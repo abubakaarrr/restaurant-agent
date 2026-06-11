@@ -1,0 +1,37 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-12345}
+      POSTGRES_DB: restaurant_agent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Auto-creates all tables on the VERY FIRST boot (when the volume is empty)
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d restaurant_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Override DATABASE_URL so the app talks to the db container over the
+      # private Docker network (host = service name "db", internal port 5432).
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-12345}@db:5432/restaurant_agent
+    ports:
+      # Bind to localhost only — Apache on the host reverse-proxies to this.
+      # The app is never exposed to the public internet directly.
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  pgdata:

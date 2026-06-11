@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ restaurant }} — AI Receptionist</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="container">
+
+    <!-- ── Voice Call Card ── -->
+    <div class="call-card">
+      <div class="call-info">
+        <h2>Live Voice Call</h2>
+        <p>Click to start a real-time voice conversation with Sana</p>
+        <div class="call-status" id="callStatus"></div>
+        <div class="vol-bars" id="volBars">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+      <button class="call-btn idle" id="callBtn" onclick="toggleCall()" title="Start voice call">
+        📞
+      </button>
+    </div>
+
+    {% if not vapi_ready %}
+    <div class="no-vapi">
+      Voice call requires <strong>VAPI_PUBLIC_KEY</strong> and <strong>VAPI_ASSISTANT_ID</strong>
+      in your <code>.env</code> file.
+    </div>
+    {% endif %}
+
+    <!-- ── Text Chat Card ── -->
+    <div class="chat-card">
+      <div class="chat-header">
+        <div class="chat-avatar">🍽️</div>
+        <div>
+          <h1>{{ restaurant }}</h1>
+          <p><span class="status-dot"></span>AI Receptionist — Text Demo</p>
+        </div>
+      </div>
+
+      <div class="messages" id="messages">
+        <div class="msg agent">
+          <div class="msg-avatar">🤖</div>
+          <div class="bubble">Hello! Thank you for calling {{ restaurant }}. I'm Sana, your AI receptionist. How can I help you today?</div>
+        </div>
+      </div>
+
+      <div class="input-area">
+        <textarea id="input" placeholder="Type a message… (Enter to send)" rows="1"
+          onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+        <button class="reset-btn" onclick="resetChat()" title="New conversation">&#8635;</button>
+        <button class="send-btn" onclick="sendMessage()" id="sendBtn">Send</button>
+      </div>
+    </div>
+
+    <div class="footer">Powered by LangGraph + GPT-4o + pgvector</div>
+  </div>
+
+  <!-- Config injected from server (read by app.js and vapi-init module) -->
+  <script>
+    window.APP_CONFIG = {
+      vapiPubKey:      "{{ vapi_pub }}",
+      vapiAssistantId: "{{ vapi_asst }}",
+      restaurantName:  "{{ restaurant }}",
+      vapiReady:       {{ 'true' if vapi_ready else 'false' }}
+    };
+  </script>
+
+  <!-- Vapi Web SDK — ESM module, initialises after DOM is ready -->
+  <script type="module">
+    import VapiMod from 'https://esm.sh/@vapi-ai/web';
+    const VapiClass = typeof VapiMod === 'function'                          ? VapiMod
+                    : (VapiMod.default && typeof VapiMod.default === 'function') ? VapiMod.default
+                    : VapiMod.Vapi;
+
+    const { vapiPubKey, vapiReady } = window.APP_CONFIG;
+    if (vapiReady) {
+      try {
+        if (!VapiClass) throw new Error('Vapi class not found in esm.sh module');
+        const v = new VapiClass(vapiPubKey);
+        window.__vapi = v;
+
+        v.on('call-start', () => {
+          window.__callActive = true;
+          document.getElementById('callBtn').className = 'call-btn active';
+          document.getElementById('callBtn').textContent = '📵';
+          document.getElementById('callStatus').textContent = '● Connected — speak now';
+          document.getElementById('callStatus').classList.add('visible');
+          document.getElementById('volBars').classList.add('visible');
+        });
+
+        v.on('call-end', () => {
+          window.__callActive = false;
+          document.getElementById('callBtn').className = 'call-btn idle';
+          document.getElementById('callBtn').textContent = '📞';
+          document.getElementById('callStatus').classList.remove('visible');
+          document.getElementById('volBars').classList.remove('visible');
+        });
+
+        v.on('message', (msg) => {
+          if (msg.type === 'transcript' && msg.transcriptType === 'final') {
+            const role = msg.role === 'user' ? 'user' : 'agent';
+            if (typeof window.addMessage === 'function') {
+              window.addMessage(role, msg.transcript);
+            }
+          }
+        });
+
+        v.on('error', (err) => {
+          console.error('Vapi error:', err);
+          document.getElementById('callStatus').textContent = '● Error: ' + (err.message || err);
+          document.getElementById('callBtn').className = 'call-btn idle';
+          document.getElementById('callBtn').textContent = '📞';
+          window.__callActive = false;
+          document.getElementById('volBars').classList.remove('visible');
+        });
+
+        console.log('Vapi SDK ready');
+      } catch (e) {
+        console.error('Vapi init failed:', e);
+      }
+    }
+  </script>
+
+  <!-- Main chat/call JS -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
