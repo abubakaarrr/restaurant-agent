@@ -1,0 +1,58 @@
+# Chatterbox TTS - Local GPU Docker image
+#
+# Uses a plain CUDA runtime + pip-only stack (no conda) to avoid the
+# torchvision::nms operator conflict that occurs with the conda-based
+# pytorch/pytorch image.
+#
+# Requires NVIDIA Container Toolkit + Docker Desktop GPU support.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    libsndfile1 \
+    ffmpeg \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Survive slow / flaky networks: long socket timeout + many retries.
+ENV PIP_DEFAULT_TIMEOUT=1000
+ENV PIP_RETRIES=10
+
+# ── Step 1: PyTorch ecosystem from the official CUDA 12.4 wheel index.
+# IMPORTANT: chatterbox-tts==0.1.6 pins torch==2.6.0, so we install that exact
+# version (with matching torchvision/torchaudio) here from the fast PyTorch
+# index. If we installed an older torch, pip would re-download torch 2.6.0
+# from the slow PyPI mirror during the chatterbox step.
+RUN pip3 install --no-cache-dir \
+    "torch==2.6.0" \
+    "torchvision==0.21.0" \
+    "torchaudio==2.6.0" \
+    --index-url https://download.pytorch.org/whl/cu124
+
+# ── Step 2: Fix the optree FutureWarning
+RUN pip3 install --no-cache-dir "optree>=0.13.0"
+
+# ── Step 3: Application deps (chatterbox, FastAPI, peft, uvicorn)
+RUN pip3 install --no-cache-dir \
+    "chatterbox-tts==0.1.6" \
+    "fastapi[standard]==0.124.4" \
+    "peft==0.18.0" \
+    uvicorn
+
+COPY chatterbox_tts_local.py .
+
+RUN mkdir -p /app/voices
+
+EXPOSE 8080
+
+ENV HF_HOME=/app/.cache/huggingface
+ENV VOICES_DIR=/app/voices
+
+CMD ["python3", "-m", "uvicorn", "chatterbox_tts_local:web_app", "--host", "0.0.0.0", "--port", "8080"]

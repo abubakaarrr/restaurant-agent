@@ -18,10 +18,11 @@ from app.tools import ALL_TOOLS
 SYSTEM_PROMPT_TEMPLATE = (Path(__file__).parent.parent.parent / "prompts" / "system.md").read_text(encoding="utf-8")
 
 model = ChatOpenAI(
-    model="gpt-4o",
+    model="gpt-4o-mini",
     api_key=settings.openai_api_key,
-    max_tokens=500,
+    max_tokens=120,
     temperature=0.3,
+    streaming=True,
 )
 model_with_tools = model.bind_tools(ALL_TOOLS)
 

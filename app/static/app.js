@@ -38,6 +38,67 @@ async function toggleCall() {
   }
 }
 
+// ── Retell voice call ─────────────────────────────────────────
+
+async function toggleRetellCall() {
+  if (!window.APP_CONFIG.retellReady) {
+    alert('Add RETELL_API_KEY and RETELL_AGENT_ID to your .env file to enable Retell calls.');
+    return;
+  }
+  const client = window.__retell;
+  if (!client) {
+    document.getElementById('retellStatus').textContent = '● SDK loading... try again in 2 seconds';
+    document.getElementById('retellStatus').classList.add('visible');
+    return;
+  }
+
+  if (window.__retellActive) {
+    client.stopCall();
+    return;
+  }
+
+  const btn = document.getElementById('retellBtn');
+  const status = document.getElementById('retellStatus');
+  retellShownTurns = 0;
+  btn.className = 'call-btn connecting';
+  btn.textContent = '⏳';
+  status.textContent = '● Connecting...';
+  status.classList.add('visible');
+
+  try {
+    const res = await fetch('/api/retell/web-call', { method: 'POST' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Unknown error' }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    status.textContent = '● Allow microphone when prompted...';
+    await client.startCall({ accessToken: data.access_token });
+  } catch (e) {
+    console.error('Retell start error:', e);
+    status.textContent = '● ' + (e.message || 'Call failed');
+    btn.className = 'call-btn idle';
+    btn.textContent = '📞';
+  }
+}
+
+// Live transcript from Retell: re-render only the finalized turns into the
+// chat panel. Retell sends the whole transcript each update, so we track how
+// many complete turns we've already shown to avoid duplicates.
+let retellShownTurns = 0;
+
+window.renderRetellTranscript = function (transcript) {
+  // All turns except the last are considered final; the last one is still
+  // being spoken, so we wait until a newer turn appears before locking it in.
+  const finalCount = Math.max(0, transcript.length - 1);
+  for (let i = retellShownTurns; i < finalCount; i++) {
+    const turn = transcript[i];
+    const role = turn.role === 'agent' ? 'agent' : 'user';
+    addMessage(role, turn.content || '');
+  }
+  retellShownTurns = finalCount;
+};
+
 // ── Text chat helpers ─────────────────────────────────────────
 
 function autoResize(el) {
@@ -115,6 +176,210 @@ function resetChat() {
   sessionId = 'demo-' + Math.random().toString(36).slice(2, 10);
   document.getElementById('messages').innerHTML = '';
   addMessage('agent', `Hello! Thank you for calling ${restaurantName}. I'm Sana, your AI receptionist. How can I help you today?`);
+}
+
+// ── Tab switching ─────────────────────────────────────────────
+
+function switchTab(tabName) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+
+  document.querySelector(`[onclick="switchTab('${tabName}')"]`).classList.add('active');
+  document.getElementById(`tab-${tabName}`).classList.add('active');
+
+  if (tabName === 'voice-studio') {
+    loadVoices();
+    checkTTSHealth();
+  }
+}
+
+// ── Voice Studio ──────────────────────────────────────────────
+
+let selectedFile = null;
+
+async function checkTTSHealth() {
+  const dot = document.getElementById('ttsStatusDot');
+  const txt = document.getElementById('ttsStatusText');
+  try {
+    const res = await fetch('/api/tts/health');
+    const data = await res.json();
+    if (data.status === 'ok') {
+      dot.className = 'vs-status-dot online';
+      txt.textContent = `TTS service online (${data.device})`;
+    } else {
+      dot.className = 'vs-status-dot offline';
+      txt.textContent = 'TTS service offline — start the tts container';
+    }
+  } catch {
+    dot.className = 'vs-status-dot offline';
+    txt.textContent = 'TTS service unreachable';
+  }
+}
+
+async function loadVoices() {
+  const grid = document.getElementById('voiceGrid');
+  const select = document.getElementById('ttsVoiceSelect');
+  try {
+    const res = await fetch('/api/voices');
+    const data = await res.json();
+    const voices = data.voices || [];
+
+    if (voices.length === 0) {
+      grid.innerHTML = '<div class="vs-empty">No voices yet — upload one above!</div>';
+    } else {
+      grid.innerHTML = voices.map(v => `
+        <div class="vs-voice-card">
+          <div class="vs-voice-icon">${v.category === 'system' ? '🔊' : '🎙️'}</div>
+          <div class="vs-voice-info">
+            <strong>${escapeHtml(v.name)}</strong>
+            <span class="vs-voice-meta">${v.category} · ${v.size_kb} KB</span>
+          </div>
+          <div class="vs-voice-actions">
+            <button class="vs-btn-small" onclick="previewVoice('${v.voice_key}')">Play</button>
+            ${v.category === 'custom' ? `<button class="vs-btn-small vs-btn-danger" onclick="deleteVoice('${v.id}')">Del</button>` : ''}
+          </div>
+        </div>
+      `).join('');
+    }
+
+    select.innerHTML = '<option value="">Select a voice...</option>' +
+      voices.map(v => `<option value="${v.voice_key}">${v.name} (${v.category})</option>`).join('');
+  } catch {
+    grid.innerHTML = '<div class="vs-empty">Failed to load voices</div>';
+  }
+}
+
+// Upload area drag-and-drop + click
+document.addEventListener('DOMContentLoaded', () => {
+  const area = document.getElementById('uploadArea');
+  const fileInput = document.getElementById('voiceFileInput');
+  if (!area || !fileInput) return;
+
+  area.addEventListener('click', () => fileInput.click());
+  area.addEventListener('dragover', e => { e.preventDefault(); area.classList.add('dragover'); });
+  area.addEventListener('dragleave', () => area.classList.remove('dragover'));
+  area.addEventListener('drop', e => {
+    e.preventDefault();
+    area.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleFileSelect(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) handleFileSelect(fileInput.files[0]);
+  });
+});
+
+function handleFileSelect(file) {
+  selectedFile = file;
+  document.getElementById('uploadArea').style.display = 'none';
+  document.getElementById('uploadForm').style.display = 'block';
+  document.getElementById('fileName').textContent = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+  const baseName = file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9-_ ]/g, '');
+  document.getElementById('voiceName').value = baseName;
+}
+
+function clearUpload() {
+  selectedFile = null;
+  document.getElementById('uploadArea').style.display = '';
+  document.getElementById('uploadForm').style.display = 'none';
+  document.getElementById('voiceFileInput').value = '';
+  document.getElementById('uploadStatus').textContent = '';
+}
+
+async function uploadVoice() {
+  if (!selectedFile) return;
+  const name = document.getElementById('voiceName').value.trim();
+  if (!name) { alert('Please enter a voice name'); return; }
+
+  const btn = document.getElementById('uploadBtn');
+  const status = document.getElementById('uploadStatus');
+  btn.disabled = true;
+  btn.textContent = 'Uploading...';
+  status.textContent = '';
+
+  const form = new FormData();
+  form.append('file', selectedFile);
+  form.append('name', name);
+
+  try {
+    const res = await fetch('/api/voices/upload', { method: 'POST', body: form });
+    const data = await res.json();
+    if (res.ok) {
+      status.className = 'vs-upload-status success';
+      status.textContent = `Voice "${data.voice.name}" uploaded successfully!`;
+      clearUpload();
+      loadVoices();
+    } else {
+      status.className = 'vs-upload-status error';
+      status.textContent = data.detail || 'Upload failed';
+    }
+  } catch (e) {
+    status.className = 'vs-upload-status error';
+    status.textContent = 'Network error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Upload Voice';
+}
+
+function previewVoice(voiceKey) {
+  const audio = new Audio(`/api/voices/${voiceKey}`);
+  audio.play().catch(e => alert('Cannot play: ' + e.message));
+}
+
+async function deleteVoice(voiceId) {
+  if (!confirm(`Delete voice "${voiceId}"?`)) return;
+  try {
+    await fetch(`/api/voices/${voiceId}`, { method: 'DELETE' });
+    loadVoices();
+  } catch (e) {
+    alert('Delete failed: ' + e.message);
+  }
+}
+
+async function generateTTS() {
+  const voiceKey = document.getElementById('ttsVoiceSelect').value;
+  const text = document.getElementById('ttsText').value.trim();
+  if (!voiceKey) { alert('Select a voice first'); return; }
+  if (!text) { alert('Enter some text'); return; }
+
+  const btn = document.getElementById('generateBtn');
+  const status = document.getElementById('ttsGenStatus');
+  const container = document.getElementById('audioPlayerContainer');
+  btn.disabled = true;
+  btn.textContent = 'Generating...';
+  status.textContent = 'Sending to TTS service — this may take a few seconds...';
+  container.style.display = 'none';
+
+  try {
+    const res = await fetch('/api/tts/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text,
+        voice_key: voiceKey,
+        temperature: parseFloat(document.getElementById('ttsTemp').value),
+        top_p: parseFloat(document.getElementById('ttsTopP').value),
+        repetition_penalty: parseFloat(document.getElementById('ttsRep').value),
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Unknown error' }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const player = document.getElementById('audioPlayer');
+    player.src = url;
+    document.getElementById('audioDownload').href = url;
+    container.style.display = 'flex';
+    status.textContent = 'Done!';
+    player.play();
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = 'Generate Speech';
 }
 
 // ── Init ──────────────────────────────────────────────────────

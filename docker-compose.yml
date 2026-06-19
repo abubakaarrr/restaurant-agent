@@ -33,5 +33,29 @@ services:
       # The app is never exposed to the public internet directly.
       - "127.0.0.1:8000:8000"
 
+  # ── Chatterbox TTS — voice cloning + text-to-speech (GPU) ──
+  tts:
+    build:
+      context: .
+      dockerfile: Dockerfile.tts
+    restart: unless-stopped
+    environment:
+      CHATTERBOX_API_KEY: ${CHATTERBOX_API_KEY:-local-dev-key}
+      VOICES_DIR: /app/voices
+      HF_TOKEN: ${HF_ACCESS_TOKEN:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./voices:/app/voices
+      - tts_hf_cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   pgdata:
+  tts_hf_cache:

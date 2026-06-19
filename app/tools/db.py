@@ -1,14 +1,9 @@
 """Database tools — booking operations backed by PostgreSQL."""
 
-import asyncpg
 from datetime import datetime, timedelta
 from langchain_core.tools import tool
 
-from app.config import settings
-
-
-async def _connect() -> asyncpg.Connection:
-    return await asyncpg.connect(settings.database_url)
+from app.db_pool import get_pool
 
 
 # ── Core DB operations (non-tool, called internally) ─────────
@@ -19,8 +14,8 @@ async def get_available_tables(date: str, time: str, party_size: int) -> list[di
     window_start = dt - timedelta(minutes=30)
     window_end = dt + timedelta(minutes=90)
 
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT t.id, t.table_number, t.capacity, t.location
@@ -38,8 +33,6 @@ async def get_available_tables(date: str, time: str, party_size: int) -> list[di
             party_size, window_start, window_end,
         )
         return [dict(r) for r in rows]
-    finally:
-        await conn.close()
 
 
 async def get_alternative_slots(date: str, time: str, party_size: int) -> list[dict]:
@@ -76,8 +69,8 @@ async def create_booking_record(
 ) -> dict:
     """Atomically create a booking with row-level locking to prevent double-booking."""
     dt = datetime.fromisoformat(f"{date}T{time}")
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.fetchrow(
                 "SELECT id FROM tables WHERE id = $1 FOR UPDATE",
@@ -106,8 +99,6 @@ async def create_booking_record(
                 name, phone, table_id, dt, party_size, notes,
             )
             return {"booking_id": row["id"], "confirmed": True}
-    finally:
-        await conn.close()
 
 
 # ── LangChain tool wrappers ───────────────────────────────────
@@ -203,8 +194,8 @@ async def lookup_booking(
     Pass booking_id if the caller has it; otherwise pass customer_name.
     Returns booking details or a not-found message.
     """
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         if booking_id:
             row = await conn.fetchrow(
                 """SELECT id, customer_name, customer_phone, booked_at, party_size, status
@@ -233,8 +224,6 @@ async def lookup_booking(
             f"{booked_at.strftime('%A %d %B %Y at %I:%M %p')}. "
             f"Status: {row['status']}."
         )
-    finally:
-        await conn.close()
 
 
 @tool
@@ -243,8 +232,8 @@ async def cancel_booking(booking_id: int, reason: str = "") -> str:
     reason is optional — if the caller declines to provide one, pass an empty string.
     Returns a cancellation confirmation or an error message.
     """
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, customer_name, status FROM bookings WHERE id = $1",
             booking_id,
@@ -265,8 +254,6 @@ async def cancel_booking(booking_id: int, reason: str = "") -> str:
             f"Booking #{booking_id} for {row['customer_name']} has been successfully cancelled. "
             f"We hope to welcome you another time."
         )
-    finally:
-        await conn.close()
 
 
 @tool
@@ -285,8 +272,8 @@ async def add_order_item(
     notes is for special instructions like 'medium rare' or 'no onions'.
     Returns confirmation of what was added and the running total.
     """
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         # First try full phrase match
         menu_row = await conn.fetchrow(
             "SELECT id, name, price, available FROM menu_items WHERE LOWER(name) LIKE LOWER($1) LIMIT 1",
@@ -349,8 +336,6 @@ async def add_order_item(
             f"Added {quantity}x {menu_row['name']} (${float(menu_row['price']):.2f} each). "
             f"Running total: ${running_total:.2f}. Would you like anything else?"
         )
-    finally:
-        await conn.close()
 
 
 @tool
@@ -359,8 +344,8 @@ async def confirm_order(session_id: str) -> str:
     Call this ONLY when the caller explicitly says they are done ordering.
     Returns a full itemised order summary with total.
     """
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         order_row = await conn.fetchrow(
             "SELECT id, booking_id FROM orders WHERE session_id = $1 AND status = 'pending' LIMIT 1",
             session_id,
@@ -413,8 +398,6 @@ async def confirm_order(session_id: str) -> str:
             f"Please note order ID {order_id} for verification or changes. "
             f"Is there anything else I can help you with?"
         )
-    finally:
-        await conn.close()
 
 
 @tool
@@ -427,8 +410,8 @@ async def lookup_order(order_id: int = 0, customer_name: str = "") -> str:
     if not order_id:
         return "Please ask the customer for their order ID so you can look it up."
 
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         order = await conn.fetchrow(
             """SELECT id, customer_name, status, total_amount, created_at
                FROM orders WHERE id = $1""",
@@ -469,8 +452,6 @@ async def lookup_order(order_id: int = 0, customer_name: str = "") -> str:
             f"Order #{order['id']} for {order['customer_name'] or 'guest'}: {item_summary}. "
             f"Total ${float(order['total_amount']):.2f}. Status: {order['status']}. {timing}"
         )
-    finally:
-        await conn.close()
 
 
 @tool
@@ -479,8 +460,8 @@ async def get_full_menu() -> str:
     Use this whenever a caller asks for the menu, asks what's available, or asks what you serve.
     Always use this instead of guessing — never invent menu items or prices.
     """
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT name, category, price, dietary, available
                FROM menu_items
@@ -515,8 +496,6 @@ async def get_full_menu() -> str:
             if label in grouped:
                 parts.append(f"{label}: " + "; ".join(grouped[label]))
         return "Here is our current menu. " + " | ".join(parts)
-    finally:
-        await conn.close()
 
 
 @tool
@@ -524,8 +503,8 @@ async def check_menu_item_availability(item_name: str) -> str:
     """Check whether a specific menu item is currently available (not sold out).
     Use this when a caller asks 'do you still have X?' or 'is X available tonight?'
     """
-    conn = await _connect()
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT name, available FROM menu_items WHERE LOWER(name) LIKE LOWER($1) LIMIT 1",
             f"%{item_name}%",
@@ -534,5 +513,3 @@ async def check_menu_item_availability(item_name: str) -> str:
             return f"'{item_name}' was not found in our menu system."
         status = "currently available" if row["available"] else "currently unavailable (sold out)"
         return f"{row['name']} is {status}."
-    finally:
-        await conn.close()

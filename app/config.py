@@ -31,6 +31,17 @@ class Settings(BaseSettings):
     restaurant_name: str = "La Casa Restaurant"
     restaurant_timezone: str = "UTC"
 
+    # Voice Cloning / TTS
+    chatterbox_api_url: str = "http://localhost:8080"
+    chatterbox_api_key: str = "local-dev-key"
+    # Which cloned voice Vapi should use on live calls (e.g. "custom/sana.wav").
+    vapi_voice_key: str = ""
+
+    # Retell (custom-LLM voice orchestration)
+    retell_api_key: str = ""
+    # The Retell agent to dial for browser web calls (from the Retell dashboard).
+    retell_agent_id: str = ""
+
     # App
     app_env: str = "development"
 

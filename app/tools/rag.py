@@ -1,10 +1,10 @@
 """RAG tool — semantic search over pgvector knowledge chunks."""
 
-import asyncpg
 from openai import AsyncOpenAI
 from langchain_core.tools import tool
 
 from app.config import settings
+from app.db_pool import get_pool
 
 oai = AsyncOpenAI(api_key=settings.openai_api_key)
 EMBEDDING_MODEL = "text-embedding-3-small"
@@ -23,8 +23,8 @@ async def semantic_search(
 ) -> list[dict]:
     """Return top-k most relevant knowledge chunks for a query."""
     vector = await _embed(query)
-    conn = await asyncpg.connect(settings.database_url)
-    try:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
         if source_filter:
             rows = await conn.fetch(
                 """
@@ -51,8 +51,6 @@ async def semantic_search(
                 str(vector), top_k, SIMILARITY_THRESHOLD,
             )
         return [dict(r) for r in rows]
-    finally:
-        await conn.close()
 
 
 # ── LangChain tool wrappers (bound to the LangGraph agent) ────

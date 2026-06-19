@@ -9,54 +9,184 @@
 <body>
   <div class="container">
 
-    <!-- ── Voice Call Card ── -->
-    <div class="call-card">
-      <div class="call-info">
-        <h2>Live Voice Call</h2>
-        <p>Click to start a real-time voice conversation with Sana</p>
-        <div class="call-status" id="callStatus"></div>
-        <div class="vol-bars" id="volBars">
-          <span></span><span></span><span></span><span></span><span></span>
-        </div>
-      </div>
-      <button class="call-btn idle" id="callBtn" onclick="toggleCall()" title="Start voice call">
-        📞
-      </button>
+    <!-- ── Tab Navigation ── -->
+    <div class="tab-nav">
+      <button class="tab-btn active" onclick="switchTab('receptionist')">Receptionist</button>
+      <button class="tab-btn" onclick="switchTab('voice-studio')">Voice Studio</button>
     </div>
 
-    {% if not vapi_ready %}
-    <div class="no-vapi">
-      Voice call requires <strong>VAPI_PUBLIC_KEY</strong> and <strong>VAPI_ASSISTANT_ID</strong>
-      in your <code>.env</code> file.
-    </div>
-    {% endif %}
+    <!-- ════════════════════════════════════════════════════════ -->
+    <!-- TAB 1: RECEPTIONIST (existing)                         -->
+    <!-- ════════════════════════════════════════════════════════ -->
+    <div id="tab-receptionist" class="tab-content active">
 
-    <!-- ── Text Chat Card ── -->
-    <div class="chat-card">
-      <div class="chat-header">
-        <div class="chat-avatar">🍽️</div>
-        <div>
-          <h1>{{ restaurant }}</h1>
-          <p><span class="status-dot"></span>AI Receptionist — Text Demo</p>
+      <!-- ── Voice Call Card (Vapi) ── -->
+      <div class="call-card">
+        <div class="call-info">
+          <h2>Live Voice Call <span class="provider-tag">Vapi</span></h2>
+          <p>Click to start a real-time voice conversation with Sana</p>
+          <div class="call-status" id="callStatus"></div>
+          <div class="vol-bars" id="volBars">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+        </div>
+        <button class="call-btn idle" id="callBtn" onclick="toggleCall()" title="Start voice call">
+          📞
+        </button>
+      </div>
+
+      {% if not vapi_ready %}
+      <div class="no-vapi">
+        Voice call requires <strong>VAPI_PUBLIC_KEY</strong> and <strong>VAPI_ASSISTANT_ID</strong>
+        in your <code>.env</code> file.
+      </div>
+      {% endif %}
+
+      <!-- ── Voice Call Card (Retell) ── -->
+      <div class="call-card">
+        <div class="call-info">
+          <h2>Live Voice Call <span class="provider-tag retell">Retell</span></h2>
+          <p>Lower latency, better transcription &amp; barge-in</p>
+          <div class="call-status" id="retellStatus"></div>
+          <div class="vol-bars" id="retellVolBars">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+        </div>
+        <button class="call-btn idle" id="retellBtn" onclick="toggleRetellCall()" title="Start Retell voice call">
+          📞
+        </button>
+      </div>
+
+      {% if not retell_ready %}
+      <div class="no-vapi">
+        Retell call requires <strong>RETELL_API_KEY</strong> and <strong>RETELL_AGENT_ID</strong>
+        in your <code>.env</code> file.
+      </div>
+      {% endif %}
+
+      <!-- ── Text Chat Card ── -->
+      <div class="chat-card">
+        <div class="chat-header">
+          <div class="chat-avatar">🍽️</div>
+          <div>
+            <h1>{{ restaurant }}</h1>
+            <p><span class="status-dot"></span>AI Receptionist — Text Demo</p>
+          </div>
+        </div>
+
+        <div class="messages" id="messages">
+          <div class="msg agent">
+            <div class="msg-avatar">🤖</div>
+            <div class="bubble">Hello! Thank you for calling {{ restaurant }}. I'm Sana, your AI receptionist. How can I help you today?</div>
+          </div>
+        </div>
+
+        <div class="input-area">
+          <textarea id="input" placeholder="Type a message… (Enter to send)" rows="1"
+            onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <button class="reset-btn" onclick="resetChat()" title="New conversation">&#8635;</button>
+          <button class="send-btn" onclick="sendMessage()" id="sendBtn">Send</button>
         </div>
       </div>
 
-      <div class="messages" id="messages">
-        <div class="msg agent">
-          <div class="msg-avatar">🤖</div>
-          <div class="bubble">Hello! Thank you for calling {{ restaurant }}. I'm Sana, your AI receptionist. How can I help you today?</div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════ -->
+    <!-- TAB 2: VOICE STUDIO                                    -->
+    <!-- ════════════════════════════════════════════════════════ -->
+    <div id="tab-voice-studio" class="tab-content">
+
+      <!-- TTS Service Status -->
+      <div class="vs-status-bar" id="ttsStatusBar">
+        <span class="vs-status-dot" id="ttsStatusDot"></span>
+        <span id="ttsStatusText">Checking TTS service...</span>
+      </div>
+
+      <!-- Upload Voice Section -->
+      <div class="vs-card">
+        <div class="vs-card-header">
+          <h2>Clone a Voice</h2>
+          <p>Upload a 10+ second audio sample to create a custom voice clone</p>
+        </div>
+        <div class="vs-upload-area" id="uploadArea">
+          <div class="vs-upload-icon">🎙️</div>
+          <p>Drag & drop an audio file here, or click to browse</p>
+          <p class="vs-upload-hint">WAV, MP3, OGG, FLAC — min 10 seconds, max 20 MB</p>
+          <input type="file" id="voiceFileInput" accept="audio/*" hidden>
+        </div>
+        <div class="vs-upload-form" id="uploadForm" style="display:none;">
+          <div class="vs-file-preview" id="filePreview">
+            <span class="vs-file-name" id="fileName"></span>
+            <button class="vs-btn-small vs-btn-danger" onclick="clearUpload()">Remove</button>
+          </div>
+          <div class="vs-form-row">
+            <input type="text" id="voiceName" placeholder="Voice name (e.g. Mario, Chef Ahmed)" class="vs-input">
+            <button class="vs-btn vs-btn-primary" onclick="uploadVoice()" id="uploadBtn">Upload Voice</button>
+          </div>
+        </div>
+        <div class="vs-upload-status" id="uploadStatus"></div>
+      </div>
+
+      <!-- Voice Library -->
+      <div class="vs-card">
+        <div class="vs-card-header">
+          <h2>Voice Library</h2>
+          <p>Your available voices for text-to-speech</p>
+          <button class="vs-btn-small" onclick="loadVoices()">Refresh</button>
+        </div>
+        <div class="vs-voice-grid" id="voiceGrid">
+          <div class="vs-empty">Loading voices...</div>
         </div>
       </div>
 
-      <div class="input-area">
-        <textarea id="input" placeholder="Type a message… (Enter to send)" rows="1"
-          onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
-        <button class="reset-btn" onclick="resetChat()" title="New conversation">&#8635;</button>
-        <button class="send-btn" onclick="sendMessage()" id="sendBtn">Send</button>
+      <!-- TTS Test -->
+      <div class="vs-card">
+        <div class="vs-card-header">
+          <h2>Test Text-to-Speech</h2>
+          <p>Generate speech using a cloned voice</p>
+        </div>
+        <div class="vs-tts-form">
+          <select id="ttsVoiceSelect" class="vs-select">
+            <option value="">Select a voice...</option>
+          </select>
+          <textarea id="ttsText" class="vs-textarea" rows="3"
+            placeholder="Type what the voice should say...">Welcome to {{ restaurant }}! How can I help you today?</textarea>
+
+          <details class="vs-advanced">
+            <summary>Advanced Settings</summary>
+            <div class="vs-sliders">
+              <label>Creativity <span id="tempVal">0.8</span>
+                <input type="range" id="ttsTemp" min="0" max="2" step="0.1" value="0.8"
+                  oninput="document.getElementById('tempVal').textContent=this.value">
+              </label>
+              <label>Voice Variety <span id="topPVal">0.95</span>
+                <input type="range" id="ttsTopP" min="0" max="1" step="0.05" value="0.95"
+                  oninput="document.getElementById('topPVal').textContent=this.value">
+              </label>
+              <label>Natural Flow <span id="repVal">1.2</span>
+                <input type="range" id="ttsRep" min="1" max="2" step="0.1" value="1.2"
+                  oninput="document.getElementById('repVal').textContent=this.value">
+              </label>
+            </div>
+          </details>
+
+          <div class="vs-tts-actions">
+            <button class="vs-btn vs-btn-primary vs-btn-generate" onclick="generateTTS()" id="generateBtn">
+              Generate Speech
+            </button>
+            <span class="vs-tts-status" id="ttsGenStatus"></span>
+          </div>
+
+          <div class="vs-audio-player" id="audioPlayerContainer" style="display:none;">
+            <audio id="audioPlayer" controls></audio>
+            <a id="audioDownload" class="vs-btn-small" download="generated.wav">Download WAV</a>
+          </div>
+        </div>
       </div>
+
     </div>
 
-    <div class="footer">Powered by LangGraph + GPT-4o + pgvector</div>
+    <div class="footer">Powered by LangGraph + GPT-4o + pgvector + Chatterbox TTS</div>
   </div>
 
   <!-- Config injected from server (read by app.js and vapi-init module) -->
@@ -65,7 +195,8 @@
       vapiPubKey:      "{{ vapi_pub }}",
       vapiAssistantId: "{{ vapi_asst }}",
       restaurantName:  "{{ restaurant }}",
-      vapiReady:       {{ 'true' if vapi_ready else 'false' }}
+      vapiReady:       {{ 'true' if vapi_ready else 'false' }},
+      retellReady:     {{ 'true' if retell_ready else 'false' }}
     };
   </script>
 
@@ -122,6 +253,59 @@
       } catch (e) {
         console.error('Vapi init failed:', e);
       }
+    }
+  </script>
+
+  <!-- Retell Web SDK — WebRTC voice calls from the browser -->
+  <script type="module">
+    import { RetellWebClient } from 'https://esm.sh/retell-client-js-sdk@2.0.8';
+
+    if (window.APP_CONFIG.retellReady) {
+      const setStatus = (txt, show = true) => {
+        const el = document.getElementById('retellStatus');
+        el.textContent = txt;
+        el.classList.toggle('visible', show);
+      };
+      const setBtn = (cls, label) => {
+        const b = document.getElementById('retellBtn');
+        b.className = 'call-btn ' + cls;
+        b.textContent = label;
+      };
+
+      const client = new RetellWebClient();
+      window.__retell = client;
+      window.__retellActive = false;
+
+      client.on('call_started', () => {
+        window.__retellActive = true;
+        setBtn('active', '📵');
+        setStatus('● Connected — speak now');
+        document.getElementById('retellVolBars').classList.add('visible');
+      });
+
+      client.on('call_ended', () => {
+        window.__retellActive = false;
+        setBtn('idle', '📞');
+        setStatus('', false);
+        document.getElementById('retellVolBars').classList.remove('visible');
+      });
+
+      client.on('update', (update) => {
+        if (typeof window.renderRetellTranscript === 'function') {
+          window.renderRetellTranscript(update.transcript || []);
+        }
+      });
+
+      client.on('error', (err) => {
+        console.error('Retell error:', err);
+        setStatus('● Error: ' + (err.message || err));
+        setBtn('idle', '📞');
+        window.__retellActive = false;
+        document.getElementById('retellVolBars').classList.remove('visible');
+        client.stopCall();
+      });
+
+      console.log('Retell SDK ready');
     }
   </script>
 
