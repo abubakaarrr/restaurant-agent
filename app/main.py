@@ -450,6 +450,91 @@ async def vapi_custom_voice(request: Request):
         raise HTTPException(504, "TTS generation timed out.")
 
 
+# ── History API ───────────────────────────────────────────────
+
+@app.get("/api/history")
+async def get_history():
+    """Return all reservations (with table + any pre-order) and standalone
+    pickup orders, for the History dashboard tab."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        booking_rows = await conn.fetch(
+            """
+            SELECT b.id, b.customer_name, b.customer_phone, b.party_size,
+                   b.booked_at, b.status, b.cancellation_reason, b.notes, b.created_at,
+                   t.table_number, t.location
+            FROM bookings b
+            LEFT JOIN tables t ON t.id = b.table_id
+            ORDER BY b.created_at DESC
+            """
+        )
+        order_rows = await conn.fetch(
+            """
+            SELECT id, session_id, booking_id, customer_name, customer_phone,
+                   status, total_amount, created_at
+            FROM orders
+            ORDER BY created_at DESC
+            """
+        )
+        item_rows = await conn.fetch(
+            """
+            SELECT order_id, item_name, quantity, unit_price, subtotal, notes
+            FROM order_items
+            ORDER BY id
+            """
+        )
+
+    # Group order items by their order id
+    items_by_order: dict[int, list[dict]] = {}
+    for it in item_rows:
+        items_by_order.setdefault(it["order_id"], []).append({
+            "item_name": it["item_name"],
+            "quantity": it["quantity"],
+            "unit_price": float(it["unit_price"]),
+            "subtotal": float(it["subtotal"]),
+            "notes": it["notes"] or "",
+        })
+
+    def serialize_order(o) -> dict:
+        return {
+            "order_id": o["id"],
+            "customer_name": o["customer_name"] or "",
+            "customer_phone": o["customer_phone"] or "",
+            "status": o["status"],
+            "total_amount": float(o["total_amount"]),
+            "created_at": o["created_at"].isoformat() if o["created_at"] else None,
+            "items": items_by_order.get(o["id"], []),
+        }
+
+    # Index pre-orders by the booking they belong to
+    orders_by_booking: dict[int, dict] = {}
+    pickup_orders: list[dict] = []
+    for o in order_rows:
+        if o["booking_id"]:
+            orders_by_booking[o["booking_id"]] = serialize_order(o)
+        else:
+            pickup_orders.append(serialize_order(o))
+
+    reservations = []
+    for b in booking_rows:
+        reservations.append({
+            "booking_id": b["id"],
+            "customer_name": b["customer_name"],
+            "customer_phone": b["customer_phone"] or "",
+            "party_size": b["party_size"],
+            "booked_at": b["booked_at"].isoformat() if b["booked_at"] else None,
+            "status": b["status"],
+            "cancellation_reason": b["cancellation_reason"] or "",
+            "notes": b["notes"] or "",
+            "created_at": b["created_at"].isoformat() if b["created_at"] else None,
+            "table_number": b["table_number"],
+            "location": b["location"] or "",
+            "preorder": orders_by_booking.get(b["id"]),
+        })
+
+    return {"reservations": reservations, "pickup_orders": pickup_orders}
+
+
 # ── Browser demo UI ───────────────────────────────────────────
 
 @app.get("/")

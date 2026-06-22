@@ -9,3 +9,9 @@ venv/
 dist/
 build/
 .DS_Store
+deploy/
+
+# Local-only config & reports
+.env.production.example
+retell_blueprint_report.md
+technical_report.md

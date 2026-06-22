@@ -13,6 +13,7 @@ Protocol reference: https://docs.retellai.com/api-references/llm-websocket
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -52,9 +53,22 @@ def _response_event(
 
 
 async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
-    """Drive one Retell call over the LLM WebSocket until it disconnects."""
+    """Drive one Retell call over the LLM WebSocket until it disconnects.
+
+    The main loop ONLY reads messages and dispatches — it never blocks on agent
+    generation. Each turn runs as a cancellable background task so we can keep
+    answering keepalive pings and, crucially, cancel a stale response when the
+    caller keeps talking or interrupts (barge-in). All sends go through a lock
+    so the reader loop and the generation task never interleave WebSocket frames.
+    """
+    send_lock = asyncio.Lock()
+
+    async def send(payload: str) -> None:
+        async with send_lock:
+            await websocket.send_text(payload)
+
     # Optional config event — tell Retell we want call details + auto-reconnect.
-    await websocket.send_text(
+    await send(
         json.dumps(
             {
                 "response_type": "config",
@@ -64,6 +78,30 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
     )
 
     caller_number = ""
+    current_task: asyncio.Task | None = None
+
+    async def run_turn(response_id: int, user_text: str) -> None:
+        """Stream one agent reply. Cancellable if a newer turn supersedes it."""
+        try:
+            async for token in stream_agent_tokens(call_id, user_text, caller_number):
+                if token:
+                    await send(_response_event(response_id, token, complete=False))
+            await send(_response_event(response_id, "", complete=True))
+        except asyncio.CancelledError:
+            # Caller interrupted / a newer turn arrived — drop this reply silently.
+            raise
+        except Exception:
+            logger.error("Retell agent stream error", exc_info=True)
+            try:
+                await send(
+                    _response_event(
+                        response_id,
+                        "I'm sorry, I had a technical issue. Could you please repeat that?",
+                        complete=True,
+                    )
+                )
+            except Exception:
+                pass
 
     try:
         while True:
@@ -76,9 +114,9 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
 
             interaction = msg.get("interaction_type")
 
-            # Keepalive.
+            # Keepalive — must be answered even while a turn is generating.
             if interaction == "ping_pong":
-                await websocket.send_text(
+                await send(
                     json.dumps(
                         {"response_type": "ping_pong", "timestamp": msg.get("timestamp")}
                     )
@@ -96,12 +134,17 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 continue
 
             if interaction in ("response_required", "reminder_required"):
+                # A newer turn supersedes whatever we were saying (barge-in or the
+                # caller simply kept talking past an earlier pause).
+                if current_task and not current_task.done():
+                    current_task.cancel()
+
                 response_id = msg.get("response_id", 0)
                 user_text = _latest_user_utterance(msg.get("transcript"))
 
                 # Nudge a silent caller.
                 if interaction == "reminder_required" and not user_text:
-                    await websocket.send_text(
+                    await send(
                         _response_event(
                             response_id,
                             "Are you still there? How can I help you?",
@@ -116,37 +159,17 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                         f"Hello! Thank you for calling {settings.restaurant_name}. "
                         "How can I help you today?"
                     )
-                    await websocket.send_text(
-                        _response_event(response_id, greeting, complete=True)
-                    )
+                    await send(_response_event(response_id, greeting, complete=True))
                     continue
 
-                # Normal turn — stream the LangGraph agent's reply token by token.
-                try:
-                    async for token in stream_agent_tokens(call_id, user_text, caller_number):
-                        if token:
-                            await websocket.send_text(
-                                _response_event(response_id, token, complete=False)
-                            )
-                except Exception:
-                    logger.error("Retell agent stream error", exc_info=True)
-                    await websocket.send_text(
-                        _response_event(
-                            response_id,
-                            "I'm sorry, I had a technical issue. Could you please repeat that?",
-                            complete=True,
-                        )
-                    )
-                    continue
-
-                # Close out this turn.
-                await websocket.send_text(
-                    _response_event(response_id, "", complete=True)
-                )
+                # Generate in the background so the loop keeps reading messages.
+                current_task = asyncio.create_task(run_turn(response_id, user_text))
 
     except WebSocketDisconnect:
         logger.info("Retell call %s disconnected", call_id)
     except Exception:
         logger.error("Retell websocket error on call %s", call_id, exc_info=True)
     finally:
+        if current_task and not current_task.done():
+            current_task.cancel()
         clear_session(call_id)

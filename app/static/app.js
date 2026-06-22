@@ -191,6 +191,118 @@ function switchTab(tabName) {
     loadVoices();
     checkTTSHealth();
   }
+  if (tabName === 'history') {
+    loadHistory();
+  }
+}
+
+// ── History ───────────────────────────────────────────────────
+
+function fmtDateTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString(undefined, {
+    weekday: 'short', day: 'numeric', month: 'short',
+    hour: 'numeric', minute: '2-digit',
+  });
+}
+
+function renderOrderBlock(order, title) {
+  if (!order) return '';
+  const lines = (order.items || []).map(it => `
+    <div class="hist-order-line">
+      <span><span class="qty">${it.quantity}×</span> ${escapeHtml(it.item_name)}${it.notes ? ` <span class="note">(${escapeHtml(it.notes)})</span>` : ''}</span>
+      <span class="price">$${it.subtotal.toFixed(2)}</span>
+    </div>
+  `).join('');
+  return `
+    <div class="hist-order">
+      <div class="hist-order-title">${title} · #${order.order_id} · ${escapeHtml(order.status)}</div>
+      <div class="hist-order-items">${lines || '<div class="hist-order-line">No items</div>'}</div>
+      <div class="hist-order-total"><span>Total</span><span>$${order.total_amount.toFixed(2)}</span></div>
+    </div>
+  `;
+}
+
+function renderReservation(r) {
+  const tableInfo = r.table_number
+    ? `Table ${r.table_number}${r.location ? ` · ${escapeHtml(r.location)}` : ''}`
+    : 'No table';
+  const preorderBadge = r.preorder ? '<span class="hist-badge preorder">Pre-order</span>' : '';
+  const reason = (r.status === 'cancelled' && r.cancellation_reason)
+    ? `<div class="hist-reason">Reason: ${escapeHtml(r.cancellation_reason)}</div>`
+    : '';
+  return `
+    <div class="hist-item">
+      <div class="hist-item-top">
+        <span class="hist-item-name">${escapeHtml(r.customer_name)}</span>
+        <div class="hist-badges">
+          <span class="hist-badge table">${tableInfo}</span>
+          ${preorderBadge}
+          <span class="hist-badge ${escapeHtml(r.status)}">${escapeHtml(r.status)}</span>
+        </div>
+      </div>
+      <div class="hist-item-meta">
+        <span><strong>${r.party_size}</strong> ${r.party_size === 1 ? 'guest' : 'guests'}</span>
+        <span>${fmtDateTime(r.booked_at)}</span>
+        <span>Booking #${r.booking_id}</span>
+        ${r.customer_phone ? `<span>${escapeHtml(r.customer_phone)}</span>` : ''}
+      </div>
+      ${reason}
+      ${renderOrderBlock(r.preorder, 'Pre-order')}
+    </div>
+  `;
+}
+
+function renderPickup(o) {
+  return `
+    <div class="hist-item">
+      <div class="hist-item-top">
+        <span class="hist-item-name">${escapeHtml(o.customer_name || 'Guest')}</span>
+        <div class="hist-badges">
+          <span class="hist-badge ${escapeHtml(o.status)}">${escapeHtml(o.status)}</span>
+        </div>
+      </div>
+      <div class="hist-item-meta">
+        <span>Order #${o.order_id}</span>
+        <span>${fmtDateTime(o.created_at)}</span>
+        ${o.customer_phone ? `<span>${escapeHtml(o.customer_phone)}</span>` : ''}
+      </div>
+      ${renderOrderBlock(o, 'Items')}
+    </div>
+  `;
+}
+
+async function loadHistory() {
+  const resList = document.getElementById('reservationsList');
+  const pickList = document.getElementById('pickupList');
+  resList.innerHTML = '<div class="vs-empty">Loading reservations...</div>';
+  pickList.innerHTML = '<div class="vs-empty">Loading orders...</div>';
+
+  try {
+    const res = await fetch('/api/history');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const reservations = data.reservations || [];
+    const pickups = data.pickup_orders || [];
+
+    document.getElementById('statReservations').textContent = reservations.length;
+    document.getElementById('statPreorders').textContent =
+      reservations.filter(r => r.preorder).length;
+    document.getElementById('statPickups').textContent = pickups.length;
+
+    resList.innerHTML = reservations.length
+      ? reservations.map(renderReservation).join('')
+      : '<div class="vs-empty">No reservations yet.</div>';
+
+    pickList.innerHTML = pickups.length
+      ? pickups.map(renderPickup).join('')
+      : '<div class="vs-empty">No pickup orders yet.</div>';
+  } catch (e) {
+    resList.innerHTML = `<div class="vs-empty">Failed to load history: ${escapeHtml(e.message)}</div>`;
+    pickList.innerHTML = '';
+  }
 }
 
 // ── Voice Studio ──────────────────────────────────────────────

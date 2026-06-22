@@ -13,6 +13,7 @@
     <div class="tab-nav">
       <button class="tab-btn active" onclick="switchTab('receptionist')">Receptionist</button>
       <button class="tab-btn" onclick="switchTab('voice-studio')">Voice Studio</button>
+      <button class="tab-btn" onclick="switchTab('history')">History</button>
     </div>
 
     <!-- ════════════════════════════════════════════════════════ -->
@@ -181,6 +182,52 @@
             <audio id="audioPlayer" controls></audio>
             <a id="audioDownload" class="vs-btn-small" download="generated.wav">Download WAV</a>
           </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════ -->
+    <!-- TAB 3: HISTORY                                          -->
+    <!-- ════════════════════════════════════════════════════════ -->
+    <div id="tab-history" class="tab-content">
+
+      <!-- Summary stat bar -->
+      <div class="hist-stats" id="histStats">
+        <div class="hist-stat">
+          <span class="hist-stat-num" id="statReservations">–</span>
+          <span class="hist-stat-label">Reservations</span>
+        </div>
+        <div class="hist-stat">
+          <span class="hist-stat-num" id="statPreorders">–</span>
+          <span class="hist-stat-label">Pre-orders</span>
+        </div>
+        <div class="hist-stat">
+          <span class="hist-stat-num" id="statPickups">–</span>
+          <span class="hist-stat-label">Pickup Orders</span>
+        </div>
+      </div>
+
+      <!-- Reservations -->
+      <div class="vs-card">
+        <div class="vs-card-header">
+          <h2>Reservations</h2>
+          <p>Every table booking, who it's for, party size &amp; any pre-order</p>
+          <button class="vs-btn-small" onclick="loadHistory()">Refresh</button>
+        </div>
+        <div class="hist-list" id="reservationsList">
+          <div class="vs-empty">Loading reservations...</div>
+        </div>
+      </div>
+
+      <!-- Pickup orders -->
+      <div class="vs-card">
+        <div class="vs-card-header">
+          <h2>Pickup Orders</h2>
+          <p>Orders placed without a reservation (ready for pickup)</p>
+        </div>
+        <div class="hist-list" id="pickupList">
+          <div class="vs-empty">Loading orders...</div>
         </div>
       </div>
 
