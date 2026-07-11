@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import zoneinfo
 from pathlib import Path
 from typing import cast
 
@@ -20,7 +21,7 @@ SYSTEM_PROMPT_TEMPLATE = (Path(__file__).parent.parent.parent / "prompts" / "sys
 model = ChatOpenAI(
     model="gpt-4o-mini",
     api_key=settings.openai_api_key,
-    max_tokens=120,
+    max_tokens=400,
     temperature=0.3,
     streaming=True,
 )
@@ -34,9 +35,15 @@ async def generate_response(
     """Core agent node: builds system prompt, trims history, calls Claude."""
     agent_config = AgentConfiguration.from_runnable_config(config)
 
+    try:
+        tz = zoneinfo.ZoneInfo(settings.restaurant_timezone)
+    except zoneinfo.ZoneInfoNotFoundError:
+        tz = datetime.timezone.utc
+
+    now_local = datetime.datetime.now(tz)
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         restaurant_name=agent_config.restaurant_name,
-        today_datetime=datetime.datetime.now().strftime("%A, %B %d %Y at %I:%M %p"),
+        today_datetime=now_local.strftime("%A, %B %d %Y at %I:%M %p"),
         timezone=settings.restaurant_timezone,
         session_id=state.get("session_id", "unknown"),
     )

@@ -20,6 +20,7 @@ import logging
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.agent.runner import clear_session, stream_agent_tokens
+from app.call_flags import consume_end_call
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,16 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
     caller keeps talking or interrupts (barge-in). All sends go through a lock
     so the reader loop and the generation task never interleave WebSocket frames.
     """
+    # Verify Retell's authorization header before doing anything else.
+    # Retell sends: Authorization: Bearer <your_retell_api_key>
+    if settings.retell_api_key:
+        auth_header = websocket.headers.get("authorization", "")
+        expected = f"Bearer {settings.retell_api_key}"
+        if auth_header != expected:
+            logger.warning("Retell WebSocket rejected — bad Authorization header on call %s", call_id)
+            await websocket.close(code=4401)
+            return
+
     send_lock = asyncio.Lock()
 
     async def send(payload: str) -> None:
@@ -86,7 +97,9 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             async for token in stream_agent_tokens(call_id, user_text, caller_number):
                 if token:
                     await send(_response_event(response_id, token, complete=False))
-            await send(_response_event(response_id, "", complete=True))
+            # Check whether the agent called end_call during this turn.
+            should_end = consume_end_call(call_id)
+            await send(_response_event(response_id, "", complete=True, end_call=should_end))
         except asyncio.CancelledError:
             # Caller interrupted / a newer turn arrived — drop this reply silently.
             raise

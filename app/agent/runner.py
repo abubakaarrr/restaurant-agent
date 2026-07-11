@@ -11,6 +11,9 @@ from app.config import settings
 
 _sessions: dict[str, list[dict]] = {}
 
+# Re-export so callers can do: from app.agent.runner import consume_end_call
+from app.call_flags import consume_end_call as consume_end_call  # noqa: E402
+
 
 def get_session_history(session_id: str) -> list[dict]:
     return _sessions.get(session_id, [])
@@ -78,14 +81,21 @@ async def stream_agent_tokens(
     user_message: str,
     caller_phone: str = "",
 ) -> AsyncIterator[str]:
-    """Stream speakable tokens from the agent for Vapi.
+    """Stream speakable tokens from the agent for Vapi / Retell.
 
     Strategy:
     - 1st LLM call may choose tools → buffer text, discard if tool_calls.
     - 2nd+ LLM call (after tools) → stream tokens live to the caller.
-  """
+
+    Barge-in safety: the user message is written to _sessions *before* we
+    start generation so that a CancelledError mid-stream never erases it from
+    conversation history.  The assistant reply is appended only on success.
+    """
     history = list(_sessions.get(session_id, []))
     history.append({"role": "user", "content": user_message})
+    # Persist the user turn immediately — if this coroutine is cancelled
+    # (Retell barge-in), the caller's utterance survives in history.
+    _sessions[session_id] = history[-20:]
 
     config = {"configurable": {"restaurant_name": settings.restaurant_name}}
     input_state = {
@@ -149,5 +159,7 @@ async def stream_agent_tokens(
     if not reply:
         reply = "I'm sorry, could you repeat that?"
 
-    history.append({"role": "assistant", "content": reply})
-    _sessions[session_id] = history[-20:]
+    # Append assistant reply to the history we already persisted above.
+    current = list(_sessions.get(session_id, []))
+    current.append({"role": "assistant", "content": reply})
+    _sessions[session_id] = current[-20:]

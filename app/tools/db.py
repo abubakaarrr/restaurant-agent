@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from langchain_core.tools import tool
 
 from app.db_pool import get_pool
+from app.call_flags import request_end_call
+from app.tools.rag import semantic_search
 
 
 # ── Core DB operations (non-tool, called internally) ─────────
@@ -69,6 +71,8 @@ async def create_booking_record(
 ) -> dict:
     """Atomically create a booking with row-level locking to prevent double-booking."""
     dt = datetime.fromisoformat(f"{date}T{time}")
+    if dt < datetime.now():
+        raise ValueError(f"Cannot book a table in the past ({date} {time}). Please choose a future date and time.")
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -274,23 +278,35 @@ async def add_order_item(
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # First try full phrase match
+        # 1. Exact (case-insensitive) substring match — fastest, zero ambiguity.
         menu_row = await conn.fetchrow(
             "SELECT id, name, price, available FROM menu_items WHERE LOWER(name) LIKE LOWER($1) LIMIT 1",
             f"%{item_name}%",
         )
-        # If not found, try matching any single word from the item name
+
+        fuzzy_matched = False  # track whether we fell back to similarity
+
+        # 2. Semantic / embedding fallback — avoids dangerous single-word guessing.
         if not menu_row:
-            words = [w for w in item_name.split() if len(w) > 3]
-            for word in words:
-                menu_row = await conn.fetchrow(
-                    "SELECT id, name, price, available FROM menu_items WHERE LOWER(name) LIKE LOWER($1) LIMIT 1",
-                    f"%{word}%",
+            chunks = await semantic_search(item_name, source_filter="menu", top_k=1)
+            if chunks:
+                # The chunk content contains the item name as part of the menu entry.
+                # Extract the name by looking it up in the DB against the chunk text.
+                chunk_text = chunks[0]["content"]
+                # Find any available menu item whose name appears in the chunk.
+                all_items = await conn.fetch(
+                    "SELECT id, name, price, available FROM menu_items WHERE available = TRUE"
                 )
-                if menu_row:
-                    break
+                best = None
+                for row in all_items:
+                    if row["name"].lower() in chunk_text.lower():
+                        best = row
+                        break
+                if best:
+                    menu_row = best
+                    fuzzy_matched = True
+
         if not menu_row:
-            # Return available drinks/items for agent to suggest alternatives
             similar = await conn.fetch(
                 "SELECT name FROM menu_items WHERE available = TRUE ORDER BY category, name LIMIT 8"
             )
@@ -332,7 +348,13 @@ async def add_order_item(
         )
         running_total = float(total_row["total"])
 
+        confirmation_prefix = (
+            f"I've matched '{item_name}' to '{menu_row['name']}' on our menu. "
+            f"Please confirm this with the caller before continuing. "
+            if fuzzy_matched else ""
+        )
         return (
+            f"{confirmation_prefix}"
             f"Added {quantity}x {menu_row['name']} (${float(menu_row['price']):.2f} each). "
             f"Running total: ${running_total:.2f}. Would you like anything else?"
         )
@@ -513,3 +535,17 @@ async def check_menu_item_availability(item_name: str) -> str:
             return f"'{item_name}' was not found in our menu system."
         status = "currently available" if row["available"] else "currently unavailable (sold out)"
         return f"{row['name']} is {status}."
+
+
+@tool
+async def end_call(session_id: str) -> str:
+    """Signal that the call should end gracefully.
+
+    Call this ONLY after you have:
+    1. Completed your full goodbye and recap.
+    2. Received a verbal confirmation from the caller that everything is correct.
+
+    Do NOT call this mid-conversation or before confirming all outstanding orders/bookings.
+    """
+    request_end_call(session_id)
+    return "Call ending."

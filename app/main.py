@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import io
@@ -13,17 +15,58 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, Security, UploadFile, WebSocket
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 
-from app.agent.runner import clear_session, get_session_history, run_agent, stream_agent_tokens
+from app.agent.runner import clear_session as _clear_session, get_session_history, run_agent, stream_agent_tokens
 from app.config import settings
 from app.db_pool import get_pool, close_pool
 from app.retell_handler import handle_retell_connection
+
+# ── Auth helpers ──────────────────────────────────────────────
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def require_dashboard_key(api_key: str | None = Security(_api_key_header)) -> None:
+    """Dependency: reject requests that don't carry a valid X-API-Key header.
+
+    If DASHBOARD_API_KEY is not set in .env, auth is skipped (dev mode).
+    """
+    if not settings.dashboard_api_key:
+        return  # auth disabled in dev
+    if api_key != settings.dashboard_api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+def _verify_retell_signature(body: bytes, signature: str) -> bool:
+    """Verify the x-retell-signature HMAC-SHA256 header on Retell webhook POST requests."""
+    if not settings.retell_api_key:
+        return True  # skip in dev when key is not configured
+    expected = hmac.new(
+        settings.retell_api_key.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _is_logged_in(request: Request) -> bool:
+    return bool(request.session.get("authenticated"))
+
+
+def _check_login(username: str, password: str) -> bool:
+    """Constant-time-ish compare for the single shared dashboard login."""
+    u_ok = hmac.compare_digest(username, settings.login_username) if len(username) == len(settings.login_username) else False
+    p_ok = hmac.compare_digest(password, settings.login_password) if len(password) == len(settings.login_password) else False
+    return u_ok and p_ok
+
 
 VOICES_DIR = Path("voices")
 ALLOWED_AUDIO_TYPES = {
@@ -56,6 +99,22 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Session cookie for the single shared dashboard login.
+# Must be added after CORS so the session is available on every request.
+_session_secret = (
+    settings.session_secret
+    or settings.dashboard_api_key
+    or "dev-session-secret-change-me"
+)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_session_secret,
+    session_cookie="restaurant_session",
+    max_age=60 * 60 * 24 * 7,  # 7 days
+    same_site="lax",
+    https_only=settings.app_env == "production",
 )
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
@@ -102,8 +161,8 @@ async def chat(req: ChatRequest):
 
 
 @app.delete("/session/{session_id}")
-async def clear_session(session_id: str):
-    clear_session(session_id)
+async def delete_session(session_id: str):
+    _clear_session(session_id)
     return {"cleared": session_id}
 
 
@@ -168,14 +227,23 @@ async def vapi_llm(request: Request):
 
 @app.post("/vapi/webhook")
 async def vapi_webhook(request: Request):
-    """Vapi server webhook — receives call lifecycle events."""
+    """Vapi server webhook — receives call lifecycle events.
+
+    Vapi signs requests with x-vapi-secret.  Set DASHBOARD_API_KEY in .env
+    and configure the same value as the server-URL secret in the Vapi dashboard.
+    """
+    if settings.dashboard_api_key:
+        provided = request.headers.get("x-vapi-secret", "")
+        if not hmac.compare_digest(provided, settings.dashboard_api_key):
+            raise HTTPException(status_code=401, detail="Invalid Vapi webhook secret")
+
     body = await request.json()
     msg = body.get("message", {})
     event_type = msg.get("type", "unknown")
 
     if event_type == "end-of-call-report":
         call_id = msg.get("call", {}).get("id", "")
-        clear_session(call_id)
+        _clear_session(call_id)
 
     return {"status": "ok"}
 
@@ -223,7 +291,7 @@ async def retell_web_call():
 
 # ── Voice Studio API ──────────────────────────────────────────
 
-@app.get("/api/voices")
+@app.get("/api/voices", dependencies=[Security(require_dashboard_key)])
 async def list_voices():
     """List all available voices (system + custom)."""
     voices = []
@@ -244,7 +312,7 @@ async def list_voices():
     return {"voices": voices}
 
 
-@app.post("/api/voices/upload")
+@app.post("/api/voices/upload", dependencies=[Security(require_dashboard_key)])
 async def upload_voice(
     file: UploadFile = File(...),
     name: str = Form(...),
@@ -285,7 +353,7 @@ async def upload_voice(
     }
 
 
-@app.delete("/api/voices/{voice_id}")
+@app.delete("/api/voices/{voice_id}", dependencies=[Security(require_dashboard_key)])
 async def delete_voice(voice_id: str):
     """Delete a custom voice."""
     folder = VOICES_DIR / "custom"
@@ -296,7 +364,7 @@ async def delete_voice(voice_id: str):
     raise HTTPException(404, "Voice not found")
 
 
-@app.get("/api/voices/{category}/{filename}")
+@app.get("/api/voices/{category}/{filename}", dependencies=[Security(require_dashboard_key)])
 async def get_voice_audio(category: str, filename: str):
     """Stream a voice reference audio file for preview."""
     if category not in ("system", "custom"):
@@ -307,7 +375,7 @@ async def get_voice_audio(category: str, filename: str):
     return FileResponse(path, media_type="audio/wav")
 
 
-@app.post("/api/tts/generate")
+@app.post("/api/tts/generate", dependencies=[Security(require_dashboard_key)])
 async def tts_generate(request: Request):
     """Proxy TTS generation to the Chatterbox service and return audio."""
     body = await request.json()
@@ -452,7 +520,7 @@ async def vapi_custom_voice(request: Request):
 
 # ── History API ───────────────────────────────────────────────
 
-@app.get("/api/history")
+@app.get("/api/history", dependencies=[Security(require_dashboard_key)])
 async def get_history():
     """Return all reservations (with table + any pre-order) and standalone
     pickup orders, for the History dashboard tab."""
@@ -535,11 +603,222 @@ async def get_history():
     return {"reservations": reservations, "pickup_orders": pickup_orders}
 
 
+# ── Settings API ──────────────────────────────────────────
+
+SETTINGS_FILE = Path("restaurant_settings.json")
+
+_DEFAULT_SETTINGS = {
+    "restaurant_name": settings.restaurant_name,
+    "phone_number": "",
+    "timezone": settings.restaurant_timezone,
+    "seating_capacity": 60,
+    "street_address": "",
+    "city": "",
+    "ai_agent_name": "Sana",
+    "languages": ["English"],
+    "opening_hours": {
+        "mon": {"open": "11:30", "close": "22:00"},
+        "tue": {"open": "11:30", "close": "22:00"},
+        "wed": {"open": "11:30", "close": "22:00"},
+        "thu": {"open": "11:30", "close": "23:00"},
+        "fri": {"open": "11:30", "close": "23:30"},
+        "sat": {"open": "10:00", "close": "23:30"},
+        "sun": {"open": "10:00", "close": "21:00"},
+    },
+}
+
+
+def _load_settings() -> dict:
+    if SETTINGS_FILE.exists():
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        merged = {**_DEFAULT_SETTINGS, **saved}
+        return merged
+    return dict(_DEFAULT_SETTINGS)
+
+
+def _save_settings(data: dict) -> dict:
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return data
+
+
+@app.get("/api/settings", dependencies=[Security(require_dashboard_key)])
+async def get_settings_api():
+    return _load_settings()
+
+
+@app.put("/api/settings", dependencies=[Security(require_dashboard_key)])
+async def update_settings(request: Request):
+    body = await request.json()
+    current = _load_settings()
+    for key in _DEFAULT_SETTINGS:
+        if key in body:
+            current[key] = body[key]
+    _save_settings(current)
+    return {"status": "ok", "settings": current}
+
+
+# ── Menu API ──────────────────────────────────────────────
+
+@app.get("/api/menu")
+async def get_menu():
+    """Return all menu items grouped by category."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, name, category, price, description, dietary, available
+            FROM menu_items
+            ORDER BY
+                CASE category
+                    WHEN 'starter' THEN 1
+                    WHEN 'main'    THEN 2
+                    WHEN 'dessert' THEN 3
+                    WHEN 'drink'   THEN 4
+                    WHEN 'special' THEN 5
+                    ELSE 6
+                END,
+                name
+            """
+        )
+    categories: dict[str, list[dict]] = {}
+    for r in rows:
+        item = {
+            "id": r["id"],
+            "name": r["name"],
+            "price": float(r["price"]),
+            "description": r["description"] or "",
+            "dietary": list(r["dietary"]) if r["dietary"] else [],
+            "available": r["available"],
+        }
+        categories.setdefault(r["category"], []).append(item)
+    return {"categories": categories}
+
+
+@app.post("/api/menu", dependencies=[Security(require_dashboard_key)])
+async def create_menu_item(request: Request):
+    """Add a new menu item."""
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    category = (body.get("category") or "main").strip()
+    price = float(body.get("price", 0))
+    description = (body.get("description") or "").strip()
+    dietary = body.get("dietary", [])
+
+    if not name:
+        raise HTTPException(400, "Item name is required")
+    if price <= 0:
+        raise HTTPException(400, "Price must be greater than 0")
+    if category not in ("starter", "main", "dessert", "drink", "special"):
+        raise HTTPException(400, "Invalid category")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO menu_items (name, category, price, description, dietary, available)
+            VALUES ($1, $2, $3, $4, $5, TRUE)
+            RETURNING id
+            """,
+            name, category, price, description, dietary,
+        )
+    return {
+        "status": "ok",
+        "item": {
+            "id": row["id"],
+            "name": name,
+            "category": category,
+            "price": price,
+            "description": description,
+            "dietary": dietary,
+            "available": True,
+        },
+    }
+
+
+@app.patch("/api/menu/{item_id}", dependencies=[Security(require_dashboard_key)])
+async def update_menu_item(item_id: int, request: Request):
+    """Toggle menu item availability or update fields."""
+    body = await request.json()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM menu_items WHERE id = $1", item_id)
+        if not row:
+            raise HTTPException(404, "Menu item not found")
+
+        if "available" in body:
+            await conn.execute(
+                "UPDATE menu_items SET available = $1 WHERE id = $2",
+                bool(body["available"]), item_id,
+            )
+
+    return {"status": "ok", "id": item_id}
+
+
+# ── Stats API ─────────────────────────────────────────────
+
+@app.get("/api/stats", dependencies=[Security(require_dashboard_key)])
+async def get_stats():
+    """Aggregated dashboard stats."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        res_count = await conn.fetchval("SELECT COUNT(*) FROM bookings")
+        order_count = await conn.fetchval("SELECT COUNT(*) FROM orders")
+        revenue = await conn.fetchval(
+            "SELECT COALESCE(SUM(total_amount), 0) FROM orders WHERE status = 'confirmed'"
+        )
+    return {
+        "total_reservations": res_count,
+        "total_orders": order_count,
+        "total_revenue": float(revenue),
+    }
+
+
 # ── Browser demo UI ───────────────────────────────────────────
+
+@app.get("/login")
+async def login_page(request: Request):
+    """Single shared login page for the restaurant dashboard."""
+    if _is_logged_in(request):
+        return RedirectResponse("/", status_code=302)
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "restaurant": settings.restaurant_name,
+        "error": None,
+    })
+
+
+@app.post("/login")
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    if _check_login(username.strip(), password):
+        request.session["authenticated"] = True
+        request.session["username"] = username.strip()
+        return RedirectResponse("/", status_code=302)
+
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "restaurant": settings.restaurant_name,
+        "error": "Invalid username or password",
+    }, status_code=401)
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=302)
+
 
 @app.get("/")
 async def browser_demo(request: Request):
     """Browser demo UI — served from app/templates/index.html."""
+    if not _is_logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+
     vapi_pub   = settings.vapi_public_key or ""
     vapi_asst  = settings.vapi_assistant_id or ""
     vapi_ready = bool(vapi_pub and vapi_pub != "your_vapi_public_key_here")
@@ -551,4 +830,6 @@ async def browser_demo(request: Request):
         "restaurant":   settings.restaurant_name,
         "vapi_ready":   vapi_ready,
         "retell_ready": retell_ready,
+        "dash_key":     settings.dashboard_api_key or "",
+        "username":     request.session.get("username", ""),
     })

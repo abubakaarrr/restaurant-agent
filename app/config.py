@@ -42,6 +42,16 @@ class Settings(BaseSettings):
     # The Retell agent to dial for browser web calls (from the Retell dashboard).
     retell_agent_id: str = ""
 
+    # Dashboard / internal API protection
+    # Set a strong random string in .env; required on X-API-Key header for /api/* routes.
+    dashboard_api_key: str = ""
+
+    # Single shared login for the browser dashboard (POC)
+    login_username: str = "admin"
+    login_password: str = "admin"
+    # Signs the session cookie — use a long random string in production
+    session_secret: str = ""
+
     # App
     app_env: str = "development"
 

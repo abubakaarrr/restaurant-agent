@@ -11,6 +11,7 @@ from app.tools.db import (
     lookup_order,
     get_full_menu,
     check_menu_item_availability,
+    end_call,
 )
 
 ALL_TOOLS = [
@@ -25,6 +26,7 @@ ALL_TOOLS = [
     lookup_order,
     get_full_menu,
     check_menu_item_availability,
+    end_call,
 ]
 
 __all__ = ["ALL_TOOLS"]
