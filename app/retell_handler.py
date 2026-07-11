@@ -62,15 +62,10 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
     caller keeps talking or interrupts (barge-in). All sends go through a lock
     so the reader loop and the generation task never interleave WebSocket frames.
     """
-    # Verify Retell's authorization header before doing anything else.
-    # Retell sends: Authorization: Bearer <your_retell_api_key>
-    if settings.retell_api_key:
-        auth_header = websocket.headers.get("authorization", "")
-        expected = f"Bearer {settings.retell_api_key}"
-        if auth_header != expected:
-            logger.warning("Retell WebSocket rejected — bad Authorization header on call %s", call_id)
-            await websocket.close(code=4401)
-            return
+    # NOTE: Retell does NOT send Authorization: Bearer <RETELL_API_KEY> on the
+    # custom-LLM WebSocket. That key is only for Retell's REST API. Requiring it
+    # here instantly closes every call. Optional query-token auth can be added
+    # later (e.g. wss://host/retell-ws/{id}?token=...).
 
     send_lock = asyncio.Lock()
 
