@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import AsyncIterator
 
 from app.agent.graph import restaurant_agent
@@ -20,6 +21,8 @@ from app.reply_guard import is_clerk_inventory, is_repeated_reply
 from app.restaurant_settings import load_restaurant_settings
 from app.config import settings
 from app.call_flags import clear_call_control
+
+logger = logging.getLogger(__name__)
 
 _sessions: dict[str, list[dict]] = {}
 
@@ -65,13 +68,50 @@ def _chunk_has_tool_calls(chunk: object) -> bool:
     return bool(additional.get("tool_calls") or additional.get("function_call"))
 
 
-def _extract_reply(messages: list) -> str:
-    for msg in reversed(messages):
-        if hasattr(msg, "type") and msg.type == "ai":
-            reply = _text_from_message_content(msg.content).strip()
-            if reply:
-                return reply
+def _message_role(msg: object) -> str:
+    if isinstance(msg, dict):
+        return str(msg.get("role") or msg.get("type") or "")
+    msg_type = getattr(msg, "type", None)
+    if msg_type:
+        return str(msg_type)
     return ""
+
+
+def _extract_reply(messages: list) -> str:
+    """Return speakable text from *this* turn only — never a prior assistant turn.
+
+    LangGraph returns the full transcript. Walking every AIMessage can echo an
+    older reply when the latest model step emitted tool_calls with empty content.
+    """
+    last_human_idx = -1
+    for index, msg in enumerate(messages):
+        role = _message_role(msg).casefold()
+        if role in {"human", "user"}:
+            last_human_idx = index
+    candidates = messages[last_human_idx + 1 :] if last_human_idx >= 0 else messages
+    for msg in reversed(candidates):
+        role = _message_role(msg).casefold()
+        if role != "ai" and role != "assistant":
+            continue
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        reply = _text_from_message_content(content).strip()
+        if reply:
+            return reply
+    return ""
+
+
+def _history_digest(history: list[dict]) -> list[dict[str, str]]:
+    digest = []
+    for message in history[-12:]:
+        role = str(message.get("role") or "")
+        content = str(message.get("content") or "")
+        digest.append(
+            {
+                "role": role,
+                "content": content if len(content) <= 240 else content[:237] + "...",
+            }
+        )
+    return digest
 
 
 def _save_turn(session_id: str, history: list[dict], user_message: str, reply: str) -> None:
@@ -120,6 +160,13 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
     scope = _action_scope(session_id, len(history), user_message)
     action_token = set_current_action_scope(scope)
     begin_turn(session_id, scope)
+    logger.info(
+        "run_agent start session=%s scope=%s user=%r history=%s",
+        session_id,
+        scope,
+        user_message,
+        _history_digest(history),
+    )
     try:
         payload = {
             "messages": history,
@@ -133,7 +180,17 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
             payload,
             config={"configurable": {"restaurant_name": settings.restaurant_name}},
         )
-        reply = _extract_reply(result.get("messages", [])) or "I'm sorry, could you repeat that?"
+        raw_messages = result.get("messages", [])
+        reply = _extract_reply(raw_messages) or "I'm sorry, could you repeat that?"
+        logger.info(
+            "run_agent model_output session=%s scope=%s reply=%r "
+            "result_msg_count=%s extracted_after_last_human=%s",
+            session_id,
+            scope,
+            reply,
+            len(raw_messages),
+            bool(_extract_reply(raw_messages)),
+        )
         retry_reason = ""
         if is_repeated_reply(user_message, previous_reply, reply):
             retry_reason = (
@@ -154,7 +211,17 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
                 payload,
                 config={"configurable": {"restaurant_name": settings.restaurant_name}},
             )
-            reply = _extract_reply(result.get("messages", [])) or reply
+            raw_messages = result.get("messages", [])
+            retried = _extract_reply(raw_messages)
+            logger.info(
+                "run_agent retry session=%s scope=%s reason=%r reply=%r",
+                session_id,
+                scope,
+                retry_reason[:80],
+                retried,
+            )
+            # Never keep a stale prior-turn extract when the retry also had no text.
+            reply = retried or "I'm sorry, could you repeat that?"
         audit_assistant_speech(reply)
         history.append({"role": "assistant", "content": reply})
         _sessions[session_id] = history[-40:]
@@ -256,6 +323,12 @@ async def stream_agent_tokens(
     if not reply:
         reply = "I'm sorry, could you repeat that?"
 
+    logger.info(
+        "stream_agent_tokens done session=%s reply=%r streamed=%s",
+        session_id,
+        reply,
+        bool(streamed_parts),
+    )
     audit_assistant_speech(reply)
     end_turn()
 
