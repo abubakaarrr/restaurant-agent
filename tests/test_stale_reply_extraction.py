@@ -133,4 +133,9 @@ async def test_three_identical_asks_do_not_echo_unrelated_prior_reply() -> None:
 def test_yes_after_time_change_is_not_treated_as_harmless_ack_for_repeat_gate() -> None:
     previous = "Got it, 7:00 PM it is. You're all set for Friday."
     # "yes" is not in the ack list — repeated prior reply should still be flagged.
-    assert is_repeated_reply("yes", previous, previous)
+    assert is_repeated_reply(
+        "yes",
+        previous,
+        previous,
+        previous_user_message="Make that 7:00 PM instead of 7:30.",
+    )

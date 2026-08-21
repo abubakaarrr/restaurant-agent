@@ -151,9 +151,14 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
     history = seed_opening_history(list(_sessions.get(session_id, [])))
     history.append({"role": "user", "content": user_message})
     previous_reply = ""
+    previous_user_message = ""
     for message in reversed(history[:-1]):
-        if message.get("role") == "assistant":
+        role = message.get("role")
+        if role == "assistant" and not previous_reply:
             previous_reply = str(message.get("content") or "")
+        elif role == "user" and not previous_user_message:
+            previous_user_message = str(message.get("content") or "")
+        if previous_reply and previous_user_message:
             break
 
     token = set_current_session_id(session_id)
@@ -192,10 +197,16 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
             bool(_extract_reply(raw_messages)),
         )
         retry_reason = ""
-        if is_repeated_reply(user_message, previous_reply, reply):
+        if is_repeated_reply(
+            user_message,
+            previous_reply,
+            reply,
+            previous_user_message=previous_user_message,
+        ):
             retry_reason = (
-                "Your previous reply repeated an old answer and ignored the latest "
-                "user message. Answer ONLY the latest user message. Use tools if needed."
+                "BUG SIGNAL: your reply was identical or nearly identical to your "
+                "previous turn, but the caller said something different. "
+                "Answer ONLY the latest user message in fresh words. Use tools if needed."
             )
         elif is_clerk_inventory(reply):
             retry_reason = (
@@ -220,8 +231,24 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
                 retry_reason[:80],
                 retried,
             )
-            # Never keep a stale prior-turn extract when the retry also had no text.
             reply = retried or "I'm sorry, could you repeat that?"
+            if is_repeated_reply(
+                user_message,
+                previous_reply,
+                reply,
+                previous_user_message=previous_user_message,
+            ):
+                logger.error(
+                    "run_agent still_duplicate_after_retry session=%s scope=%s "
+                    "forcing_soft_fallback user=%r",
+                    session_id,
+                    scope,
+                    user_message,
+                )
+                reply = (
+                    "Sorry — I repeated myself there. "
+                    "What did you need me to do just now?"
+                )
         audit_assistant_speech(reply)
         history.append({"role": "assistant", "content": reply})
         _sessions[session_id] = history[-40:]
