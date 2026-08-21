@@ -93,6 +93,7 @@ async def check_table_availability(
             time,
             party_size,
             preferred_location=location,
+            call_id=session_id,
         )
     except RestaurantServiceError as error:
         return _error_text(error)
@@ -109,8 +110,9 @@ async def create_booking(
     session_id: str = "",
     notes: str = "",
     caller_confirmed: bool = False,
+    table_number: int = 0,
 ) -> str:
-    """Create a booking only after the caller confirms name, phone, date, time and party size. Include seating or guest instructions in notes. Never use this to change an existing booking."""
+    """Create a booking only after the caller confirms name, phone, date, time and party size. Include seating or guest instructions in notes. Optional table_number must come from a fresh check_table_availability result. Never use this to change an existing booking."""
     session_id = resolve_session_id(session_id)
     draft = load_reservation_draft(session_id)
     if not notes.strip():
@@ -127,6 +129,7 @@ async def create_booking(
                     "time": time,
                     "party_size": party_size,
                     "notes": notes,
+                    "table_number": table_number,
                 },
             ),
             customer_name=name,
@@ -137,6 +140,7 @@ async def create_booking(
             notes=notes,
             confirmed=caller_confirmed,
             preferred_location=seating_location(draft),
+            table_number=table_number,
         )
     except RestaurantServiceError as error:
         return _error_text(error)
@@ -279,6 +283,7 @@ async def update_reservation_draft(
                 time,
                 party_size,
                 preferred_location=seating_location(draft),
+                call_id=session_id,
             )
             text += " " + format_availability_speech(availability)
             if not availability.get("available"):

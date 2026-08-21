@@ -56,6 +56,7 @@ class AvailabilityRequest(BaseModel):
     time: str = Field(pattern=r"^\d{2}:\d{2}$")
     party_size: int = Field(ge=1, le=12)
     preferred_location: str = Field(default="", max_length=40)
+    call_id: str = Field(default="", max_length=200)
 
 
 class CreateBookingRequest(CallRequest, AvailabilityRequest):
@@ -63,6 +64,7 @@ class CreateBookingRequest(CallRequest, AvailabilityRequest):
     customer_phone: str = Field(default="", max_length=200)
     notes: str = Field(default="", max_length=500)
     confirmed: bool
+    table_number: int = Field(default=0, ge=0)
 
 
 class LookupBookingRequest(BaseModel):
@@ -215,6 +217,7 @@ async def check_availability(body: AvailabilityRequest) -> dict[str, Any]:
                 body.time,
                 body.party_size,
                 preferred_location=body.preferred_location,
+                call_id=body.call_id,
             )
         )
     except RestaurantServiceError as error:
@@ -238,6 +241,7 @@ async def create_booking(
             notes=body.notes,
             confirmed=body.confirmed,
             preferred_location=body.preferred_location,
+            table_number=body.table_number,
         )
         if result.get("created") and result.get("booking_id") and result.get("customer_name"):
             set_active_booking(

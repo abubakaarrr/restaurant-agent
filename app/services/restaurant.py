@@ -295,6 +295,7 @@ class RestaurantService:
             FROM tables t
             WHERE t.capacity >= $1
               {location_filter}
+              AND ($7::int = 0 OR t.table_number = $7)
               AND NOT EXISTS (
                 SELECT 1
                 FROM bookings b
@@ -402,6 +403,7 @@ class RestaurantService:
         limit: int = 5,
         preferred_location: str = "",
         exclude_booking_id: int = 0,
+        table_number: int = 0,
         conn: Any | None = None,
         require_location_match: bool | None = None,
     ) -> list[JsonDict]:
@@ -423,6 +425,7 @@ class RestaurantService:
             int(exclude_booking_id or 0),
             location,
             limit,
+            int(table_number or 0),
         )
         if conn is not None:
             rows = await conn.fetch(sql, *args)
@@ -468,6 +471,7 @@ class RestaurantService:
         *,
         preferred_location: str = "",
         exclude_booking_id: int = 0,
+        call_id: str = "",
     ) -> JsonDict:
         preferred = normalize_preferred_location(preferred_location)
         limits = await self.seating_limits()
@@ -513,6 +517,12 @@ class RestaurantService:
             "alternatives": alternatives,
         }
         record_availability(result)
+        from app.availability_offer import remember_availability_offer
+        from app.call_memory import resolve_session_id
+
+        sid = resolve_session_id(call_id) if call_id else resolve_session_id()
+        if sid and tables:
+            remember_availability_offer(sid, result)
         return result
 
     async def _availability_alternatives(
@@ -609,6 +619,7 @@ class RestaurantService:
         notes: str = "",
         confirmed: bool,
         preferred_location: str = "",
+        table_number: int = 0,
     ) -> JsonDict:
         if confirmed is not True:
             raise RestaurantServiceError(
@@ -622,6 +633,9 @@ class RestaurantService:
         party_size = self._validate_party_size(party_size)
         dt = self._parse_booking_datetime(date, time)
         notes = notes.strip()[:500]
+        chosen_table = int(table_number or 0)
+        if chosen_table < 0:
+            chosen_table = 0
         confirmation_payload = booking_confirmation_payload(
             customer_name=name,
             customer_phone=phone,
@@ -639,6 +653,7 @@ class RestaurantService:
             "party_size": party_size,
             "notes": notes,
             "preferred_location": preferred_location or "",
+            "table_number": chosen_table,
         }
 
         async def operation(conn: Any) -> JsonDict:
@@ -686,8 +701,18 @@ class RestaurantService:
             require_pending_confirmation(
                 call_id, ACTION_CREATE_BOOKING, confirmation_payload
             )
+            if chosen_table:
+                from app.availability_offer import require_offered_table
+
+                require_offered_table(
+                    call_id,
+                    table_number=chosen_table,
+                    date=date,
+                    time=time,
+                    party_size=party_size,
+                )
             location_pref = normalize_preferred_location(preferred_location)
-            if location_pref:
+            if location_pref and not chosen_table:
                 limits = await self.seating_limits(conn=conn)
                 max_here = int(
                     (limits.get("max_seats_by_location") or {}).get(location_pref) or 0
@@ -705,14 +730,19 @@ class RestaurantService:
                 time,
                 party_size,
                 limit=1,
-                preferred_location=location_pref,
+                preferred_location="" if chosen_table else location_pref,
                 conn=conn,
-                require_location_match=bool(location_pref),
+                require_location_match=bool(location_pref) and not chosen_table,
+                table_number=chosen_table,
             )
             table = tables[0] if tables else None
             if not table:
                 raise RestaurantServiceError(
-                    "That slot is no longer available. Offer a new time.",
+                    (
+                        f"Table {chosen_table} is no longer available for that slot."
+                        if chosen_table
+                        else "That slot is no longer available. Offer a new time."
+                    ),
                     code="slot_unavailable",
                     status=409,
                 )
