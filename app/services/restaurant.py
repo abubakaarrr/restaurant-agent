@@ -524,8 +524,10 @@ class RestaurantService:
         from app.availability_offer import remember_availability_offer
         from app.call_memory import resolve_session_id
 
+        # Always remember — including negative results — so party-size edits can
+        # ground accept/reject on a real check_table_availability outcome.
         sid = resolve_session_id(call_id) if call_id else resolve_session_id()
-        if sid and tables:
+        if sid:
             remember_availability_offer(sid, result)
         return result
 
@@ -705,6 +707,8 @@ class RestaurantService:
             require_pending_confirmation(
                 call_id, ACTION_CREATE_BOOKING, confirmation_payload
             )
+            # create_booking always re-queries live tables below; optional table_number
+            # must also match a remembered availability offer (require_offered_table).
             if chosen_table:
                 from app.availability_offer import require_offered_table
 
@@ -919,6 +923,28 @@ class RestaurantService:
             customer_name=new_name,
             require_approval_for_paid_items=require_approval_for_paid_items,
         )
+        # Party-size edits must cite a fresh check_table_availability for that size.
+        if party_size > 0:
+            from app.availability_offer import require_fresh_availability_for_party_change
+            from app.call_memory import get_reservation_draft as _load_draft
+
+            draft_now = _load_draft(call_id)
+            current_party = int(draft_now.get("party_size") or 0)
+            if party_size != current_party:
+                slot_date = date or str(draft_now.get("date") or "")
+                slot_time = time or str(draft_now.get("time") or "")
+                require_fresh_availability_for_party_change(
+                    call_id,
+                    date=slot_date,
+                    time=slot_time,
+                    party_size=party_size,
+                    preferred_location=preferred_location
+                    or (
+                        seating_preference
+                        if isinstance(seating_preference, str)
+                        else ""
+                    ),
+                )
         if confirmed is not True:
             digest = register_pending_confirmation(
                 call_id,

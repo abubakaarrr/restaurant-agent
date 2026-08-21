@@ -120,6 +120,22 @@ def update_reservation_draft(
             "do not call update_reservation_draft."
         )
     payload = {**(updates or {}), **fields}
+    if "party_size" in payload and payload["party_size"] is not None:
+        try:
+            new_party = int(payload["party_size"])
+        except (TypeError, ValueError):
+            new_party = 0
+        current_party = int(current.get("party_size") or 0)
+        if new_party > 0 and current_party > 0 and new_party != current_party:
+            from app.availability_offer import require_fresh_availability_for_party_change
+
+            require_fresh_availability_for_party_change(
+                sid,
+                date=str(payload.get("date") or current.get("date") or ""),
+                time=str(payload.get("time") or current.get("time") or ""),
+                party_size=new_party,
+                preferred_location=str(current.get("seating_preference") or ""),
+            )
     draft = patch_draft(current, payload)
     _store_flattened(sid, draft)
     return dict(draft)
