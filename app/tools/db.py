@@ -278,11 +278,19 @@ def _ack_field_changes(updates: dict) -> str:
 
 @tool
 async def get_reservation_draft(session_id: str = "") -> str:
-    """Return the authoritative reservation details for this call. Use this instead of guessing from chat when asked what you have so far."""
+    """Return the authoritative reservation details for this call. Use this instead of guessing from chat when asked what you have so far. After a booking exists, this refreshes from the live bookings row."""
     session_id = resolve_session_id(session_id)
     await hydrate_call_memory(session_id)
     draft = load_reservation_draft(session_id)
-    notes = compose_notes(draft) or str(get_call_memory(session_id).get("notes") or "")
+    if int(draft.get("booking_id") or 0) > 0:
+        try:
+            draft = await restaurant_service.sync_confirmed_draft_from_booking(
+                session_id, int(draft["booking_id"])
+            )
+        except RestaurantServiceError:
+            draft = load_reservation_draft(session_id)
+    memory = get_call_memory(session_id)
+    notes = compose_notes(draft) or str(memory.get("notes") or "")
     readback_required = False
     if (
         draft.get("customer_name")
@@ -311,7 +319,14 @@ async def get_reservation_draft(session_id: str = "") -> str:
             )
         except RestaurantServiceError:
             pass
-    text = speak_draft(draft)
+    table_bits = ""
+    if memory.get("table_number"):
+        table_bits = (
+            f" Table {memory.get('table_number')}"
+            + (f" in {memory.get('table_location')}" if memory.get("table_location") else "")
+            + "."
+        )
+    text = speak_draft(draft) + table_bits
     if readback_required:
         return (
             "Terminal readback facts (readback_required=true). "
@@ -410,12 +425,26 @@ async def update_confirmed_booking(
             table_number=int(result["table_number"]) if result.get("table_number") else None,
             table_location=result.get("location", ""),
             notes=result.get("notes", ""),
+            seating_preference=result.get("seating_preference"),
         )
+        try:
+            await restaurant_service.sync_confirmed_draft_from_booking(
+                session_id, int(result["booking_id"])
+            )
+        except RestaurantServiceError:
+            pass
         extra = f" Notes: {result['notes']}." if result.get("notes") else ""
+        reassign = ""
+        if result.get("table_reassigned"):
+            reassign = (
+                f" Table reassigned from {result.get('previous_table_number')} "
+                f"({result.get('previous_location') or 'previous'}) to "
+                f"{result['table_number']} in {result['location']} — say this out loud."
+            )
         return (
             f"Booking {result['booking_id']} updated. Table {result['table_number']} in "
             f"{result['location']} for {result['party_size']} on {result['date']} at "
-            f"{result['time']}.{extra}"
+            f"{result['time']}.{extra}{reassign}"
         )
     alternatives = result.get("alternatives") or []
     alt_text = " or ".join(

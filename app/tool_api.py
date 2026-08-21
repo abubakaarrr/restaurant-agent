@@ -340,6 +340,13 @@ async def update_reservation_draft(body: UpdateReservationDraftRequest) -> dict[
 async def get_reservation_draft(body: CallRequest) -> dict[str, Any]:
     await hydrate_call_memory(body.call_id)
     draft = load_reservation_draft(body.call_id)
+    if int(draft.get("booking_id") or 0) > 0:
+        try:
+            draft = await restaurant_service.sync_confirmed_draft_from_booking(
+                body.call_id, int(draft["booking_id"])
+            )
+        except RestaurantServiceError as error:
+            _raise_service_error(error)
     notes = compose_notes(draft) or str(get_call_memory(body.call_id).get("notes") or "")
     if (
         draft.get("customer_name")
@@ -365,7 +372,14 @@ async def get_reservation_draft(body: CallRequest) -> dict[str, Any]:
             body.call_id, pending_state_patch(body.call_id)
         )
         return _ok({**draft, "pending_confirmation_hash": digest, "readback_required": True})
-    return _ok(draft)
+    memory = get_call_memory(body.call_id)
+    return _ok(
+        {
+            **draft,
+            "table_number": memory.get("table_number"),
+            "table_location": memory.get("table_location") or "",
+        }
+    )
 
 
 @router.post("/bookings/update", dependencies=[ToolAuth])

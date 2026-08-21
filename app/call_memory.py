@@ -269,22 +269,23 @@ def set_active_booking(
     table_number: int | None = None,
     table_location: str = "",
     notes: str = "",
+    seating_preference: str | None = None,
 ) -> None:
     sid = resolve_session_id(session_id)
     if not sid:
         return
-    draft = patch_draft(
-        get_reservation_draft(sid),
-        {
-            "booking_id": booking_id,
-            "customer_name": customer_name,
-            "customer_phone": customer_phone,
-            "party_size": party_size,
-            "date": date,
-            "time": time,
-            "status": "confirmed",
-        },
-    )
+    patch: dict[str, Any] = {
+        "booking_id": booking_id,
+        "customer_name": customer_name,
+        "customer_phone": customer_phone,
+        "party_size": party_size,
+        "date": date,
+        "time": time,
+        "status": "confirmed",
+    }
+    if seating_preference is not None:
+        patch["seating_preference"] = seating_preference
+    draft = patch_draft(get_reservation_draft(sid), patch)
     if notes and not compose_notes(draft):
         draft["extra_notes"] = notes
     extra = {}
@@ -293,6 +294,53 @@ def set_active_booking(
     if table_location:
         extra["table_location"] = table_location
     _store_flattened(sid, draft, extra)
+
+
+def apply_live_booking_to_memory(session_id: str, live: dict[str, Any]) -> dict[str, Any]:
+    """Overwrite in-call draft from a live bookings row (post-confirm source of truth)."""
+    sid = resolve_session_id(session_id)
+    if not sid:
+        return empty_draft()
+    current = get_reservation_draft(sid)
+    location = str(live.get("location") or "")
+    notes = str(live.get("notes") or "")
+    seating = str(current.get("seating_preference") or "")
+    # Prefer seating encoded in live notes; else table location.
+    for part in notes.split(";"):
+        part = part.strip()
+        if part.casefold().startswith("seating:"):
+            seating = part.split(":", 1)[1].strip()
+            break
+    if not seating and location:
+        seating = location
+    elif location and seating:
+        from app.reservation_draft import preferred_location
+
+        if preferred_location(seating) and preferred_location(location):
+            if preferred_location(seating) != preferred_location(location):
+                seating = location
+
+    draft = patch_draft(
+        current,
+        {
+            "booking_id": int(live.get("booking_id") or 0),
+            "status": "confirmed",
+            "customer_name": str(live.get("customer_name") or ""),
+            "customer_phone": str(live.get("customer_phone") or ""),
+            "date": str(live.get("date") or ""),
+            "time": str(live.get("time") or ""),
+            "party_size": int(live.get("party_size") or 0),
+            "seating_preference": seating,
+        },
+    )
+    extra = {
+        "table_number": live.get("table_number"),
+        "table_location": location,
+        "guest_notes": str(get_call_memory(sid).get("guest_notes") or ""),
+        "notes": notes,
+    }
+    _store_flattened(sid, draft, extra)
+    return get_reservation_draft(sid)
 
 
 def clear_call_memory(session_id: str) -> None:

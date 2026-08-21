@@ -1038,8 +1038,14 @@ class RestaurantService:
             table_number = row["table_number"]
             location = row["location"]
             table_id = row["table_id"]
+            previous_table_number = table_number
+            previous_location = location or ""
+            location_changed = bool(
+                location_pref
+                and normalize_preferred_location(str(location or "")) != location_pref
+            )
 
-            if changing_slot:
+            if changing_slot or location_changed:
                 tables = await self.get_available_tables(
                     new_date,
                     new_time,
@@ -1136,6 +1142,10 @@ class RestaurantService:
                 conn, call_id, state, caller_phone=row["customer_phone"] or ""
             )
             clear_pending_confirmation(call_id, ACTION_UPDATE_CONFIRMED_BOOKING)
+            table_reassigned = (
+                previous_table_number != table_number
+                or (previous_location or "") != (location or "")
+            )
             return {
                 "updated": True,
                 "booking_id": booking_id,
@@ -1147,6 +1157,10 @@ class RestaurantService:
                 "table_number": table_number,
                 "location": location or "",
                 "notes": rebuilt_notes,
+                "table_reassigned": table_reassigned,
+                "previous_table_number": previous_table_number,
+                "previous_location": previous_location,
+                "seating_preference": draft.get("seating_preference") or "",
             }
 
         result, replayed = await self._idempotent_write(
@@ -1345,13 +1359,52 @@ class RestaurantService:
         return {
             "booking_id": row["id"],
             "customer_name": row["customer_name"],
+            "customer_phone": row["customer_phone"] or "",
             "booked_at": row["booked_at"].isoformat(),
+            "date": row["booked_at"].date().isoformat(),
+            "time": row["booked_at"].strftime("%H:%M"),
             "party_size": row["party_size"],
             "status": row["status"],
             "table_number": row["table_number"],
-            "location": row["location"],
+            "location": row["location"] or "",
             "notes": row["notes"] or "",
         }
+
+    async def sync_confirmed_draft_from_booking(
+        self,
+        call_id: str,
+        booking_id: int = 0,
+    ) -> JsonDict:
+        """Reload the live bookings row into call memory — single SoT post-confirm."""
+        from app.call_memory import apply_live_booking_to_memory, get_call_memory
+
+        call_id = self._require_call_id(call_id)
+        memory = get_call_memory(call_id)
+        bid = int(booking_id or memory.get("booking_id") or 0)
+        if bid <= 0:
+            from app.call_memory import get_reservation_draft
+
+            return get_reservation_draft(call_id)
+        live = await self.lookup_booking(booking_id=bid)
+        draft = apply_live_booking_to_memory(call_id, live)
+        try:
+            from app.reservation_draft import flatten_draft
+
+            await self.persist_call_state(
+                call_id,
+                {
+                    **flatten_draft(
+                        draft,
+                        guest_notes=str(get_call_memory(call_id).get("guest_notes") or ""),
+                    ),
+                    "table_number": live.get("table_number"),
+                    "table_location": live.get("location") or "",
+                },
+                caller_phone=str(draft.get("customer_phone") or ""),
+            )
+        except RestaurantServiceError:
+            pass
+        return draft
 
     async def cancel_booking(
         self,
