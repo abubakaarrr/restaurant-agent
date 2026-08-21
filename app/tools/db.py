@@ -613,6 +613,38 @@ async def add_order_item(
 
 
 @tool
+async def set_order_fulfillment(
+    session_id: str,
+    fulfillment_type: str,
+    booking_id: int = 0,
+) -> str:
+    """Set dine_in or pickup on the existing pending order. Does not add items. Use pickup only on an explicit pickup request; reservation pre-orders default to dine_in."""
+    session_id = resolve_session_id(session_id)
+    memory = get_call_memory(session_id)
+    if fulfillment_type.strip().casefold() == "dine_in" and not booking_id:
+        booking_id = int(memory.get("booking_id") or 0)
+    try:
+        result = await restaurant_service.set_order_fulfillment(
+            call_id=session_id,
+            idempotency_key=make_idempotency_key(
+                "set_order_fulfillment",
+                {
+                    "fulfillment_type": fulfillment_type,
+                    "booking_id": booking_id,
+                },
+            ),
+            fulfillment_type=fulfillment_type,
+            booking_id=booking_id or None,
+        )
+    except RestaurantServiceError as error:
+        return _error_text(error)
+    return (
+        f"Fulfillment set to {result.get('fulfillment')}. "
+        + _format_order(result)
+    )
+
+
+@tool
 async def get_order_summary(session_id: str) -> str:
     """Read the current order, including a confirmed reservation pre-order. This does not change anything."""
     try:

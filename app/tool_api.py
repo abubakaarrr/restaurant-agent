@@ -114,6 +114,11 @@ class ConfirmOrderRequest(CallRequest):
     approved: bool
 
 
+class SetOrderFulfillmentRequest(CallRequest):
+    fulfillment_type: str = Field(min_length=1, max_length=20)
+    booking_id: int = Field(default=0, ge=0)
+
+
 class LookupOrderRequest(BaseModel):
     order_id: int = Field(gt=0)
     customer_name: str = Field(min_length=1, max_length=100)
@@ -459,6 +464,24 @@ async def add_order_item(
 async def order_summary(body: CallRequest) -> dict[str, Any]:
     try:
         return _ok(await restaurant_service.get_order_summary(call_id=body.call_id))
+    except RestaurantServiceError as error:
+        _raise_service_error(error)
+
+
+@router.post("/orders/fulfillment", dependencies=[ToolAuth])
+async def set_order_fulfillment(
+    body: SetOrderFulfillmentRequest,
+    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    try:
+        result = await restaurant_service.set_order_fulfillment(
+            call_id=body.call_id,
+            idempotency_key=idempotency_key,
+            fulfillment_type=body.fulfillment_type,
+            booking_id=body.booking_id or None,
+        )
+        _audit(body.call_id, "set_order_fulfillment", result)
+        return _ok(result)
     except RestaurantServiceError as error:
         _raise_service_error(error)
 

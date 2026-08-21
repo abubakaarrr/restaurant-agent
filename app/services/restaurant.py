@@ -773,7 +773,8 @@ class RestaurantService:
             await conn.execute(
                 """
                 UPDATE orders
-                SET booking_id = $1
+                SET booking_id = $1,
+                    fulfillment_type = 'dine_in'
                 WHERE session_id = $2
                   AND booking_id IS NULL
                   AND status IN ('pending', 'confirmed')
@@ -1692,18 +1693,21 @@ class RestaurantService:
                 booking_id,
             )
         if not order and create_if_missing:
+            fulfillment = "dine_in" if booking_id else "pickup"
             created = await conn.fetchrow(
                 """
                 INSERT INTO orders
-                    (session_id, booking_id, customer_name, customer_phone, status, draft_version)
-                VALUES ($1, $2, $3, $4, 'pending', 1)
+                    (session_id, booking_id, customer_name, customer_phone,
+                     status, draft_version, fulfillment_type)
+                VALUES ($1, $2, $3, $4, 'pending', 1, $5)
                 RETURNING id, booking_id, customer_name, customer_phone,
-                          draft_version, status, FALSE AS existing
+                          draft_version, status, fulfillment_type, FALSE AS existing
                 """,
                 call_id,
                 booking_id or None,
                 customer_name,
                 customer_phone,
+                fulfillment,
             )
             return dict(created)
         if not order:
@@ -1726,7 +1730,7 @@ class RestaurantService:
         order = await conn.fetchrow(
             """
             SELECT id, session_id, booking_id, customer_name, customer_phone,
-                   status, total_amount, draft_version, created_at
+                   status, total_amount, draft_version, created_at, fulfillment_type
             FROM orders WHERE id = $1
             """,
             order_id,
@@ -1756,6 +1760,11 @@ class RestaurantService:
                 "proposed": bool(item["proposed"]),
             }
 
+        stored = order["fulfillment_type"]
+        if stored in {"dine_in", "pickup"}:
+            fulfillment = stored
+        else:
+            fulfillment = "dine_in" if order["booking_id"] else "pickup"
         return {
             "order_id": order["id"],
             "call_id": order["session_id"],
@@ -1766,7 +1775,8 @@ class RestaurantService:
             "total": calculated_total,
             "items": [_item_payload(item) for item in committed],
             "proposed_items": [_item_payload(item) for item in proposed],
-            "fulfillment": "dine_in" if order["booking_id"] else "pickup",
+            "fulfillment": fulfillment,
+            "fulfillment_type": fulfillment,
         }
 
     async def get_order_summary(self, *, call_id: str) -> JsonDict:
@@ -1803,6 +1813,113 @@ class RestaurantService:
         result["summary_nonce"] = secrets.token_hex(8)
         record_order_summary(result)
         return result
+
+    async def set_order_fulfillment(
+        self,
+        *,
+        call_id: str,
+        idempotency_key: str,
+        fulfillment_type: str,
+        booking_id: int | None = None,
+    ) -> JsonDict:
+        """Replace fulfillment on the existing pending order; never creates a second order."""
+        call_id = self._require_call_id(call_id)
+        fulfillment = str(fulfillment_type or "").strip().casefold()
+        if fulfillment not in {"dine_in", "pickup"}:
+            raise RestaurantServiceError(
+                "fulfillment_type must be dine_in or pickup.",
+                code="invalid_fulfillment",
+                status=400,
+            )
+        resolved_booking: int | None
+        if booking_id is None:
+            resolved_booking = None
+        else:
+            try:
+                resolved_booking = int(booking_id)
+            except (TypeError, ValueError):
+                resolved_booking = 0
+            if resolved_booking <= 0:
+                resolved_booking = None
+        if fulfillment == "dine_in" and not resolved_booking:
+            # Fall back to active booking in session when switching to dine-in.
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                resolved_booking = await self._booking_id_from_session(conn, call_id) or None
+            if not resolved_booking:
+                raise RestaurantServiceError(
+                    "dine_in requires a booking_id (or an active reservation on this call).",
+                    code="booking_required",
+                    status=409,
+                )
+        if fulfillment == "pickup":
+            resolved_booking = None
+        payload = {
+            "call_id": call_id,
+            "fulfillment_type": fulfillment,
+            "booking_id": resolved_booking or 0,
+        }
+
+        async def operation(conn: Any) -> JsonDict:
+            order = await conn.fetchrow(
+                """
+                SELECT id, status FROM orders
+                WHERE session_id = $1 AND status IN ('pending', 'confirmed')
+                ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                call_id,
+            )
+            if not order:
+                raise RestaurantServiceError(
+                    "No order exists for this call.",
+                    code="order_not_found",
+                    status=404,
+                )
+            if order["status"] == "confirmed":
+                raise RestaurantServiceError(
+                    "Fulfillment cannot be changed after the order is confirmed.",
+                    code="order_already_confirmed",
+                    status=409,
+                )
+            if fulfillment == "dine_in" and resolved_booking:
+                booking = await conn.fetchrow(
+                    """
+                    SELECT id FROM bookings
+                    WHERE id = $1 AND status = 'confirmed'
+                    """,
+                    resolved_booking,
+                )
+                if not booking:
+                    raise RestaurantServiceError(
+                        "That booking was not found.",
+                        code="booking_not_found",
+                        status=404,
+                    )
+            await conn.execute(
+                """
+                UPDATE orders
+                SET fulfillment_type = $1,
+                    booking_id = $2,
+                    draft_version = draft_version + 1
+                WHERE id = $3
+                """,
+                fulfillment,
+                resolved_booking,
+                order["id"],
+            )
+            summary = await self._order_summary_with_conn(conn, order["id"])
+            return {"updated": True, **summary}
+
+        result, replayed = await self._idempotent_write(
+            action="set_order_fulfillment",
+            idempotency_key=idempotency_key,
+            call_id=call_id,
+            payload=payload,
+            operation=operation,
+        )
+        return {**result, "idempotent_replay": replayed}
 
     async def update_order_item(
         self,
@@ -1949,7 +2066,8 @@ class RestaurantService:
                     code="draft_version_conflict",
                     status=409,
                 )
-            if not order["booking_id"] and (
+            summary = await self._order_summary_with_conn(conn, order["id"])
+            if summary.get("fulfillment") == "pickup" and (
                 not (order["customer_name"] or "").strip()
                 or not (order["customer_phone"] or "").strip()
             ):
@@ -1958,7 +2076,6 @@ class RestaurantService:
                     code="pickup_contact_required",
                     status=409,
                 )
-            summary = await self._order_summary_with_conn(conn, order["id"])
             if not summary["items"]:
                 raise RestaurantServiceError(
                     "The draft order is empty.", code="empty_order", status=409

@@ -1,5 +1,5 @@
 -- ══════════════════════════════════════════════════════════════
--- La Casa Restaurant — Database Schema
+-- The Lamplighter Public House — Database Schema
 -- Run: psql restaurant_agent -f db/schema.sql
 -- ══════════════════════════════════════════════════════════════
 
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     duration_mins   INT DEFAULT 90,
     status          TEXT DEFAULT 'confirmed',  -- confirmed | cancelled | completed
     notes           TEXT DEFAULT '',
+    require_approval_for_paid_items BOOLEAN NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
@@ -54,8 +55,11 @@ CREATE TABLE IF NOT EXISTS menu_items (
     price       NUMERIC(10,2) NOT NULL,
     description TEXT,
     dietary     TEXT[] DEFAULT '{}',     -- ['vegetarian','vegan','gluten-free','halal']
-    available   BOOLEAN DEFAULT TRUE
+    available   BOOLEAN DEFAULT TRUE,
+    price_estimated BOOLEAN NOT NULL DEFAULT FALSE
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_menu_items_name_ci
+    ON menu_items (LOWER(name));
 
 -- ─────────────────────────── Call Sessions ───────────────────
 CREATE TABLE IF NOT EXISTS call_sessions (
@@ -63,8 +67,12 @@ CREATE TABLE IF NOT EXISTS call_sessions (
     session_id      TEXT UNIQUE NOT NULL,
     caller_phone    TEXT DEFAULT '',
     state           JSONB DEFAULT '{}',
+    provider        TEXT DEFAULT '',
+    metadata        JSONB DEFAULT '{}',
+    behavior_state  JSONB DEFAULT '{}',
     started_at      TIMESTAMP DEFAULT NOW(),
-    ended_at        TIMESTAMP
+    ended_at        TIMESTAMP,
+    updated_at      TIMESTAMP DEFAULT NOW()
 );
 
 -- ─────────────────────────── Orders ──────────────────────────
@@ -76,12 +84,21 @@ CREATE TABLE IF NOT EXISTS orders (
     customer_name   TEXT DEFAULT '',
     customer_phone  TEXT DEFAULT '',
     status          TEXT DEFAULT 'pending',   -- pending | confirmed | cancelled
+    fulfillment_type TEXT,                   -- dine_in | pickup | null until set
     total_amount    NUMERIC(10,2) DEFAULT 0,
     notes           TEXT DEFAULT '',
-    created_at      TIMESTAMP DEFAULT NOW()
+    draft_version   INT NOT NULL DEFAULT 1,
+    created_at      TIMESTAMP DEFAULT NOW(),
+    confirmed_at    TIMESTAMP,
+    CHECK (
+        fulfillment_type IS NULL
+        OR fulfillment_type IN ('dine_in', 'pickup')
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_session ON orders(session_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_orders_one_pending_per_session
+    ON orders(session_id) WHERE status = 'pending';
 
 -- ─────────────────────────── Order Items ─────────────────────
 CREATE TABLE IF NOT EXISTS order_items (
@@ -92,9 +109,85 @@ CREATE TABLE IF NOT EXISTS order_items (
     quantity        INT DEFAULT 1,
     unit_price      NUMERIC(10,2) NOT NULL,
     subtotal        NUMERIC(10,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
-    notes           TEXT DEFAULT ''
+    notes           TEXT DEFAULT '',
+    proposed        BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- ─────────────────────────── Schema migrations ────────────────
 -- Add cancellation_reason to bookings if it doesn't exist yet
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_reason TEXT DEFAULT '';
+
+-- ───────────────────── Voice action idempotency ──────────────
+CREATE TABLE IF NOT EXISTS voice_action_idempotency (
+    id                  BIGSERIAL PRIMARY KEY,
+    action              TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL,
+    call_id             TEXT NOT NULL,
+    request_hash        TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'processing',
+    response            JSONB,
+    created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMP,
+    UNIQUE (action, idempotency_key),
+    CHECK (status IN ('processing', 'completed'))
+);
+CREATE INDEX IF NOT EXISTS idx_voice_action_call
+    ON voice_action_idempotency(call_id, created_at DESC);
+
+-- ───────────────────── Voice call observability ──────────────
+CREATE TABLE IF NOT EXISTS call_events (
+    id                  BIGSERIAL PRIMARY KEY,
+    call_id             TEXT NOT NULL,
+    provider            TEXT NOT NULL DEFAULT 'retell',
+    event_type          TEXT NOT NULL,
+    response_id         BIGINT,
+    duration_ms         INT,
+    payload             JSONB DEFAULT '{}',
+    created_at          TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_call_events_call
+    ON call_events(call_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_call_events_type
+    ON call_events(event_type, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS provider_webhook_events (
+    provider            TEXT NOT NULL,
+    event_id            TEXT NOT NULL,
+    event_type          TEXT NOT NULL,
+    call_id             TEXT NOT NULL DEFAULT '',
+    payload             JSONB NOT NULL DEFAULT '{}',
+    received_at         TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (provider, event_id)
+);
+
+-- ───────────────────── Operator knowledge loop ───────────────
+CREATE TABLE IF NOT EXISTS knowledge_gaps (
+    id                  SERIAL PRIMARY KEY,
+    session_id          TEXT NOT NULL DEFAULT '',
+    question            TEXT NOT NULL,
+    question_normalized TEXT NOT NULL,
+    context_excerpt     TEXT NOT NULL DEFAULT '',
+    agent_response      TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'unresolved',
+    resolved_answer     TEXT NOT NULL DEFAULT '',
+    resolved_by         TEXT NOT NULL DEFAULT '',
+    created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+    resolved_at         TIMESTAMP,
+    CHECK (status IN ('unresolved', 'resolved'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_gaps_session_question
+    ON knowledge_gaps (session_id, question_normalized);
+CREATE INDEX IF NOT EXISTS idx_knowledge_gaps_status
+    ON knowledge_gaps (status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS operator_knowledge (
+    id              SERIAL PRIMARY KEY,
+    question        TEXT NOT NULL,
+    answer          TEXT NOT NULL,
+    source_gap_id   INT REFERENCES knowledge_gaps(id) ON DELETE SET NULL,
+    active          BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_knowledge_question_ci
+    ON operator_knowledge (LOWER(question));
