@@ -19,7 +19,16 @@ Affirmation = Literal["affirmative", "negative", "unclear"]
 
 ACTION_CREATE_BOOKING = "create_booking"
 ACTION_CONFIRM_ORDER = "confirm_order"
-VALID_ACTIONS = frozenset({ACTION_CREATE_BOOKING, ACTION_CONFIRM_ORDER})
+ACTION_UPDATE_CONFIRMED_BOOKING = "update_confirmed_booking"
+ACTION_CANCEL_BOOKING = "cancel_booking"
+VALID_ACTIONS = frozenset(
+    {
+        ACTION_CREATE_BOOKING,
+        ACTION_CONFIRM_ORDER,
+        ACTION_UPDATE_CONFIRMED_BOOKING,
+        ACTION_CANCEL_BOOKING,
+    }
+)
 
 PENDING_TTL = timedelta(minutes=15)
 
@@ -100,6 +109,71 @@ def order_confirmation_payload(summary: dict[str, Any]) -> dict[str, Any]:
         "fulfillment": str(summary.get("fulfillment") or ""),
         "total": round(float(summary.get("total") or 0), 2),
         "items": items,
+    }
+
+
+def update_booking_confirmation_payload(
+    *,
+    booking_id: int,
+    date: str = "",
+    time: str = "",
+    party_size: int = 0,
+    preferred_location: str = "",
+    seating_preference: str | None = None,
+    seating_backup: str | None = None,
+    seating_avoid: str | None = None,
+    dietary: str | None = None,
+    occasion: str | None = None,
+    extra_notes: str | None = None,
+    customer_name: str = "",
+    require_approval_for_paid_items: bool | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "booking_id": int(booking_id or 0),
+        "date": str(date or "").strip(),
+        "time": str(time or "").strip(),
+        "party_size": int(party_size or 0),
+        "preferred_location": str(preferred_location or "").strip(),
+        "customer_name": " ".join(str(customer_name or "").split()),
+    }
+    optional = {
+        "seating_preference": seating_preference,
+        "seating_backup": seating_backup,
+        "seating_avoid": seating_avoid,
+        "dietary": dietary,
+        "occasion": occasion,
+        "extra_notes": extra_notes,
+        "require_approval_for_paid_items": require_approval_for_paid_items,
+    }
+    for key, value in optional.items():
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def cancel_booking_confirmation_payload(
+    *,
+    booking_id: int,
+    customer_name: str = "",
+    customer_phone: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    from app.config import settings
+    from app.security import normalize_caller_phone
+
+    raw_phone = str(customer_phone or "").strip()
+    phone = (
+        normalize_caller_phone(
+            raw_phone,
+            default_country_code=settings.default_caller_country_code,
+        )
+        or raw_phone
+    )
+    return {
+        "booking_id": int(booking_id or 0),
+        "customer_name": " ".join(str(customer_name or "").split()),
+        "customer_phone": phone,
+        "reason": str(reason or "").strip(),
     }
 
 

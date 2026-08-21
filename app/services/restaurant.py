@@ -38,14 +38,18 @@ from app.reservation_draft import (
 from app.restaurant_settings import HOURS_UNCONFIRMED_NOTE, load_restaurant_settings
 from app.security import canonical_request_hash, normalize_caller_phone
 from app.pending_confirmation import (
+    ACTION_CANCEL_BOOKING,
     ACTION_CONFIRM_ORDER,
     ACTION_CREATE_BOOKING,
+    ACTION_UPDATE_CONFIRMED_BOOKING,
     booking_confirmation_payload,
+    cancel_booking_confirmation_payload,
     clear_pending_confirmation,
     order_confirmation_payload,
     pending_state_patch,
     register_pending_confirmation,
     require_pending_confirmation,
+    update_booking_confirmation_payload,
 )
 from app.turn_evidence import (
     current_turn,
@@ -873,12 +877,6 @@ class RestaurantService:
         require_approval_for_paid_items: bool | None = None,
     ) -> JsonDict:
         """Change time, party size, name, or notes on an existing booking. Never creates a new row."""
-        if confirmed is not True:
-            raise RestaurantServiceError(
-                "The caller must explicitly confirm the reservation change first.",
-                code="confirmation_required",
-                status=409,
-            )
         call_id = self._require_call_id(call_id)
         if booking_id <= 0:
             raise RestaurantServiceError("A valid booking_id is required.")
@@ -906,6 +904,43 @@ class RestaurantService:
                 "Provide a new date, time, party size, name, or note field to update.",
                 code="empty_update",
             )
+        confirmation_payload = update_booking_confirmation_payload(
+            booking_id=booking_id,
+            date=date,
+            time=time,
+            party_size=party_size,
+            preferred_location=preferred_location or "",
+            seating_preference=seating_preference,
+            seating_backup=seating_backup,
+            seating_avoid=seating_avoid,
+            dietary=dietary,
+            occasion=occasion,
+            extra_notes=extra_notes if extra_notes is not None else notes,
+            customer_name=new_name,
+            require_approval_for_paid_items=require_approval_for_paid_items,
+        )
+        if confirmed is not True:
+            digest = register_pending_confirmation(
+                call_id,
+                ACTION_UPDATE_CONFIRMED_BOOKING,
+                confirmation_payload,
+            )
+            try:
+                await self.persist_call_state(call_id, pending_state_patch(call_id))
+            except Exception:
+                pass
+            return {
+                "updated": False,
+                "pending": True,
+                "readback_required": True,
+                "pending_confirmation_hash": digest,
+                "proposed": confirmation_payload,
+                "message": (
+                    "Read every proposed change back to the caller and ask if that is "
+                    "correct. Only after an explicit yes call update_confirmed_booking "
+                    "with caller_confirmed=true."
+                ),
+            }
         payload = {
             "call_id": call_id,
             "booking_id": booking_id,
@@ -917,8 +952,15 @@ class RestaurantService:
             "require_approval_for_paid_items": require_approval_for_paid_items,
             **note_updates,
         }
+        # Fail closed before opening a DB transaction when the gate is not satisfied.
+        require_pending_confirmation(
+            call_id, ACTION_UPDATE_CONFIRMED_BOOKING, confirmation_payload
+        )
 
         async def operation(conn: Any) -> JsonDict:
+            require_pending_confirmation(
+                call_id, ACTION_UPDATE_CONFIRMED_BOOKING, confirmation_payload
+            )
             row = await conn.fetchrow(
                 """
                 SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
@@ -1067,6 +1109,7 @@ class RestaurantService:
             await self._merge_session_state(
                 conn, call_id, state, caller_phone=row["customer_phone"] or ""
             )
+            clear_pending_confirmation(call_id, ACTION_UPDATE_CONFIRMED_BOOKING)
             return {
                 "updated": True,
                 "booking_id": booking_id,
@@ -1087,6 +1130,11 @@ class RestaurantService:
             payload=payload,
             operation=operation,
         )
+        if result.get("updated"):
+            try:
+                await self.persist_call_state(call_id, pending_state_patch(call_id))
+            except Exception:
+                pass
         return {**result, "idempotent_replay": replayed}
 
     async def add_guest_note(
@@ -1290,12 +1338,6 @@ class RestaurantService:
         reason: str = "",
         confirmed: bool,
     ) -> JsonDict:
-        if confirmed is not True:
-            raise RestaurantServiceError(
-                "The caller must explicitly confirm the cancellation.",
-                code="confirmation_required",
-                status=409,
-            )
         call_id = self._require_call_id(call_id)
         if booking_id <= 0:
             raise RestaurantServiceError("A valid booking_id is required.")
@@ -1307,6 +1349,34 @@ class RestaurantService:
                 code="verification_required",
             )
         reason = reason.strip()[:300]
+        confirmation_payload = cancel_booking_confirmation_payload(
+            booking_id=booking_id,
+            customer_name=name,
+            customer_phone=phone,
+            reason=reason,
+        )
+        if confirmed is not True:
+            digest = register_pending_confirmation(
+                call_id,
+                ACTION_CANCEL_BOOKING,
+                confirmation_payload,
+            )
+            try:
+                await self.persist_call_state(call_id, pending_state_patch(call_id))
+            except Exception:
+                pass
+            return {
+                "cancelled": False,
+                "pending": True,
+                "readback_required": True,
+                "pending_confirmation_hash": digest,
+                "proposed": confirmation_payload,
+                "message": (
+                    "Confirm the cancellation with the caller (booking reference and "
+                    "name). Only after an explicit yes call cancel_booking with "
+                    "caller_confirmed=true."
+                ),
+            }
         payload = {
             "call_id": call_id,
             "booking_id": booking_id,
@@ -1314,8 +1384,14 @@ class RestaurantService:
             "customer_phone": phone,
             "reason": reason,
         }
+        require_pending_confirmation(
+            call_id, ACTION_CANCEL_BOOKING, confirmation_payload
+        )
 
         async def operation(conn: Any) -> JsonDict:
+            require_pending_confirmation(
+                call_id, ACTION_CANCEL_BOOKING, confirmation_payload
+            )
             row = await conn.fetchrow(
                 """
                 SELECT id, customer_name, customer_phone, status
@@ -1338,6 +1414,7 @@ class RestaurantService:
                     status=403,
                 )
             if row["status"] == "cancelled":
+                clear_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
                 return {
                     "cancelled": True,
                     "already_cancelled": True,
@@ -1371,6 +1448,7 @@ class RestaurantService:
                     ),
                 },
             )
+            clear_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
             return {
                 "cancelled": True,
                 "already_cancelled": False,
@@ -1385,6 +1463,11 @@ class RestaurantService:
             payload=payload,
             operation=operation,
         )
+        if result.get("cancelled"):
+            try:
+                await self.persist_call_state(call_id, pending_state_patch(call_id))
+            except Exception:
+                pass
         return {**result, "idempotent_replay": replayed}
 
     async def list_menu(self, *, available_only: bool = True) -> JsonDict:

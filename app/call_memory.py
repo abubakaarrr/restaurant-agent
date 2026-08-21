@@ -15,6 +15,7 @@ from typing import Any
 from app.db_pool import get_pool
 from app.reservation_draft import (
     DRAFT_STATUS_CANCELLED,
+    DRAFT_STATUS_CONFIRMED,
     compose_notes,
     draft_from_memory,
     empty_draft,
@@ -101,12 +102,25 @@ def update_reservation_draft(
     updates: dict[str, Any] | None = None,
     **fields: Any,
 ) -> dict[str, Any]:
-    """Patch reservation draft fields. Empty string clears a text field."""
+    """Patch reservation draft fields. Empty string clears a text field.
+
+    Refuses once a confirmed booking exists — use update_confirmed_booking instead.
+    """
     sid = resolve_session_id(session_id)
     if not sid:
         return empty_draft()
+    current = get_reservation_draft(sid)
+    if (
+        int(current.get("booking_id") or 0) > 0
+        and str(current.get("status") or "") == DRAFT_STATUS_CONFIRMED
+    ):
+        raise ValueError(
+            "This reservation is already confirmed (booking_id set). "
+            "Use update_confirmed_booking with a full read-back and explicit yes — "
+            "do not call update_reservation_draft."
+        )
     payload = {**(updates or {}), **fields}
-    draft = patch_draft(get_reservation_draft(sid), payload)
+    draft = patch_draft(current, payload)
     _store_flattened(sid, draft)
     return dict(draft)
 

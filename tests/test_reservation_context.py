@@ -96,28 +96,53 @@ async def test_availability_hypothetical_does_not_write_draft(monkeypatch) -> No
         clear_call_memory("draft-hypo")
 
 
-async def test_cancel_without_confirm_does_not_cancel() -> None:
-    with pytest.raises(RestaurantServiceError) as exc:
-        await restaurant_service.cancel_booking(
-            call_id="cancel-no",
-            idempotency_key="cancel-key-1",
-            booking_id=12,
-            customer_name="Sam",
-            confirmed=False,
-        )
-    assert exc.value.code == "confirmation_required"
+async def test_cancel_without_confirm_registers_pending() -> None:
+    clear_call_memory("cancel-no")
+    result = await restaurant_service.cancel_booking(
+        call_id="cancel-no",
+        idempotency_key="cancel-key-1",
+        booking_id=12,
+        customer_name="Sam",
+        confirmed=False,
+    )
+    assert result.get("pending") is True
+    assert result.get("readback_required") is True
+    assert result.get("cancelled") is False
 
 
-async def test_update_booking_without_confirm_is_rejected() -> None:
+async def test_update_booking_without_confirm_registers_pending() -> None:
+    clear_call_memory("upd-no")
+    result = await restaurant_service.update_confirmed_booking(
+        call_id="upd-no",
+        idempotency_key="update-key-1",
+        booking_id=12,
+        confirmed=False,
+        time="20:00",
+    )
+    assert result.get("pending") is True
+    assert result.get("readback_required") is True
+    assert result.get("updated") is False
+
+
+async def test_update_booking_confirmed_without_pending_is_rejected() -> None:
+    from app.pending_confirmation import begin_caller_turn
+
+    clear_call_memory("upd-no-pending")
+    begin_caller_turn("upd-no-pending", "yes")
     with pytest.raises(RestaurantServiceError) as exc:
         await restaurant_service.update_confirmed_booking(
-            call_id="upd-no",
-            idempotency_key="update-key-1",
+            call_id="upd-no-pending",
+            idempotency_key="update-key-missing-pending",
             booking_id=12,
-            confirmed=False,
+            confirmed=True,
             time="20:00",
         )
-    assert exc.value.code == "confirmation_required"
+    assert exc.value.status == 409
+    assert exc.value.code in {
+        "pending_confirmation_missing",
+        "affirmation_required",
+        "confirmation_hash_mismatch",
+    }
 
 
 pytestmark_db = pytest.mark.skipif(
@@ -185,6 +210,22 @@ async def test_confirmed_booking_updates_time_notes_and_food(monkeypatch) -> Non
     )
     booking_id = created["booking_id"]
 
+    from app.pending_confirmation import (
+        ACTION_UPDATE_CONFIRMED_BOOKING,
+        update_booking_confirmation_payload,
+    )
+
+    update_payload = update_booking_confirmation_payload(
+        booking_id=booking_id,
+        time="20:00",
+        dietary="",
+        extra_notes="window table",
+    )
+    begin_caller_turn("res-update", "read the change back")
+    register_pending_confirmation(
+        "res-update", ACTION_UPDATE_CONFIRMED_BOOKING, update_payload
+    )
+    begin_caller_turn("res-update", "yes")
     updated = await restaurant_service.update_confirmed_booking(
         call_id="res-update",
         idempotency_key="change-time-notes",

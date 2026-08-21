@@ -189,7 +189,7 @@ async def update_reservation_draft(
     extra_notes: str | None = None,
     require_approval_for_paid_items: bool | None = None,
 ) -> str:
-    """Save or correct reservation details. After a booking exists this also updates the live booking, including the guest name. Never transfer for a name change. Pass only fields the caller just gave. Empty string clears that field."""
+    """Save or correct reservation details before a booking exists. Once booking_id is set and status is confirmed, refuse — use update_confirmed_booking with read-back then yes. Pass only fields the caller just gave. Empty string clears that field."""
     session_id = resolve_session_id(session_id)
     await hydrate_call_memory(session_id)
     updates: dict = {}
@@ -223,55 +223,6 @@ async def update_reservation_draft(
             ),
             caller_phone=str(draft.get("customer_phone") or ""),
         )
-        booking_id = int(draft.get("booking_id") or 0)
-        if booking_id > 0:
-            result = await restaurant_service.update_confirmed_booking(
-                call_id=session_id,
-                idempotency_key=make_idempotency_key(
-                    "update_confirmed_booking",
-                    {"booking_id": booking_id, **updates},
-                ),
-                booking_id=booking_id,
-                confirmed=True,
-                date=str(updates.get("date") or ""),
-                time=str(updates.get("time") or ""),
-                party_size=int(updates["party_size"]) if "party_size" in updates else 0,
-                seating_preference=updates.get("seating_preference"),
-                seating_backup=updates.get("seating_backup"),
-                seating_avoid=updates.get("seating_avoid"),
-                dietary=updates.get("dietary"),
-                occasion=updates.get("occasion"),
-                extra_notes=updates.get("extra_notes"),
-                customer_name=str(updates.get("customer_name") or ""),
-                require_approval_for_paid_items=updates.get(
-                    "require_approval_for_paid_items"
-                ),
-            )
-            if result.get("updated"):
-                set_active_booking(
-                    session_id,
-                    booking_id=int(result["booking_id"]),
-                    customer_name=result["customer_name"],
-                    customer_phone=result.get("customer_phone", ""),
-                    party_size=int(result["party_size"]),
-                    date=result["date"],
-                    time=result["time"],
-                    table_number=int(result["table_number"])
-                    if result.get("table_number")
-                    else None,
-                    table_location=result.get("location", ""),
-                    notes=result.get("notes", ""),
-                )
-                return (
-                    "Booking updated. Acknowledge only what changed; "
-                    "do not restate the full reservation. "
-                    + _ack_field_changes(updates)
-                )
-            if result.get("slot_unavailable"):
-                return (
-                    "Name or notes were not blocked, but the new time is unavailable. "
-                    "The existing booking is unchanged. Offer alternatives."
-                )
     except ValueError as error:
         return f"invalid_request: {error}"
     except RestaurantServiceError as error:
@@ -391,7 +342,7 @@ async def update_confirmed_booking(
     require_approval_for_paid_items: bool | None = None,
     caller_confirmed: bool = False,
 ) -> str:
-    """Change time, party size, name, or notes on an existing confirmed booking. Never cancel and recreate. The caller's instruction to change a field is confirmation — set caller_confirmed=true and do it now. Empty string on a note field clears it. 'Forget the fifth person' is party_size 4. If the new slot is taken, offer alternatives and leave the booking unchanged."""
+    """Change time, party size, name, or notes on an existing confirmed booking. Never cancel and recreate. First call with caller_confirmed=false to register the proposed change and get readback facts; after the caller says yes, call again with the same fields and caller_confirmed=true. Empty string on a note field clears it. 'Forget the fifth person' is party_size 4. If the new slot is taken, offer alternatives and leave the booking unchanged."""
     session_id = resolve_session_id(session_id)
     await hydrate_call_memory(session_id)
     memory = get_call_memory(session_id)
@@ -415,6 +366,7 @@ async def update_confirmed_booking(
                     "extra_notes": extra_notes,
                     "customer_name": customer_name,
                     "require_approval_for_paid_items": require_approval_for_paid_items,
+                    "caller_confirmed": caller_confirmed,
                 },
             ),
             booking_id=booking_id,
@@ -438,6 +390,14 @@ async def update_confirmed_booking(
         )
     except RestaurantServiceError as error:
         return _error_text(error)
+    if result.get("pending") or result.get("readback_required"):
+        proposed = result.get("proposed") or {}
+        return (
+            "Pending confirmation — do not claim the booking changed yet. "
+            "Read every proposed change back, then ask if that is correct. "
+            f"Proposed: {proposed}. "
+            + str(result.get("message") or "")
+        )
     if result.get("updated"):
         set_active_booking(
             session_id,
@@ -523,6 +483,13 @@ async def cancel_booking(
         )
     except RestaurantServiceError as error:
         return _error_text(error)
+    if result.get("pending") or result.get("readback_required"):
+        proposed = result.get("proposed") or {}
+        return (
+            "Pending confirmation — do not cancel yet. Confirm the booking reference "
+            f"and name with the caller, then wait for an explicit yes. Proposed: {proposed}. "
+            + str(result.get("message") or "")
+        )
     memory = get_call_memory(session_id)
     if memory.get("booking_id") == booking_id:
         clear_active_booking(session_id)
