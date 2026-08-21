@@ -41,6 +41,9 @@ async def test_three_edits_short_acks_then_one_terminal_readback(monkeypatch) ->
     call_id = f"readback-{suffix}"
     clear_call_memory(call_id)
     token = set_current_session_id(call_id)
+    from app.call_memory import set_current_action_scope, reset_current_action_scope
+
+    scope_token = set_current_action_scope(f"{call_id}:readback")
 
     connection = __import__("asyncpg")
     conn = await connection.connect(database_url)
@@ -107,6 +110,7 @@ async def test_three_edits_short_acks_then_one_terminal_readback(monkeypatch) ->
     finally:
         from app.call_memory import reset_current_session_id
 
+        reset_current_action_scope(scope_token)
         reset_current_session_id(token)
         clear_call_memory(call_id)
         await close_pool()

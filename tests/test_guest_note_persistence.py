@@ -37,30 +37,35 @@ async def test_add_guest_note_survives_reservation_draft_reflatten(monkeypatch) 
     suffix = uuid.uuid4().hex[:10]
     call_id = f"guest-note-{suffix}"
     clear_call_memory(call_id)
+    from app.call_memory import set_current_action_scope, reset_current_action_scope
 
-    update_reservation_draft(
-        call_id,
-        customer_name="Sam",
-        customer_phone="+14155550951",
-        date=(datetime.now() + timedelta(days=12)).date().isoformat(),
-        time="19:00",
-        party_size=4,
-        seating_preference="window",
-    )
+    scope_token = set_current_action_scope(f"{call_id}:guest-note")
+    try:
+        update_reservation_draft(
+            call_id,
+            customer_name="Sam",
+            customer_phone="+14155550951",
+            date=(datetime.now() + timedelta(days=12)).date().isoformat(),
+            time="19:00",
+            party_size=4,
+            seating_preference="window",
+        )
 
-    result = await add_guest_note.ainvoke(
-        {
-            "session_id": call_id,
-            "note": "don't add anything with an extra charge without asking me first",
-        }
-    )
-    assert "extra charge" in result.lower() or "note" in result.lower()
+        result = await add_guest_note.ainvoke(
+            {
+                "session_id": call_id,
+                "note": f"don't add anything with an extra charge without asking me first [{suffix}]",
+            }
+        )
+        assert "extra charge" in result.lower() or "note" in result.lower()
 
-    # Unrelated field patch re-flattens structured notes into top-level notes.
-    update_reservation_draft(call_id, dietary="vegetarian")
-    prompt = format_memory_for_prompt(call_id)
-    assert "don't add anything with an extra charge" in prompt
-    assert "vegetarian" in prompt
-    assert "window" in prompt
-    clear_call_memory(call_id)
-    await close_pool()
+        # Unrelated field patch re-flattens structured notes into top-level notes.
+        update_reservation_draft(call_id, dietary="vegetarian")
+        prompt = format_memory_for_prompt(call_id)
+        assert "don't add anything with an extra charge" in prompt
+        assert "vegetarian" in prompt
+        assert "window" in prompt
+    finally:
+        reset_current_action_scope(scope_token)
+        clear_call_memory(call_id)
+        await close_pool()
