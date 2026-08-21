@@ -262,7 +262,11 @@ async def update_reservation_draft(
                     table_location=result.get("location", ""),
                     notes=result.get("notes", ""),
                 )
-                return "Booking updated. " + speak_draft(load_reservation_draft(session_id))
+                return (
+                    "Booking updated. Acknowledge only what changed; "
+                    "do not restate the full reservation. "
+                    + _ack_field_changes(updates)
+                )
             if result.get("slot_unavailable"):
                 return (
                     "Name or notes were not blocked, but the new time is unavailable. "
@@ -272,7 +276,10 @@ async def update_reservation_draft(
         return f"invalid_request: {error}"
     except RestaurantServiceError as error:
         return _error_text(error)
-    text = "Saved. " + speak_draft(draft)
+    text = (
+        "Saved. Acknowledge only what changed; do not restate the full draft. "
+        + _ack_field_changes(updates)
+    )
     date = str(draft.get("date") or "")
     time = str(draft.get("time") or "")
     party_size = int(draft.get("party_size") or 0)
@@ -293,6 +300,31 @@ async def update_reservation_draft(
     return text
 
 
+def _ack_field_changes(updates: dict) -> str:
+    labels = {
+        "customer_name": "name",
+        "customer_phone": "phone",
+        "date": "date",
+        "time": "time",
+        "party_size": "party size",
+        "seating_preference": "seating",
+        "seating_backup": "backup seating",
+        "seating_avoid": "avoid",
+        "dietary": "dietary",
+        "occasion": "occasion",
+        "extra_notes": "notes",
+        "require_approval_for_paid_items": "paid-item approval",
+    }
+    parts = []
+    for key, value in updates.items():
+        label = labels.get(key, key)
+        if value == "" or value == 0:
+            parts.append(f"{label} cleared")
+        else:
+            parts.append(f"{label}={value}")
+    return ("Changed: " + "; ".join(parts) + ".") if parts else ""
+
+
 @tool
 async def get_reservation_draft(session_id: str = "") -> str:
     """Return the authoritative reservation details for this call. Use this instead of guessing from chat when asked what you have so far."""
@@ -300,6 +332,7 @@ async def get_reservation_draft(session_id: str = "") -> str:
     await hydrate_call_memory(session_id)
     draft = load_reservation_draft(session_id)
     notes = compose_notes(draft) or str(get_call_memory(session_id).get("notes") or "")
+    readback_required = False
     if (
         draft.get("customer_name")
         and draft.get("customer_phone")
@@ -320,16 +353,24 @@ async def get_reservation_draft(session_id: str = "") -> str:
                 notes=notes,
             ),
         )
+        readback_required = True
         try:
             await restaurant_service.persist_call_state(
                 session_id, pending_state_patch(session_id)
             )
         except RestaurantServiceError:
             pass
+    text = speak_draft(draft)
+    if readback_required:
+        return (
+            "Terminal readback facts (readback_required=true). "
+            "Read every field, then ask if all details are correct. "
+            + text
+        )
     return (
-        "Host readback facts. Speak this like a person at the stand, not a form. "
-        "Do not start with 'I have [name]'. "
-        + speak_draft(draft)
+        "Draft facts for reference. Acknowledge only what the caller asked; "
+        "do not restate the full reservation unless they asked for a full recap. "
+        + text
     )
 
 
@@ -658,7 +699,18 @@ async def get_order_summary(session_id: str) -> str:
         )
     except RestaurantServiceError as error:
         return _error_text(error)
-    return _format_order(result) + " Read every item and total, then ask if all details are correct."
+    text = _format_order(result)
+    if result.get("readback_required"):
+        return (
+            text
+            + " readback_required=true. Read every item, fulfillment type, and total, "
+            "then ask if all details are correct."
+        )
+    return (
+        text
+        + " Reference only — do not restate the full order unless the caller asked "
+        "for a full recap or this is final confirmation."
+    )
 
 
 @tool
@@ -690,7 +742,11 @@ async def update_order_item(
         )
     except RestaurantServiceError as error:
         return _error_text(error)
-    return "Draft item updated. " + _format_order(result)
+    return (
+        f"Item updated to quantity {quantity}"
+        + (f" with notes: {notes}" if notes else "")
+        + ". Acknowledge only what changed; do not restate the full order."
+    )
 
 
 @tool
