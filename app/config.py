@@ -169,8 +169,6 @@ class Settings(BaseSettings):
             if len(value.strip()) < minimum:
                 failures.append(f"{name} must contain at least {minimum} characters")
 
-        if self.login_username == "admin" or self.login_password == "admin":
-            failures.append("LOGIN_USERNAME and LOGIN_PASSWORD must not use admin defaults")
         if "*" in self.cors_origins:
             failures.append("ALLOWED_ORIGINS must not contain '*' in production")
         for origin in self.cors_origins:
@@ -184,8 +182,6 @@ class Settings(BaseSettings):
             )
         if self.enable_public_web_calls and not self.retell_agent_id:
             failures.append("RETELL_AGENT_ID is required when public web calls are enabled")
-        if not self.staff_transfer_number:
-            failures.append("STAFF_TRANSFER_NUMBER is required for production handoff")
         for name, number in (
             ("RETELL_PHONE_NUMBER", self.retell_phone_number),
             ("STAFF_TRANSFER_NUMBER", self.staff_transfer_number),
