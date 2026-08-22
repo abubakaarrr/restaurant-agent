@@ -1,80 +1,98 @@
-"""RAG tool — semantic search over pgvector knowledge chunks."""
+"""Grounded read tools that avoid embeddings on the live voice path."""
 
-from openai import AsyncOpenAI
+from __future__ import annotations
+
+import re
+
 from langchain_core.tools import tool
 
-from app.config import settings
-from app.db_pool import get_pool
-
-oai = AsyncOpenAI(api_key=settings.openai_api_key)
-EMBEDDING_MODEL = "text-embedding-3-small"
-SIMILARITY_THRESHOLD = 0.0  # no threshold — always return top results
-
-
-async def _embed(text: str) -> list[float]:
-    resp = await oai.embeddings.create(model=EMBEDDING_MODEL, input=text)
-    return resp.data[0].embedding
+from app.services.restaurant import (
+    RestaurantServiceError,
+    format_menu_price,
+    restaurant_service,
+)
 
 
-async def semantic_search(
-    query: str,
-    source_filter: str | None = None,
-    top_k: int = 3,
-) -> list[dict]:
-    """Return top-k most relevant knowledge chunks for a query."""
-    vector = await _embed(query)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if source_filter:
-            rows = await conn.fetch(
-                """
-                SELECT content, source,
-                       1 - (embedding <=> $1::vector) AS similarity
-                FROM knowledge_chunks
-                WHERE source = $2
-                  AND 1 - (embedding <=> $1::vector) > $4
-                ORDER BY embedding <=> $1::vector
-                LIMIT $3
-                """,
-                str(vector), source_filter, top_k, SIMILARITY_THRESHOLD,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT content, source,
-                       1 - (embedding <=> $1::vector) AS similarity
-                FROM knowledge_chunks
-                WHERE 1 - (embedding <=> $1::vector) > $3
-                ORDER BY embedding <=> $1::vector
-                LIMIT $2
-                """,
-                str(vector), top_k, SIMILARITY_THRESHOLD,
-            )
-        return [dict(r) for r in rows]
+def _tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) > 2
+    }
 
-
-# ── LangChain tool wrappers (bound to the LangGraph agent) ────
 
 @tool
 async def search_menu(query: str) -> str:
-    """Search the restaurant menu for items, prices, dietary info, and ingredients.
-    Use this when the caller asks about food, drinks, dietary options, allergens, or prices.
-    """
-    chunks = await semantic_search(query, source_filter="menu", top_k=3)
-    if not chunks:
-        return "No relevant menu information found."
-    return "\n\n".join(c["content"] for c in chunks)
+    """Search live menu names, descriptions, categories, dietary tags, and prices."""
+    try:
+        menu = await restaurant_service.list_menu()
+    except RestaurantServiceError as error:
+        return f"{error.code}: {error.message}"
+
+    query_tokens = _tokens(query)
+    matches: list[dict] = []
+    for item in menu["items"]:
+        searchable = " ".join(
+            [
+                item["name"],
+                item["category"],
+                item["description"],
+                " ".join(item["dietary"]),
+            ]
+        )
+        score = len(query_tokens & _tokens(searchable))
+        if score:
+            matches.append({**item, "_score": score})
+    matches.sort(key=lambda item: (-item["_score"], item["name"]))
+    if not matches:
+        return "No grounded menu result matched that question. Ask the caller to clarify."
+    lines = [
+        (
+            f"{item['name']} ({format_menu_price(item)}, "
+            f"{'available' if item['available'] else 'sold out'}): "
+            f"{item['description'] or 'No additional description.'} "
+            f"Dietary tags: {', '.join(item['dietary']) or 'none listed'}."
+        )
+        for item in matches[:8]
+    ]
+    return " ".join(lines) + f" Allergy safety: {menu['allergen_notice']}"
 
 
 @tool
 async def search_restaurant_info(query: str) -> str:
-    """Search for general restaurant information: location, hours, parking, facilities, FAQs, policies.
-    Use this when the caller asks about opening hours, address, parking, accessibility, events, or policies.
-    """
-    # Search both info and slots sources — hours live in slots, FAQs live in info
-    info_chunks = await semantic_search(query, source_filter="info", top_k=3)
-    slots_chunks = await semantic_search(query, source_filter="slots", top_k=3)
-    all_chunks = info_chunks + slots_chunks
-    if not all_chunks:
-        return "No relevant information found."
-    return "\n\n".join(c["content"] for c in all_chunks)
+    """Answer hours, address, parking, cancellation, late arrival, patio, birthday cake, and other restaurant policy questions from approved knowledge. If nothing matches, do not transfer; call log_unknown_question."""
+    try:
+        result = await restaurant_service.restaurant_info(query)
+    except RestaurantServiceError as error:
+        return f"{error.code}: {error.message}"
+    if result.get("formatted"):
+        return result["formatted"]
+    parts: list[str] = []
+    if result.get("restaurant_name"):
+        parts.append(f"Restaurant: {result['restaurant_name']}.")
+    if result.get("hours_unconfirmed") or result.get("hours_note"):
+        parts.append(result.get("hours_note") or result.get("formatted") or "")
+    elif result.get("opening_hours"):
+        hours = "; ".join(
+            f"{day}: {value.get('open', 'closed')}-{value.get('close', 'closed')}"
+            for day, value in result["opening_hours"].items()
+        )
+        parts.append(f"Hours: {hours}.")
+    address = " ".join(
+        value
+        for value in (result.get("street_address", ""), result.get("city", ""))
+        if value
+    )
+    if address:
+        parts.append(f"Address: {address}.")
+    if result.get("phone_number"):
+        parts.append(f"Phone: {result['phone_number']}.")
+    if result.get("languages"):
+        parts.append(f"Supported languages: {', '.join(result['languages'])}.")
+    if parts:
+        return " ".join(parts)
+    return (
+        "No grounded restaurant answer matched that question. "
+        "Call log_unknown_question with the caller's words. Do not transfer. "
+        "Tell them you will get the answer from the team."
+    )

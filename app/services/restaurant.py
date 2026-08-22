@@ -104,7 +104,15 @@ def format_availability_speech(result: Mapping[str, Any]) -> str:
             f"table {row['table_number']} ({row['capacity']} seats, {row['location']})"
             for row in result.get("tables") or []
         )
-        return f"Available: {tables}. availability_nonce={nonce}."
+        sections = result.get("available_sections") or []
+        section_text = ""
+        if sections:
+            section_text = (
+                " Offer the caller these open sections and ask which they prefer: "
+                + ", ".join(sections)
+                + ". Keep individual table numbers internal unless they ask."
+            )
+        return f"Available: {tables}.{section_text} availability_nonce={nonce}."
     alternatives = result.get("alternatives") or []
     alt_text = "; ".join(
         (
@@ -518,6 +526,13 @@ class RestaurantService:
                 }
                 for row in tables
             ],
+            "available_sections": sorted(
+                {
+                    str(row["location"]).casefold()
+                    for row in tables
+                    if row.get("location")
+                }
+            ),
             "alternatives": alternatives,
         }
         record_availability(result)

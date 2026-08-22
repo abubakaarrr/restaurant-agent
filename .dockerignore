@@ -13,3 +13,9 @@ __pycache__/
 .DS_Store
 README.md
 tests/
+artifacts/
+docs/
+*.plan.md
+technical_report.md
+retell_blueprint_report.md
+CLOUD_AGENT_PROMPT_SESAME_LEVEL.md

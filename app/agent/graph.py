@@ -6,7 +6,7 @@ Flow:
                         ↓ (no tool calls)
                        END
 
-The agent (Claude) decides which tools to call based on the caller's message.
+The rollback agent decides which tools to call based on the caller's message.
 Available tools:
   - search_menu              → RAG on menu.md
   - search_restaurant_info   → RAG on restaurant_info.md + slots.md
@@ -18,27 +18,53 @@ Available tools:
 from __future__ import annotations
 from typing import Literal
 
+from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import tools_condition
 
-from app.agent.configuration import AgentConfiguration
 from app.agent.state import RestaurantAgentState
 from app.agent.nodes import generate_response, tool_node
 
 # ── Build graph ───────────────────────────────────────────────
 
-builder = StateGraph(RestaurantAgentState, config_schema=AgentConfiguration)
+MAX_TOOL_ITERATIONS = 3
+
+
+def route_after_agent(state: RestaurantAgentState) -> Literal["tools", "limit", "__end__"]:
+    message = state["messages"][-1]
+    tool_calls = getattr(message, "tool_calls", None) or []
+    if not tool_calls:
+        return END
+    if state.get("tool_iterations", 0) >= MAX_TOOL_ITERATIONS:
+        return "limit"
+    return "tools"
+
+
+async def tool_limit_response(state: RestaurantAgentState) -> dict:
+    return {
+        "messages": [
+            AIMessage(
+                content=(
+                    "I'm sorry, I couldn't complete that safely. "
+                    "I can connect you with the restaurant staff."
+                )
+            )
+        ]
+    }
+
+builder = StateGraph(RestaurantAgentState)
 
 builder.add_node("agent", generate_response)
 builder.add_node("tools", tool_node)
+builder.add_node("limit", tool_limit_response)
 
 builder.add_edge(START, "agent")
 builder.add_conditional_edges(
     "agent",
-    tools_condition,          # LangGraph built-in: routes to "tools" if tool_calls present
-    {"tools": "tools", END: END},
+    route_after_agent,
+    {"tools": "tools", "limit": "limit", END: END},
 )
 builder.add_edge("tools", "agent")  # after tool result → back to agent for final response
+builder.add_edge("limit", END)
 
 restaurant_agent = builder.compile()
 restaurant_agent.name = "restaurant_receptionist"

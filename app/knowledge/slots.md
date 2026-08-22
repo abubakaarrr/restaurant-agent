@@ -1,53 +1,35 @@
-# La Casa Restaurant — Opening Hours & Table Configuration
+# The Lamplighter Public House — Hours & Table Configuration
 
 ## Opening Hours
 
-| Day | Hours | Kitchen Closes |
-|-----|-------|---------------|
-| Monday | 11:00 AM – 10:00 PM | 9:30 PM |
-| Tuesday | 11:00 AM – 10:00 PM | 9:30 PM |
-| Wednesday | 11:00 AM – 10:00 PM | 9:30 PM |
-| Thursday | 11:00 AM – 10:00 PM | 9:30 PM |
-| Friday | 11:00 AM – 11:00 PM | 10:30 PM |
-| Saturday | 10:00 AM – 11:00 PM | 10:30 PM |
-| Sunday | 10:00 AM – 9:00 PM | 8:30 PM |
-
-We are closed on Christmas Day (December 25) and New Year's Day (January 1).
-
-## Service Sessions
-
-- **Breakfast** (Saturday & Sunday only): 10:00 AM – 12:00 PM
-- **Lunch**: 12:00 PM – 3:00 PM
-- **Dinner**: 5:30 PM – 9:30 PM (Fri/Sat until 10:30 PM)
+Opening hours are not confirmed with the venue. Public listings disagree, including whether Monday is open. Do not invent a weekly schedule, kitchen close times, or service sessions. Take a message or offer a callback instead of quoting times.
 
 ## Table Configuration
 
+Demo floor plan for availability rehearsal only — not an official venue seating chart.
+Phone reservations support parties of 1–10. Main, patio, and private each have tables up to 10 seats.
+
 | Table Number | Capacity | Location | Notes |
 |-------------|----------|----------|-------|
-| 1 | 2 | Main Hall | Window seat |
-| 2 | 2 | Main Hall | Window seat |
+| 1 | 2 | Main Hall | |
+| 2 | 2 | Main Hall | |
 | 3 | 4 | Main Hall | |
 | 4 | 4 | Main Hall | |
-| 5 | 4 | Main Hall | |
-| 6 | 6 | Main Hall | Round table |
-| 7 | 6 | Main Hall | |
-| 8 | 8 | Private Room | Bookable for private events |
-| 9 | 8 | Private Room | Bookable for private events |
-| 10 | 2 | Patio | Outdoor, weather permitting |
-| 11 | 2 | Patio | Outdoor, weather permitting |
-| 12 | 4 | Patio | Outdoor, weather permitting |
+| 5 | 6 | Main Hall | |
+| 6 | 8 | Main Hall | |
+| 7 | 10 | Main Hall | |
+| 8 | 8 | Private Room | Private event bookings exist; do not invent package prices |
+| 9 | 10 | Private Room | Private event bookings exist; do not invent package prices |
+| 10 | 2 | Patio | Outdoor patio is real |
+| 11 | 4 | Patio | Outdoor patio is real |
+| 12 | 6 | Patio | Outdoor patio is real |
+| 13 | 8 | Patio | Outdoor patio is real |
+| 14 | 10 | Patio | Outdoor patio is real |
 
 ## Booking Rules
 
 - Standard reservation slot: **90 minutes**
-- Minimum party size: **1 person**
-- Maximum party size via phone: **12 people** (larger groups need manager approval — we'll call you back)
-- Bookings must be made at least **1 hour in advance**
-- Same-day bookings accepted until **8:00 PM**
-- We hold reservations for **15 minutes** past the booked time
-
-## Cancellation Policy
-
-- Please cancel at least **2 hours before** your reservation
-- To cancel or modify, call us directly — the AI receptionist cannot modify existing bookings
-- Repeated no-shows may affect future booking eligibility
+- Reservations are also offered through OpenTable
+- Patio is a real location filter, not a stand-in for indoor tables
+- When more than one section fits the party, ask the caller which they prefer (main, patio, or private) before booking
+- The host can change name, time, party size, notes, and pre-order items on the line

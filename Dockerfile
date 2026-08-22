@@ -1,22 +1,26 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
-# System build deps (needed for some wheels); removed after install stays small
+# curl is used only by the container healthcheck; Python dependencies ship wheels.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        libpq-dev \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
+
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/runtime /app/voices/custom /app/voices/system \
+    && chown -R appuser:appuser /app
+
+USER appuser
 
 EXPOSE 8000
 

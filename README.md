@@ -1,135 +1,158 @@
-# Restaurant AI Receptionist — POC
+# Restaurant AI Receptionist
 
-An AI phone receptionist for **La Casa Restaurant**, built with:
-- **LangGraph** — stateful agent orchestration (ReAct pattern)
-- **Claude claude-sonnet-4-20250514** (Anthropic) — the LLM
-- **FastAPI** — REST API + Twilio webhook (future)
-- **PostgreSQL + pgvector** — live bookings + RAG knowledge base
-- **OpenAI text-embedding-3-small** — knowledge chunk embeddings
+Production-pilot backend for a restaurant phone and website receptionist.
 
----
+The primary route is **Retell managed Conversation Flow** for telephony,
+transcription, turn-taking, voice, transfer, and call operations. This FastAPI
+service owns trusted restaurant data and exposes authenticated, idempotent
+booking/order/menu tools. The older LangGraph custom-LLM WebSocket remains
+feature-flagged for one rollback release.
 
-## Project Structure
+## Architecture
 
-```
-restaurant-agent/
-├── app/
-│   ├── main.py                   # FastAPI entry point
-│   ├── config.py                 # Settings from .env
-│   ├── agent/
-│   │   ├── graph.py              # LangGraph graph (START → agent ↔ tools → END)
-│   │   ├── state.py              # RestaurantAgentState
-│   │   ├── configuration.py      # Runtime config (model, restaurant name)
-│   │   └── nodes/
-│   │       ├── generate_response.py   # Claude node with bound tools
-│   │       └── tool_executor.py       # LangGraph ToolNode
-│   ├── tools/
-│   │   ├── rag.py                # pgvector semantic search tools
-│   │   └── db.py                 # Booking + availability tools
-│   ├── prompts/
-│   │   └── system.md             # Agent persona + rules
-│   └── knowledge/
-│       ├── menu.md               # Full restaurant menu (embedded)
-│       ├── slots.md              # Hours + table config (embedded)
-│       └── restaurant_info.md    # FAQs + location + policies (embedded)
-├── db/
-│   ├── schema.sql                # PostgreSQL + pgvector schema
-│   └── seed.py                   # Seed tables, menu items, embed knowledge files
-└── tests/
-    └── simulate_call.py          # Demo: run 3 call scenarios without Twilio
+```mermaid
+flowchart LR
+    Phone[Phone caller] --> Retell[Retell managed voice]
+    Web[Website widget] --> Retell
+    Retell --> Flow[Conversation Flow]
+    Flow --> API[Authenticated voice tool API]
+    API --> Service[Restaurant service]
+    Service --> DB[(PostgreSQL)]
+    Retell --> Staff[Warm staff transfer]
+    Retell --> Webhook[Signed lifecycle webhook]
+    Webhook --> DB
 ```
 
----
+Production call audio does not pass through this server. Retell owns the audio
+path; the backend returns structured business results over HTTPS.
 
-## Quick Start
+## Safety properties
 
-### 1. Prerequisites
+- Write tools default off with `VOICE_LIVE_WRITES_ENABLED=false`.
+- Every booking, cancellation, order mutation, and order confirmation requires
+  an idempotency key.
+- Orders remain drafts until the caller approves a complete itemized readback.
+- Booking creation locks the selected table and prevents a double booking.
+- Fuzzy menu matches return candidates without mutating an order.
+- Human transfer uses a server-configured E.164 number, never caller/model text.
+- Retell lifecycle webhooks use timestamped HMAC verification and replay
+  rejection.
+- Call telemetry excludes phone numbers and transcripts by default and follows
+  a configured retention period.
+- The deterministic behavior reducer makes no age, accent, disability, or
+  emotion classifications.
+
+## Local setup
+
+Requirements:
 
 - Python 3.11+
-- PostgreSQL 15+ with [pgvector extension](https://github.com/pgvector/pgvector)
-- API keys: Anthropic (Claude) + OpenAI (embeddings)
+- PostgreSQL 16 with pgvector, or Docker
+- OpenAI key only if testing the legacy LangGraph rollback adapter
+- Retell account for managed voice deployment
 
-### 2. Install
-
-```bash
-cd restaurant-agent
+```powershell
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
+Copy-Item .env.example .env
+python scripts/bootstrap_local_secrets.py --apply
 ```
 
-### 3. Configure
+For Docker, set both `POSTGRES_PASSWORD` and an encoded `DATABASE_URL` in
+`.env`, then:
 
-```bash
-cp .env.example .env
-# Edit .env — fill in DATABASE_URL, ANTHROPIC_API_KEY, OPENAI_API_KEY
-```
-
-### 4. Set up database
-
-```bash
-createdb restaurant_agent
-psql restaurant_agent -f db/schema.sql
+```powershell
+docker compose up -d db
+python scripts/migrate.py --initialize-schema
 python db/seed.py
 ```
 
-### 5. Run the demo simulation (no Twilio needed)
+For an existing database, never rerun the base schema:
 
-```bash
-python tests/simulate_call.py
+```powershell
+python scripts/migrate.py
 ```
 
-### 6. Start the API server
+Start the API:
 
-```bash
-uvicorn app.main:app --reload
-# API docs: http://localhost:8000/docs
+```powershell
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
----
+The health endpoint returns 503 until the pilot migration is installed.
 
-## Agent Flow
+## Managed voice tool API
 
+All routes are under `/api/voice-tools` and require
+`X-Voice-Tool-Secret`. Write routes also require `Idempotency-Key`.
+
+Capabilities include:
+
+- live menu and exact item matching;
+- grounded restaurant hours/location;
+- availability, booking creation, verified lookup, and cancellation;
+- order draft add/update/remove and summary;
+- explicit versioned order confirmation;
+- authenticated tool health with write-flag status.
+
+Retell desired state and endpoint mappings live in
+`config/retell-agent.pilot.json`. Managed-flow node prompts live under
+`app/prompts/retell/`.
+
+## Rollback adapter
+
+The legacy Retell custom-LLM route is
+`wss://HOST/retell-ws/CALL_ID?token=RETELL_WS_TOKEN` and is disabled with
+`ENABLE_LEGACY_RETELL_CUSTOM_LLM=false`.
+
+It now includes:
+
+- cancellable generation and guaranteed response closure;
+- deterministic silence handling that never replays the previous action;
+- behavior adaptation from explicit requests and timing proxies;
+- staff transfer and end-call controls;
+- first-response and cancellation timing events;
+- bounded tool loops and provider-neutral restaurant services.
+
+Vapi and self-hosted Chatterbox are disabled in the live route by default.
+Chatterbox remains available only through Docker's `offline-tts` profile.
+
+## Tests
+
+Unit and protocol suite:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = "1"
+python -m pytest -q -p pytest_asyncio.plugin
 ```
-Caller message
-      │
-      ▼
-  [agent node]  ←──────────────────────────┐
-  Claude decides:                           │
-    • needs menu info?  → search_menu       │
-    • needs table check? → check_table_availability
-    • ready to book?    → create_booking    │
-    • general question? → search_restaurant_info
-    • has all info?     → respond directly  │
-      │                                     │
-      ▼ (tool call present)                 │
-  [tool node]  ─────────────────────────────┘
-  Executes tool, returns result
-      │
-      ▼ (no more tool calls)
-    END → voice response (≤40 words)
+
+Database race/idempotency suite:
+
+```powershell
+$env:RUN_DB_INTEGRATION = "1"
+$env:TEST_DATABASE_URL = "postgresql://postgres:password@localhost:5432/restaurant_agent"
+python -m pytest -q -p pytest_asyncio.plugin tests/test_database_integration.py tests/test_app_security_integration.py
 ```
 
----
+The suite covers behavior transitions, API authentication, CSRF, webhook
+signatures, replay protection, reminders, handoff, booking concurrency, order
+corrections, idempotency, migration/provisioning validation, and bakeoff gates.
 
-## Tools Available to the Agent
+## Pilot operations
 
-| Tool | Purpose |
-|------|---------|
-| `search_menu` | RAG search on menu.md — answers dietary, price, ingredient questions |
-| `search_restaurant_info` | RAG search on info + slots — answers hours, location, parking, policies |
-| `check_table_availability` | Live SQL query — checks if tables are free for given date/time/party |
-| `create_booking` | Atomic SQL insert — saves confirmed booking with row-level lock |
-| `check_menu_item_availability` | Live SQL query — checks if a specific dish is sold out |
+- [Retell setup, number provisioning, transfer, and rollback](docs/RETELL_SETUP.md)
+- [Client website widget](docs/CLIENT_WEBSITE.md)
+- [Voice bakeoff](docs/VOICE_BAKEOFF.md)
+- [Direct ElevenAgents challenger](docs/ELEVENAGENTS_CHALLENGER.md)
+- [Supervised staff/customer pilot](docs/PILOT_RUNBOOK.md)
+- [Server deployment](DEPLOY.md)
 
----
+Existing Retell baseline metrics are collected without PII:
 
-## Extending the POC
+```powershell
+python scripts/collect_retell_baseline.py --output artifacts/retell-baseline.json
+```
 
-| What to add | Where |
-|-------------|-------|
-| Twilio voice integration | `app/telephony/twilio_handler.py` (not in POC scope) |
-| Order tracking | New tool in `app/tools/db.py` + update schema |
-| Human handoff | Add `end_call` condition in `graph.py` + `<Dial>` in TwiML |
-| Real-time specials | Update `menu_items` table; agent reads `check_menu_item_availability` |
-| LangSmith tracing | Set `LANGCHAIN_TRACING_V2=true` in `.env` |
+Do not enable live writes or expand unattended hours until the checked-in
+release gates pass on real carrier calls.

@@ -13,8 +13,10 @@ class AgentConfiguration:
     """Runtime configuration passed into the LangGraph graph."""
 
     restaurant_name: str = field(default_factory=lambda: settings.restaurant_name)
-    model: str = field(default="gpt-4o")
-    max_response_tokens: int = field(default=300)
+    model: str = field(default_factory=lambda: settings.llm_model)
+    max_response_tokens: int = field(default_factory=lambda: settings.llm_max_tokens)
+    temperature: float = field(default_factory=lambda: settings.llm_temperature)
+    reasoning_effort: str = field(default_factory=lambda: settings.llm_reasoning_effort)
 
     @classmethod
     def from_runnable_config(cls, config: Optional[RunnableConfig] = None) -> AgentConfiguration:

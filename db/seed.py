@@ -2,11 +2,11 @@
 Seed script — run once after schema.sql:
     python db/seed.py
 
-Does two things:
-1. Inserts tables and menu items into PostgreSQL
-2. Embeds knowledge .md files into pgvector (RAG)
+By default this inserts only the live tables and menu. Optional legacy/offline
+pgvector embeddings require ``--with-embeddings`` and an OpenAI key.
 """
 
+import argparse
 import asyncio
 import os
 import sys
@@ -21,64 +21,161 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/restaurant_agent")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@127.0.0.1:5432/restaurant_agent")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 EMBEDDING_MODEL = "text-embedding-3-small"
 
-oai = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
+PRICE_ESTIMATED = "Price estimated pending client confirmation."
+PRICE_CONFIRMED = "Price confirmed."
 
 # ── Restaurant tables ─────────────────────────────────────────
+# Phone bookings support parties up to 10. Each dining room has at least
+# one table that seats 10 so main / patio / private can all take a large party.
 
 TABLES = [
+    # main dining room
     (1, 2, "main"),
     (2, 2, "main"),
     (3, 4, "main"),
     (4, 4, "main"),
-    (5, 4, "main"),
-    (6, 6, "main"),
-    (7, 6, "main"),
+    (5, 6, "main"),
+    (6, 8, "main"),
+    (7, 10, "main"),
+    # private rooms
     (8, 8, "private"),
-    (9, 8, "private"),
+    (9, 10, "private"),
+    # patio / outdoor
     (10, 2, "patio"),
-    (11, 2, "patio"),
-    (12, 4, "patio"),
+    (11, 4, "patio"),
+    (12, 6, "patio"),
+    (13, 8, "patio"),
+    (14, 10, "patio"),
 ]
 
+
+def _menu_description(body: str, *, estimated: bool) -> str:
+    flag = PRICE_ESTIMATED if estimated else PRICE_CONFIRMED
+    return f"{body} {flag}".strip()
+
+
+# (name, category, price, description, dietary, price_estimated)
+# Dish names are venue-confirmed. Prices are estimated unless price_estimated is False.
 MENU_ITEMS = [
-    # (name, category, price, description, dietary)
-    ("Tomato Basil Soup", "starter", 7.50, "Creamy roasted tomato soup with fresh basil", ["vegetarian", "gluten-free"]),
-    ("Garlic Bread", "starter", 5.00, "Toasted sourdough with herb butter and roasted garlic", ["vegetarian"]),
-    ("Hummus Platter", "starter", 9.00, "House-made hummus with cucumber, olives, pita", ["vegan", "gluten-free"]),
-    ("Spring Rolls", "starter", 8.50, "Crispy vegetable rolls with sweet chili sauce", ["vegan"]),
-    ("Chicken Wings", "starter", 12.00, "Grilled wings, choice of BBQ/buffalo/honey-garlic", ["gluten-free"]),
-    ("Caprese Salad", "starter", 10.00, "Fresh mozzarella, heirloom tomatoes, aged balsamic", ["vegetarian", "gluten-free"]),
-    ("Caesar Salad", "starter", 11.00, "Romaine, parmesan, croutons, house Caesar dressing", ["vegetarian"]),
-    ("Grilled Chicken Breast", "main", 18.00, "Free-range chicken, lemon herb sauce, roasted veg", ["gluten-free"]),
-    ("Beef Ribeye Steak", "main", 32.00, "280g grain-fed ribeye, chips and house salad", ["gluten-free"]),
-    ("Pan-Seared Salmon", "main", 24.00, "Atlantic salmon, dill cream sauce, wild rice", ["gluten-free"]),
-    ("Mushroom Risotto", "main", 19.00, "Arborio rice, wild mushrooms, truffle oil, parmesan", ["vegetarian", "gluten-free"]),
-    ("Vegetable Pasta Primavera", "main", 16.00, "Penne, roasted seasonal vegetables, tomato herb sauce", ["vegan"]),
-    ("Lamb Rack", "main", 36.00, "2 herb-crusted lamb cutlets, red wine jus, minted peas", ["gluten-free"]),
-    ("Fish and Chips", "main", 20.00, "Beer-battered barramundi, thick-cut chips, tartare sauce", []),
-    ("Chicken Parma", "main", 22.00, "Crumbed chicken, Napoli sauce, ham, mozzarella", []),
-    ("New York Cheesecake", "dessert", 10.00, "Baked cheesecake with berry coulis", ["vegetarian"]),
-    ("Chocolate Lava Cake", "dessert", 11.00, "Warm dark chocolate cake, molten centre, vanilla ice cream", ["vegetarian"]),
-    ("Tiramisu", "dessert", 10.00, "Espresso-soaked sponge, mascarpone, cocoa", ["vegetarian"]),
-    ("Fruit Sorbet", "dessert", 8.00, "Rotating daily flavour — vegan and gluten-free", ["vegan", "gluten-free"]),
-    ("Ice Cream", "dessert", 8.00, "3 scoops: vanilla, chocolate, or strawberry", ["vegetarian", "gluten-free"]),
-    ("Soft Drinks", "drink", 4.00, "Coke, Lemonade, Soda Water, Ginger Beer", ["vegan", "gluten-free"]),
-    ("Freshly Squeezed Juice", "drink", 6.00, "Orange, Apple, Watermelon (seasonal)", ["vegan", "gluten-free"]),
-    ("Coffee", "drink", 4.50, "Flat White, Cappuccino, Latte — oat milk available", ["vegetarian"]),
-    ("Long Black", "drink", 4.00, "Long black coffee (double espresso)", ["vegetarian"]),
-    ("Espresso", "drink", 4.00, "Single or double espresso shot", ["vegetarian"]),
-    ("Flat White", "drink", 4.50, "Flat white coffee, oat milk available", ["vegetarian"]),
-    ("Cappuccino", "drink", 4.50, "Cappuccino, oat milk available", ["vegetarian"]),
-    ("Latte", "drink", 4.50, "Latte coffee, oat milk available", ["vegetarian"]),
-    ("Sparkling Water", "drink", 3.50, "500ml sparkling water", ["vegan", "gluten-free"]),
-    ("Still Water", "drink", 3.50, "500ml still water", ["vegan", "gluten-free"]),
-    ("Tea", "drink", 4.00, "English Breakfast, Green, Chamomile, Peppermint", ["vegan", "gluten-free"]),
-    ("Mocktail of the Day", "drink", 8.00, "Ask your server for today's creation", ["vegan"]),
+    (
+        "Rosemary Fries",
+        "starter",
+        9.00,
+        _menu_description("Confirmed real item.", estimated=True),
+        ["vegetarian"],
+        True,
+    ),
+    (
+        "Fried Cauliflower",
+        "starter",
+        12.00,
+        _menu_description("Confirmed real item.", estimated=True),
+        ["vegetarian"],
+        True,
+    ),
+    (
+        "Dumplings",
+        "starter",
+        14.00,
+        _menu_description("Confirmed real item. Style unconfirmed.", estimated=True),
+        [],
+        True,
+    ),
+    (
+        "Chicken Katsu Burger",
+        "main",
+        19.00,
+        _menu_description("Confirmed real item; a reviewer favorite.", estimated=True),
+        [],
+        True,
+    ),
+    (
+        "Hangover Burger",
+        "main",
+        20.00,
+        _menu_description("Confirmed real item.", estimated=True),
+        [],
+        True,
+    ),
+    (
+        "Fish and Chips",
+        "main",
+        21.00,
+        _menu_description("Confirmed real item, recommended in reviews.", estimated=True),
+        [],
+        True,
+    ),
+    (
+        "BLT",
+        "main",
+        17.00,
+        _menu_description("Confirmed real item.", estimated=True),
+        [],
+        True,
+    ),
+    (
+        "Cobb Salad",
+        "main",
+        18.00,
+        _menu_description("Confirmed real item.", estimated=True),
+        [],
+        True,
+    ),
+    (
+        "Poutine",
+        "main",
+        16.00,
+        _menu_description("Confirmed real item. Ham hock variant seen.", estimated=True),
+        [],
+        True,
+    ),
+    (
+        "Sweet Potato Fries",
+        "starter",
+        8.00,
+        _menu_description("Confirmed real item.", estimated=True),
+        ["vegetarian"],
+        True,
+    ),
+    (
+        "Salted Pretzel Toffee Pudding",
+        "dessert",
+        11.00,
+        _menu_description("Confirmed real item.", estimated=True),
+        ["vegetarian"],
+        True,
+    ),
+    (
+        "Old Fashioned",
+        "drink",
+        15.00,
+        _menu_description('Confirmed real item; called "best in Gastown" in reviews.', estimated=True),
+        [],
+        True,
+    ),
+    (
+        "Craft Lager Pitcher",
+        "drink",
+        18.00,
+        _menu_description("Confirmed real item.", estimated=False),
+        ["vegetarian"],
+        False,
+    ),
+    (
+        "Wings (Wing Wednesday)",
+        "special",
+        12.50,
+        _menu_description(
+            "Wednesday only, $12.50 per pound. Not a daily menu item.",
+            estimated=False,
+        ),
+        [],
+        False,
+    ),
 ]
 
 
@@ -89,6 +186,7 @@ KNOWLEDGE_FILES = [
     ("slots", "app/knowledge/slots.md"),
     ("info", "app/knowledge/restaurant_info.md"),
 ]
+
 
 def chunk_markdown(text: str, chunk_size: int = 400, overlap: int = 80) -> list[str]:
     """Split text into overlapping chunks by characters."""
@@ -102,34 +200,76 @@ def chunk_markdown(text: str, chunk_size: int = 400, overlap: int = 80) -> list[
 
 
 async def embed(texts: list[str]) -> list[list[float]]:
+    oai = AsyncOpenAI(api_key=OPENAI_API_KEY)
     resp = await oai.embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return [item.embedding for item in resp.data]
 
 
-async def seed(conn: asyncpg.Connection) -> None:
+async def seed(conn: asyncpg.Connection, *, with_embeddings: bool = False) -> None:
     print("Seeding tables...")
     for table_number, capacity, location in TABLES:
         await conn.execute(
             """
             INSERT INTO tables (table_number, capacity, location)
             VALUES ($1, $2, $3)
-            ON CONFLICT (table_number) DO NOTHING
+            ON CONFLICT (table_number) DO UPDATE SET
+                capacity = EXCLUDED.capacity,
+                location = EXCLUDED.location
             """,
-            table_number, capacity, location
+            table_number,
+            capacity,
+            location,
         )
-    print(f"  → {len(TABLES)} tables seeded.")
+    print(f"  -> {len(TABLES)} tables seeded.")
 
     print("Seeding menu items...")
-    for name, category, price, description, dietary in MENU_ITEMS:
+    live_names = [name.casefold() for name, *_rest in MENU_ITEMS]
+    await conn.execute(
+        """
+        DELETE FROM menu_items
+        WHERE NOT (LOWER(name) = ANY($1::text[]))
+          AND id NOT IN (
+              SELECT DISTINCT menu_item_id FROM order_items
+              WHERE menu_item_id IS NOT NULL
+          )
+        """,
+        live_names,
+    )
+    await conn.execute(
+        """
+        UPDATE menu_items
+        SET available = FALSE
+        WHERE NOT (LOWER(name) = ANY($1::text[]))
+        """,
+        live_names,
+    )
+    for name, category, price, description, dietary, price_estimated in MENU_ITEMS:
         await conn.execute(
             """
-            INSERT INTO menu_items (name, category, price, description, dietary)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT DO NOTHING
+            INSERT INTO menu_items
+                (name, category, price, description, dietary, available, price_estimated)
+            VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+            ON CONFLICT ((LOWER(name))) DO UPDATE SET
+                category = EXCLUDED.category,
+                price = EXCLUDED.price,
+                description = EXCLUDED.description,
+                dietary = EXCLUDED.dietary,
+                available = TRUE,
+                price_estimated = EXCLUDED.price_estimated
             """,
-            name, category, float(price), description, dietary
+            name,
+            category,
+            float(price),
+            description,
+            dietary,
+            price_estimated,
         )
-    print(f"  → {len(MENU_ITEMS)} menu items seeded.")
+    print(f"  -> {len(MENU_ITEMS)} menu items seeded.")
+
+    if not with_embeddings:
+        print("Skipping legacy pgvector embeddings (use --with-embeddings to rebuild).")
+        print("Seed complete.")
+        return
 
     print("Embedding knowledge files into pgvector...")
     base_path = Path(__file__).parent.parent
@@ -144,6 +284,7 @@ async def seed(conn: asyncpg.Connection) -> None:
         text = file_path.read_text(encoding="utf-8")
         chunks = chunk_markdown(text)
         print(f"  Embedding {len(chunks)} chunks from {rel_path}...")
+        await conn.execute("DELETE FROM knowledge_chunks WHERE source = $1", source)
 
         # Embed in batches of 20
         for i in range(0, len(chunks), 20):
@@ -159,22 +300,28 @@ async def seed(conn: asyncpg.Connection) -> None:
                 )
             total_chunks += len(batch)
 
-    print(f"  → {total_chunks} chunks embedded.")
+    print(f"  -> {total_chunks} chunks embedded.")
     print("Seed complete.")
 
 
-async def main() -> None:
-    if not OPENAI_API_KEY:
+async def main(*, with_embeddings: bool = False) -> None:
+    if with_embeddings and not OPENAI_API_KEY:
         print("ERROR: OPENAI_API_KEY not set in .env — cannot embed knowledge files.")
-        print("Set your key and re-run, or skip RAG seeding for now.")
-        return
+        raise SystemExit(2)
 
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        await seed(conn)
+        await seed(conn, with_embeddings=with_embeddings)
     finally:
         await conn.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--with-embeddings",
+        action="store_true",
+        help="Rebuild legacy/offline pgvector knowledge chunks.",
+    )
+    args = parser.parse_args()
+    asyncio.run(main(with_embeddings=args.with_embeddings))

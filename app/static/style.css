@@ -355,6 +355,15 @@ body {
 
 /* ── Shared components ────────────────────────────────── */
 
+.knowledge-resolve {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 16rem;
+}
+.knowledge-resolve textarea {
+  width: 100%;
+}
 .btn-small {
   padding: 6px 14px;
   border: 1px solid var(--border);

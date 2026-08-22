@@ -1,0 +1,219 @@
+{% set mode = widget_mode | default('hybrid', true) | lower | trim %}
+{% set public_key = retell_public_key | default('', true) | trim %}
+{% set chat_agent_id = retell_chat_agent_id | default('', true) | trim %}
+{% set voice_agent_id = retell_voice_agent_id | default('', true) | trim %}
+{% set callback_phone = retell_callback_phone_number | default('', true) | trim %}
+{% set callback_countries_value = callback_countries | default('', true) | trim %}
+{% set callback_terms = callback_terms_url | default('', true) | trim %}
+{% set title = widget_title | default('Restaurant assistant', true) | trim %}
+{% set logo_url = widget_logo_url | default('', true) | trim %}
+{% set color = widget_color | default('#8B1E2D', true) | trim %}
+{% set fab_text = widget_fab_text | default('How can we help?', true) | trim %}
+{% set recaptcha_key = recaptcha_site_key | default('', true) | trim %}
+{% set hybrid_ready = mode == 'hybrid' and public_key and (chat_agent_id or voice_agent_id) %}
+{% set callback_ready = mode == 'callback' and public_key and voice_agent_id and callback_phone and callback_countries_value and callback_terms %}
+{% set widget_ready = hybrid_ready or callback_ready %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>{{ title | e }} — Widget demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #1f2937;
+      background: #f8fafc;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 1.5rem;
+    }
+
+    main {
+      width: min(100%, 42rem);
+      padding: clamp(1.5rem, 5vw, 3rem);
+      border: 1px solid #dbe3ec;
+      border-radius: 1rem;
+      background: #fff;
+      box-shadow: 0 1rem 2.5rem rgb(15 23 42 / 8%);
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    header img {
+      width: 3rem;
+      height: 3rem;
+      object-fit: contain;
+      border-radius: .5rem;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.5rem, 5vw, 2.25rem);
+      line-height: 1.15;
+    }
+
+    p {
+      line-height: 1.6;
+    }
+
+    .status,
+    .warning {
+      margin-top: 1.5rem;
+      padding: 1rem;
+      border-radius: .75rem;
+    }
+
+    .status {
+      border: 1px solid #a7f3d0;
+      background: #ecfdf5;
+    }
+
+    .warning {
+      border: 1px solid #f5c96a;
+      background: #fffbeb;
+    }
+
+    .warning h2 {
+      margin-top: 0;
+      font-size: 1.125rem;
+    }
+
+    code {
+      overflow-wrap: anywhere;
+    }
+
+    a {
+      color: #1d4ed8;
+    }
+
+    a:focus-visible {
+      outline: 3px solid #93c5fd;
+      outline-offset: 3px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      {% if logo_url %}
+      <img src="{{ logo_url | e }}" alt="">
+      {% endif %}
+      <h1>{{ title | e }}</h1>
+    </header>
+
+    {% if widget_ready %}
+    <p>
+      {% if callback_ready %}
+      Use the call button in the lower-right corner to request a telephone callback.
+      {% elif chat_agent_id and voice_agent_id %}
+      Use the button in the lower-right corner, then choose voice or text chat.
+      {% elif voice_agent_id %}
+      Use the button in the lower-right corner to start a browser voice conversation.
+      {% else %}
+      Use the button in the lower-right corner to start a text conversation.
+      {% endif %}
+    </p>
+
+    {% if not recaptcha_key %}
+    <p class="warning" role="status">
+      Development notice: reCAPTCHA v3 is not configured. Add
+      <code>recaptcha_site_key</code> and enable abuse prevention on the Retell
+      public key before production.
+    </p>
+    {% else %}
+    <p class="status" role="status">The secure website widget is configured for this demo.</p>
+    {% endif %}
+    {% else %}
+    <section class="warning" role="status" aria-labelledby="setup-title">
+      <h2 id="setup-title">Local widget setup is incomplete</h2>
+      <p>The hosted widget was not loaded. Pass these public configuration values from the future route:</p>
+      <ul>
+        {% if mode not in ['hybrid', 'callback'] %}
+        <li><code>widget_mode</code> must be <code>hybrid</code> or <code>callback</code>.</li>
+        {% endif %}
+        {% if not public_key %}
+        <li><code>retell_public_key</code></li>
+        {% endif %}
+        {% if mode == 'hybrid' and not (chat_agent_id or voice_agent_id) %}
+        <li><code>retell_chat_agent_id</code>, <code>retell_voice_agent_id</code>, or both</li>
+        {% endif %}
+        {% if mode == 'callback' and not voice_agent_id %}
+        <li><code>retell_voice_agent_id</code></li>
+        {% endif %}
+        {% if mode == 'callback' and not callback_phone %}
+        <li><code>retell_callback_phone_number</code> in E.164 format</li>
+        {% endif %}
+        {% if mode == 'callback' and not callback_countries_value %}
+        <li><code>callback_countries</code>, restricted to served countries</li>
+        {% endif %}
+        {% if mode == 'callback' and not callback_terms %}
+        <li><code>callback_terms_url</code> for the approved privacy/terms page</li>
+        {% endif %}
+      </ul>
+      <p>
+        For local testing, add <code>localhost</code> to the public key’s exact
+        allowed domains and to the reCAPTCHA v3 configuration. Never pass
+        <code>RETELL_API_KEY</code> to this template.
+      </p>
+    </section>
+    {% endif %}
+
+    <noscript>
+      <p class="warning">JavaScript is required to use the voice, chat, or callback widget.</p>
+    </noscript>
+  </main>
+
+  {% if widget_ready and recaptcha_key %}
+  <script src="https://www.google.com/recaptcha/api.js?render={{ recaptcha_key | urlencode }}"></script>
+  {% endif %}
+
+  {% if hybrid_ready %}
+  <script
+    id="retell-widget"
+    src="https://dashboard.retellai.com/retell-widget-v2.js"
+    type="module"
+    data-public-key="{{ public_key | e }}"
+    {% if chat_agent_id %}data-agent-id="{{ chat_agent_id | e }}"{% endif %}
+    {% if voice_agent_id %}data-voice-public-key="{{ public_key | e }}"{% endif %}
+    {% if voice_agent_id %}data-voice-agent-id="{{ voice_agent_id | e }}"{% endif %}
+    data-title="{{ title | e }}"
+    {% if logo_url %}data-logo-url="{{ logo_url | e }}"{% endif %}
+    data-color="{{ color | e }}"
+    data-fab-text="{{ fab_text | e }}"
+    {% if recaptcha_key %}data-recaptcha-key="{{ recaptcha_key | e }}"{% endif %}
+  ></script>
+  {% elif callback_ready %}
+  <script
+    id="retell-widget"
+    src="https://dashboard.retellai.com/retell-widget-v2.js"
+    type="module"
+    data-public-key="{{ public_key | e }}"
+    data-agent-id="{{ voice_agent_id | e }}"
+    data-widget="callback"
+    data-phone-number="{{ callback_phone | e }}"
+    data-title="{{ title | e }}"
+    data-countries="{{ callback_countries_value | e }}"
+    data-tc="{{ callback_terms | e }}"
+    data-color="{{ color | e }}"
+    data-fab-text="{{ fab_text | e }}"
+    {% if recaptcha_key %}data-recaptcha-key="{{ recaptcha_key | e }}"{% endif %}
+  ></script>
+  {% endif %}
+</body>
+</html>

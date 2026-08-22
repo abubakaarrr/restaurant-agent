@@ -7,14 +7,52 @@ Kept separate from runner.py to avoid circular imports:
 
 from __future__ import annotations
 
-_end_call_flags: dict[str, bool] = {}
+from dataclasses import dataclass
+from typing import Literal
+
+
+HandoffReason = Literal[
+    "human_requested",
+    "manager_or_complaint",
+    "severe_allergy",
+    "unsupported_language",
+    "repeated_verification_failure",
+    "payment_or_refund",
+    "system_outage",
+    "safety",
+]
+
+
+@dataclass(frozen=True)
+class CallControl:
+    action: Literal["end", "transfer"]
+    reason: str = ""
+
+
+_control_flags: dict[str, CallControl] = {}
 
 
 def request_end_call(session_id: str) -> None:
     """Signal that the call should end after the current turn."""
-    _end_call_flags[session_id] = True
+    if session_id:
+        _control_flags[session_id] = CallControl(action="end")
+
+
+def request_transfer(session_id: str, reason: HandoffReason) -> None:
+    """Request transfer to the server-configured number, never a model value."""
+    if session_id:
+        _control_flags[session_id] = CallControl(action="transfer", reason=reason)
+
+
+def consume_call_control(session_id: str) -> CallControl | None:
+    return _control_flags.pop(session_id, None)
+
+
+def clear_call_control(session_id: str) -> None:
+    _control_flags.pop(session_id, None)
 
 
 def consume_end_call(session_id: str) -> bool:
     """Return True (and clear the flag) if end_call was requested for this session."""
-    return _end_call_flags.pop(session_id, False)
+    control = consume_call_control(session_id)
+    return bool(control and control.action == "end")

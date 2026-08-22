@@ -39,6 +39,10 @@
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8h1a4 4 0 0 1 0 8h-1"/><path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"/><line x1="6" y1="1" x2="6" y2="4"/><line x1="10" y1="1" x2="10" y2="4"/><line x1="14" y1="1" x2="14" y2="4"/></svg>
         <span>Menu</span>
       </button>
+      <button class="nav-link" onclick="switchPage('knowledge')">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span>Knowledge</span>
+      </button>
 
       <div class="nav-divider"></div>
 
@@ -78,7 +82,7 @@
 
       <div class="page-header">
         <h1>Call & Chat</h1>
-        <p>Voice calls and text conversations with Sana, your AI receptionist</p>
+        <p>Voice calls and text conversations with {{ agent_name }}, your virtual restaurant host</p>
       </div>
 
       <div class="call-chat-layout">
@@ -87,10 +91,11 @@
         <div class="calls-column">
 
           <!-- Vapi card -->
+          {% if vapi_ready %}
           <div class="call-card">
             <div class="call-info">
               <h2>Live Voice Call <span class="provider-tag">Vapi</span></h2>
-              <p>Click to start a real-time voice conversation with Sana</p>
+              <p>Click to start a real-time voice conversation with {{ agent_name }}</p>
               <div class="call-status" id="callStatus"></div>
               <div class="vol-bars" id="volBars">
                 <span></span><span></span><span></span><span></span><span></span>
@@ -100,19 +105,13 @@
               📞
             </button>
           </div>
-
-          {% if not vapi_ready %}
-          <div class="config-warning">
-            Voice call requires <strong>VAPI_PUBLIC_KEY</strong> and <strong>VAPI_ASSISTANT_ID</strong>
-            in your <code>.env</code> file.
-          </div>
           {% endif %}
 
           <!-- Retell card -->
           <div class="call-card">
             <div class="call-info">
               <h2>Live Voice Call <span class="provider-tag retell">Retell</span></h2>
-              <p>Lower latency, better transcription &amp; barge-in</p>
+              <p>Browser preview for the configured managed voice agent</p>
               <div class="call-status" id="retellStatus"></div>
               <div class="vol-bars" id="retellVolBars">
                 <span></span><span></span><span></span><span></span><span></span>
@@ -138,14 +137,14 @@
               <div class="chat-avatar">🍽️</div>
               <div>
                 <h1>{{ restaurant }}</h1>
-                <p><span class="status-dot"></span>AI Receptionist — Text Demo</p>
+                <p><span class="status-dot"></span>Host — Text Demo</p>
               </div>
             </div>
 
             <div class="messages" id="messages">
               <div class="msg agent">
-                <div class="msg-avatar">🤖</div>
-                <div class="bubble">Hello! Thank you for calling {{ restaurant }}. I'm Sana, your AI receptionist. How can I help you today?</div>
+                <div class="msg-avatar">🍽️</div>
+                <div class="bubble">Hi, you've reached {{ restaurant }}. This is {{ agent_name }}. How can I help you today?</div>
               </div>
             </div>
 
@@ -279,6 +278,49 @@
       </div>
     </div>
 
+    <!-- ═══════ PAGE: Knowledge ═══════ -->
+    <div id="page-knowledge" class="page-content">
+
+      <div class="page-header">
+        <h1>Knowledge</h1>
+        <p>Questions the host could not answer, and answers the floor can use next time</p>
+        <button class="btn-small" onclick="loadKnowledge()">Refresh</button>
+      </div>
+
+      <div class="table-wrapper">
+        <h2>Open questions</h2>
+        <table class="data-table" id="knowledgeGapsTable">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Question</th>
+              <th>Context</th>
+              <th>Answer</th>
+            </tr>
+          </thead>
+          <tbody id="knowledgeGapsBody">
+            <tr><td colspan="4" class="empty-state">Loading questions...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="table-wrapper" style="margin-top:1.5rem">
+        <h2>Live answers</h2>
+        <table class="data-table" id="knowledgeFaqTable">
+          <thead>
+            <tr>
+              <th>Question</th>
+              <th>Answer</th>
+              <th>Updated</th>
+            </tr>
+          </thead>
+          <tbody id="knowledgeFaqBody">
+            <tr><td colspan="3" class="empty-state">Loading answers...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- ═══════ PAGE: Menu ═══════ -->
     <div id="page-menu" class="page-content">
 
@@ -354,7 +396,7 @@
           <div class="form-grid">
             <div class="form-group">
               <label for="setName">Restaurant name</label>
-              <input type="text" id="setName" placeholder="e.g. La Casa Restaurant">
+              <input type="text" id="setName" placeholder="e.g. The Lamplighter Public House">
             </div>
             <div class="form-group">
               <label for="setPhone">Phone number</label>
@@ -406,7 +448,7 @@
           <div class="form-grid">
             <div class="form-group">
               <label for="setAgentName">Agent name</label>
-              <input type="text" id="setAgentName" placeholder="e.g. Sana">
+              <input type="text" id="setAgentName" placeholder="e.g. Clough">
               <small class="form-hint">The name your AI receptionist introduces itself as</small>
             </div>
           </div>
@@ -437,7 +479,7 @@
 
         <div class="settings-section">
           <h2>Opening Hours</h2>
-          <p class="settings-hint">Sana uses today's hours for open/closed checks and the full weekly schedule when guests ask.</p>
+          <p class="settings-hint">These hours feed the dashboard, grounded information tools, and rollback agent.</p>
 
           <div class="hours-list" id="hoursList">
             <div class="hours-row">
@@ -500,16 +542,18 @@
   <!-- Config injected from server -->
   <script>
     window.APP_CONFIG = {
-      vapiPubKey:      "{{ vapi_pub }}",
-      vapiAssistantId: "{{ vapi_asst }}",
-      restaurantName:  "{{ restaurant }}",
+      vapiPubKey:      {{ vapi_pub | tojson }},
+      vapiAssistantId: {{ vapi_asst | tojson }},
+      restaurantName:  {{ restaurant | tojson }},
+      agentName:       {{ agent_name | tojson }},
       vapiReady:       {{ 'true' if vapi_ready else 'false' }},
       retellReady:     {{ 'true' if retell_ready else 'false' }},
-      dashKey:         "{{ dash_key }}"
+      csrfToken:       {{ csrf_token | tojson }}
     };
   </script>
 
-  <!-- Vapi Web SDK -->
+  {% if vapi_ready %}
+  <!-- Legacy Vapi rollback Web SDK -->
   <script type="module">
     import VapiMod from 'https://esm.sh/@vapi-ai/web';
     const VapiClass = typeof VapiMod === 'function'                          ? VapiMod
@@ -564,6 +608,7 @@
       }
     }
   </script>
+  {% endif %}
 
   <!-- Retell Web SDK -->
   <script type="module">

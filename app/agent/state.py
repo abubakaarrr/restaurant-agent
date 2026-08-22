@@ -12,3 +12,5 @@ class RestaurantAgentState(MessagesState):
     session_id: str = ""
     caller_phone: str = ""
     turn_count: int = 0
+    tool_iterations: int = 0
+    behavior_directive: str = ""

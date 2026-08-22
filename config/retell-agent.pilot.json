@@ -1,0 +1,333 @@
+{
+  "manifest_kind": "retell-pilot-review-manifest",
+  "manifest_version": "2026-08-12",
+  "directly_importable": false,
+  "notice": "Redacted, version-controlled desired state for dashboard/API review. It is not a Retell API request body.",
+  "pilot_scope": {
+    "market": "US_OR_CANADA",
+    "direction": "inbound",
+    "phone_number_ownership": "new_retell_managed",
+    "production_traffic_policy": "one Retell agent at weight 1",
+    "primary_orchestration": "retell_managed_conversation_flow",
+    "challenger_policy": "Direct ElevenAgents is bakeoff-only and must not receive the Retell pilot number."
+  },
+  "redacted_resource_references": {
+    "retell_conversation_flow_id": "<RETELL_CONVERSATION_FLOW_ID>",
+    "retell_agent_id": "<RETELL_AGENT_ID>",
+    "retell_agent_version": "<PINNED_PUBLISHED_VERSION_OR_PROD_TAG>",
+    "retell_phone_number": "<NEW_RETELL_MANAGED_E164_NUMBER>",
+    "staff_fallback_number": "<STAFF_E164_NUMBER>",
+    "webhook_url": "https://<PILOT_API_HOST>/api/retell/webhook"
+  },
+  "phone_number_desired_state": {
+    "provisioner": "scripts/provision_retell.py",
+    "nickname": "restaurant-agent-pilot",
+    "country_code": "<US_OR_CA>",
+    "area_code": "<US_ONLY_OPTIONAL_3_DIGITS>",
+    "number_provider": "<twilio_or_telnyx>",
+    "inbound_agents": [
+      {
+        "agent_id": "<RETELL_AGENT_ID>",
+        "agent_version": "<PINNED_PUBLISHED_VERSION_OR_PROD_TAG>",
+        "weight": 1
+      }
+    ],
+    "fallback_number": "<STAFF_E164_NUMBER>",
+    "fallback_scope_warning": "Retell fallback_number is a concurrency fallback, not a universal agent-error or transfer-failure fallback."
+  },
+  "agent_review": {
+    "response_engine": {
+      "type": "conversation-flow",
+      "conversation_flow_id": "<RETELL_CONVERSATION_FLOW_ID>"
+    },
+    "language": "en-US",
+    "interaction_settings": {
+      "responsiveness": 0.8,
+      "interruption_sensitivity": 0.7,
+      "enable_dynamic_responsiveness": true,
+      "enable_dynamic_voice_speed": true,
+      "enable_backchannel": false,
+      "backchannel_frequency": 0,
+      "denoising_mode": "noise-cancellation",
+      "reminder_trigger_ms": 12000,
+      "reminder_max_count": 2,
+      "begin_message_delay_ms": 500,
+      "end_call_after_silence_ms": 120000,
+      "max_call_duration_ms": 900000,
+      "ambient_sound": null
+    },
+    "data_storage_setting": "everything_except_pii",
+    "boosted_keywords": [
+      "<RESTAURANT_NAME>",
+      "<MENU_TERMS_TO_VERIFY_IN_STAGING>"
+    ]
+  },
+  "conversation_flow_review": {
+    "start_speaker": "agent",
+    "version_controlled_prompts": [
+      "app/prompts/retell/global.md",
+      "app/prompts/retell/reservation.md",
+      "app/prompts/retell/order.md",
+      "app/prompts/retell/handoff.md"
+    ],
+    "required_paths": [
+      "greeting_and_intent_route",
+      "menu_and_allergen_information",
+      "pickup_order",
+      "reservation_and_confirmation",
+      "booking_or_order_lookup",
+      "staff_transfer",
+      "transfer_failure_recovery",
+      "safe_end_call"
+    ],
+    "staff_transfer": {
+      "node_type": "call_transfer",
+      "destination": "<STAFF_E164_NUMBER>",
+      "pilot_mode": "warm_transfer",
+      "pre_transfer_message": "Let me connect you with the restaurant team.",
+      "human_detection": true,
+      "failure_path": "Apologize, collect a callback number only with consent, and do not claim the transfer succeeded.",
+      "required_phone_only_test": true
+    },
+    "tool_endpoint_placeholders": [
+      {
+        "name": "get_menu",
+        "method": "GET",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/menu",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "check_table_availability",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/availability",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "create_reservation",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/bookings/create",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:create_booking:{{confirmed_draft_version}}"
+      },
+      {
+        "name": "lookup_booking",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/bookings/lookup",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "cancel_booking",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/bookings/cancel",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:cancel_booking:{{booking_id}}"
+      },
+      {
+        "name": "add_guest_note",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/bookings/notes",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:add_guest_note:{{turn_id}}"
+      },
+      {
+        "name": "update_reservation_draft",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/reservations/draft",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "get_reservation_draft",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/reservations/draft/get",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "update_confirmed_booking",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/bookings/update",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:update_booking:{{booking_id}}"
+      },
+      {
+        "name": "log_unknown_question",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/knowledge/unknown",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "find_menu_item",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/menu/find",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "add_order_item",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/items/add",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:add_item:{{turn_id}}"
+      },
+      {
+        "name": "get_order_summary",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/summary",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "update_order_item",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/items/update",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:update_item:{{turn_id}}"
+      },
+      {
+        "name": "remove_order_item",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/items/remove",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:remove_item:{{turn_id}}"
+      },
+      {
+        "name": "confirm_order",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/confirm",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:confirm_order:{{draft_version}}"
+      },
+      {
+        "name": "lookup_order",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/lookup",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "restaurant_info",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/restaurant-info",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      }
+    ]
+  },
+  "lifecycle_webhooks": {
+    "webhook_url": "https://<PILOT_API_HOST>/api/retell/webhook",
+    "webhook_timeout_ms": 10000,
+    "webhook_events": [
+      "call_started",
+      "call_ended",
+      "call_analyzed",
+      "transfer_started",
+      "transfer_bridged",
+      "transfer_cancelled",
+      "transfer_ended"
+    ],
+    "security_requirements": [
+      "Verify X-Retell-Signature against the exact raw request body.",
+      "Use the Retell API key designated as the webhook key.",
+      "Reject stale signatures and return 2xx promptly after durable acceptance.",
+      "Deduplicate lifecycle events by event plus call_id; include transfer attempt identity for transfer events."
+    ]
+  },
+  "voice_bakeoff": {
+    "traffic_policy": "Run matched scripts in Retell web/phone tests before launch. Do not split the production number across voice or platform arms.",
+    "arms": [
+      {
+        "id": "retell_elevenlabs_authorized_clone",
+        "platform": "Retell",
+        "voice_provider": "elevenlabs",
+        "voice_id": "<RETELL_ELEVENLABS_AUTHORIZED_CLONE_VOICE_ID>",
+        "voice_model": "eleven_flash_v2",
+        "enable_expressive_mode": false,
+        "eligibility": "Use only after voice-owner authorization and the provider-permitted create/verify/share workflow are documented; consent alone does not override provider policy."
+      },
+      {
+        "id": "retell_platform_expressive",
+        "platform": "Retell",
+        "voice_provider": "platform",
+        "voice_id": "<RETELL_PLATFORM_VOICE_ID_SELECTED_IN_DASHBOARD>",
+        "voice_model": null,
+        "enable_expressive_mode": true,
+        "expressive_emotion_tags": [
+          "empathetic",
+          "happy",
+          "pause",
+          "emphasis"
+        ]
+      },
+      {
+        "id": "direct_elevenagents_challenger",
+        "platform": "ElevenAgents",
+        "voice_id": "<ELEVENLABS_CHALLENGER_VOICE_ID>",
+        "routing": "bakeoff_only",
+        "production_number_attached": false,
+        "constraint": "Separate test agent and test entry point; it is not the pilot's primary orchestration path."
+      }
+    ],
+    "scorecard": [
+      "task completion and tool correctness",
+      "transfer trigger and bridge success",
+      "median and p95 response latency",
+      "interruption and barge-in recovery",
+      "name, time, price, and allergen pronunciation",
+      "caller-rated naturalness",
+      "all-in measured cost per completed call"
+    ]
+  },
+  "release_gates": [
+    {
+      "gate": "voice_rights",
+      "pass": "Authorization and evidence of the provider-permitted create, verify, and share workflow exist for every cloned voice used."
+    },
+    {
+      "gate": "published_version",
+      "pass": "The selected Retell agent version is published and the pilot number references a deliberate numeric version or assigned prod tag."
+    },
+    {
+      "gate": "tool_safety",
+      "pass": "All write tools require caller confirmation, are idempotent, and pass staging tests without live customer data."
+    },
+    {
+      "gate": "webhook_security",
+      "pass": "Signature verification, replay rejection, deduplication, and fast acknowledgement are tested."
+    },
+    {
+      "gate": "staff_handoff",
+      "pass": "Answered, no-answer, busy, voicemail, and after-hours phone transfer cases have expected outcomes and webhook events."
+    },
+    {
+      "gate": "number_fallback",
+      "pass": "A controlled concurrency-limit test reaches the configured staff fallback number."
+    },
+    {
+      "gate": "billing",
+      "pass": "A workspace owner accepts number, telephony, model, voice, and production-rate test charges and has alerts or budget monitoring."
+    },
+    {
+      "gate": "challenger_isolation",
+      "pass": "Direct ElevenAgents remains on a separate test entry point with no production Retell number routing."
+    },
+    {
+      "gate": "rollback_rehearsal",
+      "pass": "The operator has timed a rebind to the previous known-good published version and to the staff-transfer-only version."
+    }
+  ],
+  "rollback": {
+    "known_good_agent_version": "<PREVIOUS_PUBLISHED_NUMERIC_VERSION>",
+    "staff_transfer_only_agent_version": "<PUBLISHED_STAFF_TRANSFER_ONLY_VERSION>",
+    "immediate_actions": [
+      "Stop publishing or moving tags.",
+      "Rebind inbound_agents at weight 1 to the previous known-good numeric version, or move the prod tag back.",
+      "If tools are unsafe, rebind to the staff-transfer-only published version.",
+      "Confirm the number binding with List/Get Phone Number and place a real phone test.",
+      "Keep the number during short rollback windows; release it only when ending the pilot because deletion stops number charges and relinquishes the number."
+    ],
+    "success_signal": "A new inbound phone call reaches the intended version and either completes a safe task or bridges to staff.",
+    "audit_fields": [
+      "operator",
+      "timestamp",
+      "from_version",
+      "to_version",
+      "reason",
+      "verification_call_id"
+    ]
+  }
+}

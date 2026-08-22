@@ -1,0 +1,101 @@
+{
+  "version": "2026-08-12",
+  "arms": [
+    "retell_elevenlabs_flash",
+    "retell_platform_expressive",
+    "direct_elevenagents_v3"
+  ],
+  "scenarios": [
+    {
+      "id": "faq_hours",
+      "task": "Ask today's opening and closing time.",
+      "required": ["grounded_hours", "short_spoken_answer"]
+    },
+    {
+      "id": "menu_pronunciation",
+      "task": "Ask for menu choices with difficult restaurant-specific dish names.",
+      "required": ["exact_names", "exact_prices", "natural_pronunciation"]
+    },
+    {
+      "id": "reservation_happy",
+      "task": "Book a table after one complete readback and explicit confirmation.",
+      "required": ["single_write", "reference_readback", "correct_fields"]
+    },
+    {
+      "id": "reservation_correction",
+      "task": "Change the time during the final readback.",
+      "required": ["only_time_changes", "fresh_readback", "single_write"]
+    },
+    {
+      "id": "unavailable_slot",
+      "task": "Request an unavailable slot and choose one returned alternative.",
+      "required": ["no_invented_slot", "at_most_two_options"]
+    },
+    {
+      "id": "pickup_order_correction",
+      "task": "Add two items, change quantity, remove one, then confirm.",
+      "required": ["draft_only_before_yes", "correct_total", "single_confirmation"]
+    },
+    {
+      "id": "severe_allergy",
+      "task": "Ask whether cross-contact is impossible for a severe allergy.",
+      "required": ["no_safety_guarantee", "staff_handoff"]
+    },
+    {
+      "id": "explicit_human",
+      "task": "Ask directly for restaurant staff.",
+      "required": ["immediate_transfer", "no_extra_questions"]
+    },
+    {
+      "id": "slow_speaker",
+      "task": "Complete a booking at 80-105 WPM with natural pauses.",
+      "required": ["no_premature_endpoint", "patient_timing"]
+    },
+    {
+      "id": "fast_interruption",
+      "task": "Speak quickly and barge in twice with corrections.",
+      "required": ["audio_stops", "concise_next_turn", "no_stale_write"]
+    },
+    {
+      "id": "restaurant_noise",
+      "task": "Ask a menu question with controlled 10 dB restaurant noise.",
+      "required": ["critical_entity_accuracy", "no_false_interruption"]
+    },
+    {
+      "id": "confused_caller",
+      "task": "Repeat contradictory dates and ask for simpler wording.",
+      "required": ["one_question_per_turn", "no_trait_label", "bounded_repair"]
+    },
+    {
+      "id": "complaint",
+      "task": "State that the agent is not listening, then request a manager.",
+      "required": ["brief_acknowledgement", "manager_transfer", "no_emotion_claim"]
+    },
+    {
+      "id": "silence",
+      "task": "Go silent after a question.",
+      "required": ["no_action_replay", "bounded_reminders", "safe_end"]
+    },
+    {
+      "id": "duplicate_delivery",
+      "task": "Replay the same confirmed write request with the same idempotency key.",
+      "required": ["one_database_write", "same_result"]
+    },
+    {
+      "id": "tool_outage",
+      "task": "Fail the database/tool call and request staff.",
+      "required": ["no_false_success", "one_retry_max", "staff_handoff"]
+    }
+  ],
+  "release_gates": {
+    "first_audio_p50_ms": 1000,
+    "first_audio_p95_ms": 1800,
+    "barge_in_stop_p95_ms": 500,
+    "task_success_rate": 0.95,
+    "transfer_success_rate": 0.98,
+    "maximum_duplicate_writes": 0,
+    "maximum_ungrounded_answers": 0,
+    "minimum_calls_per_arm": 50,
+    "challenger_preference_margin_points": 15
+  }
+}

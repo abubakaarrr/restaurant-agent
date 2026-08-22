@@ -1,22 +1,24 @@
-"""FastAPI entry point — chat API + Vapi Custom LLM + Voice Studio + browser demo UI."""
+"""FastAPI entry point for managed voice tools, webhooks, and operator UI."""
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import logging
 import io
+import secrets
 import traceback
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
+from app.logging_config import configure_logging
+
+configure_logging()
 logger = logging.getLogger(__name__)
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, Security, UploadFile, WebSocket
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
@@ -25,36 +27,56 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.agent.runner import clear_session as _clear_session, get_session_history, run_agent, stream_agent_tokens
+from app.call_analytics import ingest_retell_webhook, purge_expired_call_data
 from app.config import settings
 from app.db_pool import get_pool, close_pool
+from app.rate_limit import chat_limiter, login_limiter, web_call_limiter
+from app.restaurant_settings import (
+    load_restaurant_settings as _load_settings,
+    save_restaurant_settings as _save_settings,
+    validate_restaurant_settings_update,
+)
 from app.retell_handler import handle_retell_connection
+from app.retell_ws_auth import remember_retell_call, retell_ws_authorized
+from app.security import constant_time_equal, verify_retell_webhook_signature
+from app.services.restaurant import RestaurantServiceError, restaurant_service
+from app.tool_api import router as voice_tool_router
 
 # ── Auth helpers ──────────────────────────────────────────────
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def require_dashboard_key(api_key: str | None = Security(_api_key_header)) -> None:
-    """Dependency: reject requests that don't carry a valid X-API-Key header.
+async def require_dashboard_access(
+    request: Request,
+    api_key: str | None = Security(_api_key_header),
+) -> None:
+    """Allow a server API key or a logged-in dashboard session with CSRF."""
+    if settings.dashboard_api_key and constant_time_equal(api_key, settings.dashboard_api_key):
+        return
+    if not _is_logged_in(request):
+        if not settings.dashboard_api_key and not settings.is_production:
+            return
+        raise HTTPException(status_code=401, detail="Dashboard authentication required")
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        provided = request.headers.get("X-CSRF-Token")
+        expected = str(request.session.get("csrf_token") or "")
+        if not constant_time_equal(provided, expected):
+            raise HTTPException(status_code=403, detail="Invalid or missing CSRF token")
 
-    If DASHBOARD_API_KEY is not set in .env, auth is skipped (dev mode).
-    """
-    if not settings.dashboard_api_key:
-        return  # auth disabled in dev
-    if api_key != settings.dashboard_api_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-
-def _verify_retell_signature(body: bytes, signature: str) -> bool:
-    """Verify the x-retell-signature HMAC-SHA256 header on Retell webhook POST requests."""
-    if not settings.retell_api_key:
-        return True  # skip in dev when key is not configured
-    expected = hmac.new(
-        settings.retell_api_key.encode(),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+def _require_vapi_access(request: Request) -> None:
+    if not settings.enable_legacy_vapi:
+        raise HTTPException(status_code=404, detail="Legacy Vapi adapter is disabled")
+    if not settings.vapi_server_secret:
+        raise HTTPException(status_code=503, detail="Vapi server secret is not configured")
+    provided = request.headers.get("x-vapi-secret", "")
+    if not provided:
+        authorization = request.headers.get("authorization", "")
+        if authorization.lower().startswith("bearer "):
+            provided = authorization[7:]
+    if not constant_time_equal(provided, settings.vapi_server_secret):
+        raise HTTPException(status_code=401, detail="Invalid Vapi server secret")
 
 
 def _is_logged_in(request: Request) -> bool:
@@ -80,25 +102,43 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.validate_runtime_security()
     # Warm the connection pool at startup so the first call doesn't pay the
     # connection-setup cost mid-conversation.
     await get_pool()
+    try:
+        await purge_expired_call_data()
+    except Exception:
+        # Existing deployments must apply the pilot migration first. Keep
+        # startup available for the health endpoint while making the gap clear.
+        logger.warning("Call-data retention cleanup skipped; apply DB migrations", exc_info=True)
     yield
     await close_pool()
 
 
 app = FastAPI(
     title="Restaurant AI Receptionist",
-    description="La Casa Restaurant — AI receptionist powered by LangGraph + GPT-4o",
-    version="0.1.0",
+    description="Managed voice tools, call operations, and restaurant dashboard",
+    version="0.2.0",
     lifespan=lifespan,
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_origins,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Idempotency-Key",
+        "X-API-Key",
+        "X-CSRF-Token",
+        "X-Voice-Tool-Secret",
+    ],
+    allow_credentials=True,
 )
 
 # Session cookie for the single shared dashboard login.
@@ -119,6 +159,7 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
+app.include_router(voice_tool_router)
 
 VOICES_DIR = Path("voices")
 
@@ -138,14 +179,36 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "restaurant": settings.restaurant_name}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        database_ok = await conn.fetchval("SELECT 1")
+        pilot_schema = await conn.fetchval(
+            "SELECT to_regclass('public.voice_action_idempotency') IS NOT NULL"
+        )
+    if database_ok != 1 or not pilot_schema:
+        raise HTTPException(status_code=503, detail="Database migration required")
+    runtime = _load_settings()
+    return {
+        "status": "ok",
+        "restaurant": runtime.get("restaurant_name") or settings.restaurant_name,
+        "agent_name": runtime.get("ai_agent_name") or settings.ai_agent_name,
+        "voice_live_writes_enabled": settings.voice_live_writes_enabled,
+        "managed_retell_ready": bool(
+            settings.retell_agent_id and settings.voice_tool_secret
+        ),
+    }
 
 
 # ── Text chat endpoint (browser demo + testing) ───────────────
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    dependencies=[Security(require_dashboard_access)],
+)
+async def chat(req: ChatRequest, request: Request):
     """Text chat endpoint — used by the browser demo and simulate_call.py."""
+    await chat_limiter.check(request, scope="chat")
     session_id = req.session_id or str(uuid.uuid4())
     try:
         reply = await run_agent(session_id, req.message, req.caller_phone)
@@ -160,7 +223,10 @@ async def chat(req: ChatRequest):
     )
 
 
-@app.delete("/session/{session_id}")
+@app.delete(
+    "/session/{session_id}",
+    dependencies=[Security(require_dashboard_access)],
+)
 async def delete_session(session_id: str):
     _clear_session(session_id)
     return {"cleared": session_id}
@@ -183,6 +249,7 @@ async def vapi_llm(request: Request):
     OpenAI-compatible streaming endpoint for Vapi's Custom LLM feature.
     Streams real LLM tokens as they are generated (after any tool calls).
     """
+    _require_vapi_access(request)
     body = await request.json()
 
     messages: list[dict] = body.get("messages", [])
@@ -198,8 +265,11 @@ async def vapi_llm(request: Request):
         yield _sse_chunk(chunk_id, {"role": "assistant", "content": ""})
 
         if not user_messages:
+            runtime = _load_settings()
+            restaurant_name = runtime.get("restaurant_name") or settings.restaurant_name
+            agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
             greeting = (
-                f"Hello! Thank you for calling {settings.restaurant_name}. "
+                f"Hi, you've reached {restaurant_name}. This is {agent_name}. "
                 "How can I help you today?"
             )
             yield _sse_chunk(chunk_id, {"content": greeting})
@@ -229,13 +299,9 @@ async def vapi_llm(request: Request):
 async def vapi_webhook(request: Request):
     """Vapi server webhook — receives call lifecycle events.
 
-    Vapi signs requests with x-vapi-secret.  Set DASHBOARD_API_KEY in .env
-    and configure the same value as the server-URL secret in the Vapi dashboard.
+    Rollback only. Configure VAPI_SERVER_SECRET as Vapi's server-URL secret.
     """
-    if settings.dashboard_api_key:
-        provided = request.headers.get("x-vapi-secret", "")
-        if not hmac.compare_digest(provided, settings.dashboard_api_key):
-            raise HTTPException(status_code=401, detail="Invalid Vapi webhook secret")
+    _require_vapi_access(request)
 
     body = await request.json()
     msg = body.get("message", {})
@@ -254,17 +320,36 @@ async def vapi_webhook(request: Request):
 async def retell_ws(websocket: WebSocket, call_id: str):
     """Retell connects here for each call. Retell does STT/turn-taking/TTS;
     we run the LangGraph agent and stream text replies back."""
+    # Accept first. Closing an unaccepted socket is returned as HTTP 403, which
+    # Retell retries without a useful close reason.
     await websocket.accept()
+    if not settings.enable_legacy_retell_custom_llm:
+        logger.warning("Retell WS rejected for %s: custom-LLM adapter disabled", call_id)
+        await websocket.close(code=1008, reason="Legacy custom-LLM adapter is disabled")
+        return
+    provided = websocket.query_params.get("token", "")
+    if not retell_ws_authorized(call_id, provided):
+        logger.warning(
+            "Retell WS rejected for %s: add ?token=RETELL_WS_TOKEN to the custom LLM URL "
+            "in the Retell dashboard, or start the call from this app so the call id is minted",
+            call_id,
+        )
+        await websocket.close(code=1008, reason="Invalid WebSocket token")
+        return
     await handle_retell_connection(websocket, call_id)
 
 
-@app.post("/api/retell/web-call")
-async def retell_web_call():
+@app.post(
+    "/api/retell/web-call",
+    dependencies=[Security(require_dashboard_access)],
+)
+async def retell_web_call(request: Request):
     """Mint a short-lived Retell web-call access token for the browser SDK.
 
     The API key stays server-side; the browser only ever sees the access token,
     which Retell invalidates after 30s if a call isn't started.
     """
+    await web_call_limiter.check(request, scope="retell-web-call")
     if not settings.retell_api_key or not settings.retell_agent_id:
         raise HTTPException(
             status_code=400,
@@ -283,15 +368,41 @@ async def retell_web_call():
         raise HTTPException(status_code=502, detail=f"Retell error: {resp.text}")
 
     data = resp.json()
+    call_id = str(data.get("call_id") or "")
+    remember_retell_call(call_id)
     return {
         "access_token": data.get("access_token", ""),
-        "call_id": data.get("call_id", ""),
+        "call_id": call_id,
     }
+
+
+@app.post("/api/retell/webhook")
+async def retell_webhook(request: Request):
+    """Receive signed, replay-protected Retell call lifecycle events."""
+    raw_body = await request.body()
+    signature = request.headers.get("X-Retell-Signature")
+    if not verify_retell_webhook_signature(
+        raw_body,
+        settings.retell_api_key,
+        signature,
+    ):
+        raise HTTPException(status_code=401, detail="Invalid Retell webhook signature")
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    await ingest_retell_webhook(payload, raw_body)
+    event_type = payload.get("event") or payload.get("event_type")
+    call = payload.get("call") if isinstance(payload.get("call"), dict) else {}
+    call_id = call.get("call_id") or call.get("id")
+    if event_type in {"call_ended", "call_analyzed"} and call_id:
+        _clear_session(str(call_id))
+    return Response(status_code=204)
 
 
 # ── Voice Studio API ──────────────────────────────────────────
 
-@app.get("/api/voices", dependencies=[Security(require_dashboard_key)])
+@app.get("/api/voices", dependencies=[Security(require_dashboard_access)])
 async def list_voices():
     """List all available voices (system + custom)."""
     voices = []
@@ -312,7 +423,7 @@ async def list_voices():
     return {"voices": voices}
 
 
-@app.post("/api/voices/upload", dependencies=[Security(require_dashboard_key)])
+@app.post("/api/voices/upload", dependencies=[Security(require_dashboard_access)])
 async def upload_voice(
     file: UploadFile = File(...),
     name: str = Form(...),
@@ -353,7 +464,7 @@ async def upload_voice(
     }
 
 
-@app.delete("/api/voices/{voice_id}", dependencies=[Security(require_dashboard_key)])
+@app.delete("/api/voices/{voice_id}", dependencies=[Security(require_dashboard_access)])
 async def delete_voice(voice_id: str):
     """Delete a custom voice."""
     folder = VOICES_DIR / "custom"
@@ -364,7 +475,7 @@ async def delete_voice(voice_id: str):
     raise HTTPException(404, "Voice not found")
 
 
-@app.get("/api/voices/{category}/{filename}", dependencies=[Security(require_dashboard_key)])
+@app.get("/api/voices/{category}/{filename}", dependencies=[Security(require_dashboard_access)])
 async def get_voice_audio(category: str, filename: str):
     """Stream a voice reference audio file for preview."""
     if category not in ("system", "custom"):
@@ -375,7 +486,7 @@ async def get_voice_audio(category: str, filename: str):
     return FileResponse(path, media_type="audio/wav")
 
 
-@app.post("/api/tts/generate", dependencies=[Security(require_dashboard_key)])
+@app.post("/api/tts/generate", dependencies=[Security(require_dashboard_access)])
 async def tts_generate(request: Request):
     """Proxy TTS generation to the Chatterbox service and return audio."""
     body = await request.json()
@@ -424,7 +535,7 @@ async def tts_generate(request: Request):
         raise HTTPException(504, "TTS generation timed out. Try shorter text.")
 
 
-@app.get("/api/tts/health")
+@app.get("/api/tts/health", dependencies=[Security(require_dashboard_access)])
 async def tts_health():
     """Check if the Chatterbox TTS service is running."""
     try:
@@ -477,6 +588,7 @@ async def vapi_custom_voice(request: Request):
     sample rate. We generate speech via Chatterbox in the configured cloned
     voice and stream back raw PCM (s16le, mono) at the requested rate.
     """
+    _require_vapi_access(request)
     body = await request.json()
     message = body.get("message", body)
     text = (message.get("text") or "").strip()
@@ -520,7 +632,7 @@ async def vapi_custom_voice(request: Request):
 
 # ── History API ───────────────────────────────────────────────
 
-@app.get("/api/history", dependencies=[Security(require_dashboard_key)])
+@app.get("/api/history", dependencies=[Security(require_dashboard_access)])
 async def get_history():
     """Return all reservations (with table + any pre-order) and standalone
     pickup orders, for the History dashboard tab."""
@@ -605,70 +717,38 @@ async def get_history():
 
 # ── Settings API ──────────────────────────────────────────
 
-SETTINGS_FILE = Path("restaurant_settings.json")
 
-_DEFAULT_SETTINGS = {
-    "restaurant_name": settings.restaurant_name,
-    "phone_number": "",
-    "timezone": settings.restaurant_timezone,
-    "seating_capacity": 60,
-    "street_address": "",
-    "city": "",
-    "ai_agent_name": "Sana",
-    "languages": ["English"],
-    "opening_hours": {
-        "mon": {"open": "11:30", "close": "22:00"},
-        "tue": {"open": "11:30", "close": "22:00"},
-        "wed": {"open": "11:30", "close": "22:00"},
-        "thu": {"open": "11:30", "close": "23:00"},
-        "fri": {"open": "11:30", "close": "23:30"},
-        "sat": {"open": "10:00", "close": "23:30"},
-        "sun": {"open": "10:00", "close": "21:00"},
-    },
-}
-
-
-def _load_settings() -> dict:
-    if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        merged = {**_DEFAULT_SETTINGS, **saved}
-        return merged
-    return dict(_DEFAULT_SETTINGS)
-
-
-def _save_settings(data: dict) -> dict:
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    return data
-
-
-@app.get("/api/settings", dependencies=[Security(require_dashboard_key)])
+@app.get("/api/settings", dependencies=[Security(require_dashboard_access)])
 async def get_settings_api():
     return _load_settings()
 
 
-@app.put("/api/settings", dependencies=[Security(require_dashboard_key)])
+@app.put("/api/settings", dependencies=[Security(require_dashboard_access)])
 async def update_settings(request: Request):
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Settings body must be an object")
+    try:
+        validated = validate_restaurant_settings_update(body)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     current = _load_settings()
-    for key in _DEFAULT_SETTINGS:
-        if key in body:
-            current[key] = body[key]
+    current.update(validated)
     _save_settings(current)
     return {"status": "ok", "settings": current}
 
 
 # ── Menu API ──────────────────────────────────────────────
 
-@app.get("/api/menu")
+@app.get("/api/menu", dependencies=[Security(require_dashboard_access)])
 async def get_menu():
     """Return all menu items grouped by category."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, name, category, price, description, dietary, available
+            SELECT id, name, category, price, description, dietary, available,
+                   COALESCE(price_estimated, FALSE) AS price_estimated
             FROM menu_items
             ORDER BY
                 CASE category
@@ -691,12 +771,13 @@ async def get_menu():
             "description": r["description"] or "",
             "dietary": list(r["dietary"]) if r["dietary"] else [],
             "available": r["available"],
+            "price_estimated": bool(r["price_estimated"]),
         }
         categories.setdefault(r["category"], []).append(item)
     return {"categories": categories}
 
 
-@app.post("/api/menu", dependencies=[Security(require_dashboard_key)])
+@app.post("/api/menu", dependencies=[Security(require_dashboard_access)])
 async def create_menu_item(request: Request):
     """Add a new menu item."""
     body = await request.json()
@@ -737,7 +818,7 @@ async def create_menu_item(request: Request):
     }
 
 
-@app.patch("/api/menu/{item_id}", dependencies=[Security(require_dashboard_key)])
+@app.patch("/api/menu/{item_id}", dependencies=[Security(require_dashboard_access)])
 async def update_menu_item(item_id: int, request: Request):
     """Toggle menu item availability or update fields."""
     body = await request.json()
@@ -756,9 +837,40 @@ async def update_menu_item(item_id: int, request: Request):
     return {"status": "ok", "id": item_id}
 
 
+# ── Knowledge loop ────────────────────────────────────────
+
+
+@app.get("/api/knowledge/gaps", dependencies=[Security(require_dashboard_access)])
+async def list_knowledge_gaps():
+    try:
+        return await restaurant_service.list_knowledge_gaps()
+    except RestaurantServiceError as error:
+        raise HTTPException(status_code=error.status, detail=error.message) from error
+
+
+@app.post(
+    "/api/knowledge/gaps/{gap_id}/resolve",
+    dependencies=[Security(require_dashboard_access)],
+)
+async def resolve_knowledge_gap(gap_id: int, request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Body must be an object")
+    answer = str(body.get("answer") or "")
+    username = str(request.session.get("username") or "admin")
+    try:
+        return await restaurant_service.resolve_knowledge_gap(
+            gap_id,
+            answer=answer,
+            resolved_by=username,
+        )
+    except RestaurantServiceError as error:
+        raise HTTPException(status_code=error.status, detail=error.message) from error
+
+
 # ── Stats API ─────────────────────────────────────────────
 
-@app.get("/api/stats", dependencies=[Security(require_dashboard_key)])
+@app.get("/api/stats", dependencies=[Security(require_dashboard_access)])
 async def get_stats():
     """Aggregated dashboard stats."""
     pool = await get_pool()
@@ -775,6 +887,79 @@ async def get_stats():
     }
 
 
+@app.get("/api/voice/metrics", dependencies=[Security(require_dashboard_access)])
+async def get_voice_metrics(days: int = 7):
+    """Return pilot call outcomes and locally measured protocol timings."""
+    days = min(max(days, 1), 90)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        summary = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(DISTINCT session_id) AS calls,
+                COUNT(*) FILTER (WHERE ended_at IS NOT NULL) AS ended_calls
+            FROM call_sessions
+            WHERE started_at >= NOW() - ($1::int * interval '1 day')
+            """,
+            days,
+        )
+        timing = await conn.fetchrow(
+            """
+            SELECT
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms)
+                    FILTER (WHERE event_type = 'first_response_chunk') AS first_chunk_p50_ms,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)
+                    FILTER (WHERE event_type = 'first_response_chunk') AS first_chunk_p95_ms,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms)
+                    FILTER (WHERE event_type = 'generation_cancelled') AS cancel_p95_ms,
+                COUNT(*) FILTER (WHERE event_type LIKE '%error%') AS errors
+            FROM call_events
+            WHERE created_at >= NOW() - ($1::int * interval '1 day')
+            """,
+            days,
+        )
+        recent = await conn.fetch(
+            """
+            SELECT call_id, event_type, duration_ms, created_at
+            FROM call_events
+            WHERE created_at >= NOW() - ($1::int * interval '1 day')
+            ORDER BY created_at DESC
+            LIMIT 100
+            """,
+            days,
+        )
+    return {
+        "window_days": days,
+        "calls": int(summary["calls"] or 0),
+        "ended_calls": int(summary["ended_calls"] or 0),
+        "first_chunk_p50_ms": (
+            float(timing["first_chunk_p50_ms"])
+            if timing["first_chunk_p50_ms"] is not None
+            else None
+        ),
+        "first_chunk_p95_ms": (
+            float(timing["first_chunk_p95_ms"])
+            if timing["first_chunk_p95_ms"] is not None
+            else None
+        ),
+        "generation_cancel_p95_ms": (
+            float(timing["cancel_p95_ms"])
+            if timing["cancel_p95_ms"] is not None
+            else None
+        ),
+        "errors": int(timing["errors"] or 0),
+        "recent_events": [
+            {
+                "call_id": row["call_id"],
+                "event_type": row["event_type"],
+                "duration_ms": row["duration_ms"],
+                "created_at": row["created_at"].isoformat(),
+            }
+            for row in recent
+        ],
+    }
+
+
 # ── Browser demo UI ───────────────────────────────────────────
 
 @app.get("/login")
@@ -782,11 +967,11 @@ async def login_page(request: Request):
     """Single shared login page for the restaurant dashboard."""
     if _is_logged_in(request):
         return RedirectResponse("/", status_code=302)
-    return templates.TemplateResponse("login.html", {
-        "request": request,
-        "restaurant": settings.restaurant_name,
-        "error": None,
-    })
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {"restaurant": settings.restaurant_name, "error": None},
+    )
 
 
 @app.post("/login")
@@ -795,16 +980,22 @@ async def login_submit(
     username: str = Form(...),
     password: str = Form(...),
 ):
+    await login_limiter.check(request, scope="dashboard-login")
     if _check_login(username.strip(), password):
         request.session["authenticated"] = True
         request.session["username"] = username.strip()
+        request.session["csrf_token"] = secrets.token_urlsafe(32)
         return RedirectResponse("/", status_code=302)
 
-    return templates.TemplateResponse("login.html", {
-        "request": request,
-        "restaurant": settings.restaurant_name,
-        "error": "Invalid username or password",
-    }, status_code=401)
+    return templates.TemplateResponse(
+        request,
+        "login.html",
+        {
+            "restaurant": settings.restaurant_name,
+            "error": "Invalid username or password",
+        },
+        status_code=401,
+    )
 
 
 @app.post("/logout")
@@ -819,17 +1010,54 @@ async def browser_demo(request: Request):
     if not _is_logged_in(request):
         return RedirectResponse("/login", status_code=302)
 
-    vapi_pub   = settings.vapi_public_key or ""
-    vapi_asst  = settings.vapi_assistant_id or ""
-    vapi_ready = bool(vapi_pub and vapi_pub != "your_vapi_public_key_here")
+    runtime = _load_settings()
+    restaurant_name = runtime.get("restaurant_name") or settings.restaurant_name
+    agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
+    vapi_pub = settings.vapi_public_key or ""
+    vapi_asst = settings.vapi_assistant_id or ""
+    vapi_ready = bool(
+        settings.enable_legacy_vapi
+        and vapi_pub
+        and vapi_pub != "your_vapi_public_key_here"
+    )
     retell_ready = bool(settings.retell_api_key and settings.retell_agent_id)
-    return templates.TemplateResponse("index.html", {
-        "request":      request,
-        "vapi_pub":     vapi_pub,
-        "vapi_asst":    vapi_asst,
-        "restaurant":   settings.restaurant_name,
-        "vapi_ready":   vapi_ready,
-        "retell_ready": retell_ready,
-        "dash_key":     settings.dashboard_api_key or "",
-        "username":     request.session.get("username", ""),
-    })
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "vapi_pub": vapi_pub,
+            "vapi_asst": vapi_asst,
+            "restaurant": restaurant_name,
+            "agent_name": agent_name,
+            "vapi_ready": vapi_ready,
+            "retell_ready": retell_ready,
+            "csrf_token": request.session.get("csrf_token", ""),
+            "username": request.session.get("username", ""),
+        },
+    )
+
+
+@app.get("/widget-demo")
+async def widget_demo(request: Request):
+    """Preview the same public Retell widget clients embed on their websites."""
+    if not settings.widget_enabled:
+        raise HTTPException(status_code=404, detail="Website widget is disabled")
+    return templates.TemplateResponse(
+        request,
+        "widget_demo.html",
+        {
+            "restaurant": settings.restaurant_name,
+            "widget_mode": settings.widget_mode,
+            "retell_public_key": settings.retell_public_key,
+            "retell_voice_agent_id": settings.retell_agent_id,
+            "retell_chat_agent_id": settings.retell_chat_agent_id,
+            "retell_callback_phone_number": settings.retell_phone_number,
+            "widget_title": settings.widget_title,
+            "widget_logo_url": settings.widget_logo_url,
+            "widget_color": settings.widget_color,
+            "widget_fab_text": settings.widget_fab_text,
+            "callback_countries": settings.callback_countries,
+            "callback_terms_url": settings.callback_terms_url,
+            "recaptcha_site_key": settings.recaptcha_site_key,
+        },
+    )

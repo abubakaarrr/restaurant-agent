@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-12345}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: restaurant_agent
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -27,14 +27,21 @@ services:
     environment:
       # Override DATABASE_URL so the app talks to the db container over the
       # private Docker network (host = service name "db", internal port 5432).
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-12345}@db:5432/restaurant_agent
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      RESTAURANT_SETTINGS_FILE: /app/runtime/restaurant_settings.json
     ports:
       # Bind to localhost only — Apache on the host reverse-proxies to this.
       # The app is never exposed to the public internet directly.
       - "127.0.0.1:8000:8000"
+    volumes:
+      - restaurant_runtime:/app/runtime
+    security_opt:
+      - no-new-privileges:true
 
-  # ── Chatterbox TTS — voice cloning + text-to-speech (GPU) ──
+  # Offline Voice Studio only. It is excluded from normal production startup;
+  # run explicitly with: docker compose --profile offline-tts up tts
   tts:
+    profiles: ["offline-tts"]
     build:
       context: .
       dockerfile: Dockerfile.tts
@@ -58,4 +65,5 @@ services:
 
 volumes:
   pgdata:
+  restaurant_runtime:
   tts_hf_cache:

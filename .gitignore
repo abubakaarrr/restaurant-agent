@@ -9,9 +9,21 @@ venv/
 dist/
 build/
 .DS_Store
-deploy/
+restaurant_settings.json
+runtime/
+artifacts/voice-bakeoff/
+*.dump
+backup_*.sql
+
+# Local development and verification files
+/tests/
+/docs/
+/artifacts/
+*.log
+/pytest.ini
+/requirements-dev.txt
+/CLOUD_AGENT_PROMPT_SESAME_LEVEL.md
 
 # Local-only config & reports
-.env.production.example
 retell_blueprint_report.md
 technical_report.md

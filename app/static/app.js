@@ -1,7 +1,7 @@
 // Restaurant AI Receptionist — browser demo
 // Server injects config into window.APP_CONFIG before this script runs.
 
-const { vapiPubKey, vapiAssistantId, restaurantName, vapiReady } = window.APP_CONFIG;
+const { vapiPubKey, vapiAssistantId, restaurantName, agentName, vapiReady } = window.APP_CONFIG;
 
 let sessionId = 'demo-' + Math.random().toString(36).slice(2, 10);
 window.__callActive = false;
@@ -40,6 +40,10 @@ function switchPage(pageName) {
   if (pageName === 'menu' && !_pageLoaded.menu) {
     _pageLoaded.menu = true;
     loadMenu();
+  }
+  if (pageName === 'knowledge' && !_pageLoaded.knowledge) {
+    _pageLoaded.knowledge = true;
+    loadKnowledge();
   }
   if (pageName === 'settings' && !_pageLoaded.settings) {
     _pageLoaded.settings = true;
@@ -115,7 +119,10 @@ async function toggleRetellCall() {
   status.classList.add('visible');
 
   try {
-    const res = await fetch('/api/retell/web-call', { method: 'POST' });
+    const res = await fetch('/api/retell/web-call', {
+      method: 'POST',
+      headers: authHeaders(),
+    });
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: 'Unknown error' }));
       throw new Error(err.detail || `HTTP ${res.status}`);
@@ -158,7 +165,7 @@ function addMessage(role, text) {
   const c = document.getElementById('messages');
   const d = document.createElement('div');
   d.className = 'msg ' + role;
-  const av = role === 'agent' ? '🤖' : '👤';
+  const av = role === 'agent' ? '🍽️' : '👤';
   d.innerHTML = `<div class="msg-avatar">${av}</div><div class="bubble">${escapeHtml(text)}</div>`;
   c.appendChild(d);
   c.scrollTop = c.scrollHeight;
@@ -169,7 +176,7 @@ function showTyping() {
   const d = document.createElement('div');
   d.className = 'msg agent';
   d.id = 'typing';
-  d.innerHTML = '<div class="msg-avatar">🤖</div><div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>';
+  d.innerHTML = '<div class="msg-avatar">🍽️</div><div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>';
   c.appendChild(d);
   c.scrollTop = c.scrollHeight;
 }
@@ -201,7 +208,7 @@ async function sendMessage() {
   try {
     const res = await fetch('/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ message: text, session_id: sessionId, caller_phone: '+1555000001' }),
     });
     const data = await res.json();
@@ -219,7 +226,7 @@ async function sendMessage() {
 function resetChat() {
   sessionId = 'demo-' + Math.random().toString(36).slice(2, 10);
   document.getElementById('messages').innerHTML = '';
-  addMessage('agent', `Hello! Thank you for calling ${restaurantName}. I'm Sana, your AI receptionist. How can I help you today?`);
+  addMessage('agent', `Hi, you've reached ${restaurantName}. This is ${agentName}. How can I help you today?`);
 }
 
 // ── Utilities ─────────────────────────────────────────────────
@@ -239,8 +246,8 @@ function fmtCurrency(val) {
 }
 
 function authHeaders() {
-  const key = window.APP_CONFIG.dashKey;
-  return key ? { 'X-API-Key': key } : {};
+  const token = window.APP_CONFIG.csrfToken;
+  return token ? { 'X-CSRF-Token': token } : {};
 }
 
 // ── Dashboard ─────────────────────────────────────────────────
@@ -360,6 +367,80 @@ async function loadReservations() {
   } catch (e) {
     tbody.innerHTML = `<tr><td colspan="7" class="empty-state">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
   }
+}
+
+// ── Knowledge page ────────────────────────────────────────────
+
+async function loadKnowledge() {
+  const gapsBody = document.getElementById('knowledgeGapsBody');
+  const faqBody = document.getElementById('knowledgeFaqBody');
+  gapsBody.innerHTML = '<tr><td colspan="4" class="empty-state">Loading...</td></tr>';
+  faqBody.innerHTML = '<tr><td colspan="3" class="empty-state">Loading...</td></tr>';
+
+  try {
+    const res = await fetch('/api/knowledge/gaps', { headers: authHeaders() });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const unresolved = (data.gaps || []).filter(g => g.status === 'unresolved');
+    const faq = data.knowledge || [];
+
+    if (unresolved.length === 0) {
+      gapsBody.innerHTML = '<tr><td colspan="4" class="empty-state">No unanswered questions</td></tr>';
+    } else {
+      gapsBody.innerHTML = unresolved.map(gap => `
+        <tr>
+          <td>${fmtDateTime(gap.created_at)}</td>
+          <td class="td-name">${escapeHtml(gap.question)}</td>
+          <td><span class="td-notes">${escapeHtml(gap.context_excerpt || '—')}</span></td>
+          <td>
+            <form class="knowledge-resolve" onsubmit="return resolveKnowledgeGap(event, ${gap.id})">
+              <textarea name="answer" rows="2" required placeholder="Answer the host should use next time"></textarea>
+              <button type="submit" class="btn-small">Save answer</button>
+            </form>
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    if (faq.length === 0) {
+      faqBody.innerHTML = '<tr><td colspan="3" class="empty-state">No saved answers yet</td></tr>';
+    } else {
+      faqBody.innerHTML = faq.map(item => `
+        <tr>
+          <td class="td-name">${escapeHtml(item.question)}</td>
+          <td>${escapeHtml(item.answer)}</td>
+          <td>${fmtDateTime(item.updated_at || item.created_at)}</td>
+        </tr>
+      `).join('');
+    }
+  } catch (e) {
+    gapsBody.innerHTML = `<tr><td colspan="4" class="empty-state">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
+    faqBody.innerHTML = `<tr><td colspan="3" class="empty-state">Failed to load: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+async function resolveKnowledgeGap(event, gapId) {
+  event.preventDefault();
+  const answer = event.target.answer.value.trim();
+  if (!answer) return false;
+  const button = event.target.querySelector('button');
+  button.disabled = true;
+  try {
+    const res = await fetch(`/api/knowledge/gaps/${gapId}/resolve`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.detail || `HTTP ${res.status}`);
+    }
+    await loadKnowledge();
+  } catch (e) {
+    button.disabled = false;
+    alert('Could not save answer: ' + e.message);
+  }
+  return false;
 }
 
 // ── Orders page ───────────────────────────────────────────────
@@ -623,7 +704,7 @@ async function loadSettings() {
     document.getElementById('setCapacity').value = s.seating_capacity || '';
     document.getElementById('setAddress').value = s.street_address || '';
     document.getElementById('setCity').value = s.city || '';
-    document.getElementById('setAgentName').value = s.ai_agent_name || 'Sana';
+    document.getElementById('setAgentName').value = s.ai_agent_name || 'Clough';
 
     const langs = s.languages || ['English'];
     Object.entries(LANG_CHECKBOXES).forEach(([lang, id]) => {
@@ -660,10 +741,11 @@ async function saveSettings() {
 
   const opening_hours = {};
   DAYS.forEach(day => {
-    opening_hours[day] = {
-      open: document.getElementById(`hours-${day}-open`).value || '11:30',
-      close: document.getElementById(`hours-${day}-close`).value || '22:00',
-    };
+    const open = document.getElementById(`hours-${day}-open`).value;
+    const close = document.getElementById(`hours-${day}-close`).value;
+    if (open && close) {
+      opening_hours[day] = { open, close };
+    }
   });
 
   const payload = {
@@ -673,9 +755,10 @@ async function saveSettings() {
     seating_capacity: parseInt(document.getElementById('setCapacity').value) || 60,
     street_address: document.getElementById('setAddress').value.trim(),
     city: document.getElementById('setCity').value.trim(),
-    ai_agent_name: document.getElementById('setAgentName').value.trim() || 'Sana',
+    ai_agent_name: document.getElementById('setAgentName').value.trim() || 'Clough',
     languages,
     opening_hours,
+    hours_unconfirmed: Object.keys(opening_hours).length === 0,
   };
 
   try {
