@@ -56,8 +56,19 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
+```
+
+The copied `VOICE_TOOL_SECRET`, `RETELL_WS_TOKEN`, `SESSION_SECRET`, and
+`DASHBOARD_API_KEY` values are public placeholders, not usable secrets. Before
+a separately approved local bootstrap, clear each placeholder in `.env` (leave
+`NAME=`) or replace all four with genuinely local values. With placeholders
+cleared, generate the missing values with:
+
+```powershell
 python scripts/bootstrap_local_secrets.py --apply
 ```
+
+Keep `.env` and generated values untracked; never print or commit them.
 
 For the existing Docker path, keep `.env` untracked and provide these database
 variables:

@@ -6,7 +6,8 @@
 - Keep `VOICE_LIVE_WRITES_ENABLED=false` unless a separately approved release task has cleared the documented gates.
 - Booking and order-table mutation routes require idempotency keys. Booking creation, booking updates/cancellation, and final order confirmation use a server-owned pending-readback and later-affirmation gate. Confirmed-order item changes only check a caller-confirmed flag; guest-note writes and pending-order fulfillment changes lack a confirmation/readback gate. Treat stronger enforcement for those gaps as future work; see `app/services/restaurant.py`.
 - Lifecycle webhooks require timestamped HMAC verification and replay deduplication; see `app/security.py` and `app/call_analytics.py`.
-- Do not use live restaurant/customer data, place calls, provision providers, or deploy during local development. Run `scripts/bootstrap_local_secrets.py --apply` only for a separately approved local-environment setup that specifically requires generated local-only secrets; keep those values untracked, never print them, and never commit them. Do not run it or create secrets during governance or orientation tasks. `scripts/provision_retell.py --apply` and `scripts/reset_demo.py` mutate external or database state and are not verification commands.
+- Do not use live restaurant/customer data, place calls, provision providers, or deploy during local development. `scripts/provision_retell.py --apply` and `scripts/reset_demo.py` mutate external or database state and are not verification commands.
+- Values copied from `.env.example` for `VOICE_TOOL_SECRET`, `RETELL_WS_TOKEN`, `SESSION_SECRET`, and `DASHBOARD_API_KEY` are placeholders, not usable secrets. Before a separately approved local-environment bootstrap, clear or replace all four, then run `scripts/bootstrap_local_secrets.py --apply`; keep generated values untracked, never print them, and never commit them. Do not run it or create secrets during governance or orientation tasks.
 
 ## Development
 
