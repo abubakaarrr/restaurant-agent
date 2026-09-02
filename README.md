@@ -71,6 +71,7 @@ Initialize an empty Docker database and start the API within the Compose
 network:
 
 ```powershell
+docker compose build web
 docker compose up -d db
 docker compose run --rm web python scripts/migrate.py --initialize-schema
 docker compose run --rm web python db/seed.py
@@ -80,8 +81,9 @@ docker compose up -d web
 For an existing database, never rerun the base schema:
 
 ```powershell
+docker compose build web
 docker compose run --rm web python scripts/migrate.py
-docker compose up -d --build web
+docker compose up -d web
 ```
 
 The health endpoint returns 503 until the pilot migration is installed.

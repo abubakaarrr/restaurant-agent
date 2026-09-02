@@ -49,6 +49,7 @@ configuration.
 ## 3. Database and application
 
 ```bash
+docker compose build web
 docker compose up -d db
 docker compose run --rm web python scripts/migrate.py --initialize-schema
 docker compose run --rm web python db/seed.py
@@ -58,8 +59,9 @@ docker compose up -d web
 Use `--initialize-schema` only for an empty database. On upgrades:
 
 ```bash
+docker compose build web
 docker compose run --rm web python scripts/migrate.py
-docker compose up -d --build web
+docker compose up -d web
 ```
 
 The default seed is idempotent and populates only live tables/menu data. Legacy
