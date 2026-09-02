@@ -60,10 +60,13 @@ python scripts/bootstrap_local_secrets.py --apply
 ```
 
 For Docker, set both `POSTGRES_PASSWORD` and an encoded `DATABASE_URL` in
-`.env`, then:
+`.env`. The migration script reads `DATABASE_URL` from the current process, so
+export the value from `.env` before initializing an empty database:
 
 ```powershell
 docker compose up -d db
+$databaseUrlLine = Get-Content .env | Where-Object { $_ -match '^DATABASE_URL=' } | Select-Object -First 1
+$env:DATABASE_URL = $databaseUrlLine.Substring("DATABASE_URL=".Length)
 python scripts/migrate.py --initialize-schema
 python db/seed.py
 ```
@@ -71,6 +74,8 @@ python db/seed.py
 For an existing database, never rerun the base schema:
 
 ```powershell
+$databaseUrlLine = Get-Content .env | Where-Object { $_ -match '^DATABASE_URL=' } | Select-Object -First 1
+$env:DATABASE_URL = $databaseUrlLine.Substring("DATABASE_URL=".Length)
 python scripts/migrate.py
 ```
 
@@ -135,9 +140,13 @@ Database race/idempotency suite:
 
 ```powershell
 $env:RUN_DB_INTEGRATION = "1"
-$env:TEST_DATABASE_URL = "postgresql://postgres:password@localhost:5432/restaurant_agent"
+$env:TEST_DATABASE_URL = "postgresql://postgres:password@127.0.0.1:5432/restaurant_agent_test_disposable"
 python -m pytest -q -p pytest_asyncio.plugin tests/test_database_integration.py tests/test_app_security_integration.py
 ```
+
+The `restaurant_agent_test_disposable` database must be pre-created and kept
+separate from application data. Restored database integration tests may
+truncate application tables in the database named by `TEST_DATABASE_URL`.
 
 When restored, the suite should cover behavior transitions, API authentication,
 CSRF, webhook signatures, replay protection, reminders, handoff, booking

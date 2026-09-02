@@ -9,7 +9,7 @@
 ## Development
 
 - Use Python 3.11+ and install the tracked runtime dependencies with `python -m pip install -r requirements.txt`. Docker uses PostgreSQL 16 with pgvector; follow `README.md` and `DEPLOY.md`, and use `python scripts/migrate.py --initialize-schema` only for an empty database.
-- The current baseline does not track `requirements-dev.txt` or `tests/`; both paths are ignored in `.gitignore`. Do not report the README's pytest commands as passing until the test assets and development dependencies are restored. Database integration tests additionally require an explicitly isolated `TEST_DATABASE_URL`.
+- The current baseline does not track `requirements-dev.txt` or `tests/`; both paths are ignored in `.gitignore`. Do not report the README's pytest commands as passing until the test assets and development dependencies are restored. Database integration tests require a pre-created, disposable, isolated `TEST_DATABASE_URL` and may truncate application tables there.
 - Make changes on a feature branch and deliver them through review. Never edit an applied migration; add a new file under `db/migrations/`.
 
 ## Maintaining this file
