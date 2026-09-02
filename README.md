@@ -59,30 +59,29 @@ Copy-Item .env.example .env
 python scripts/bootstrap_local_secrets.py --apply
 ```
 
-For Docker, set both `POSTGRES_PASSWORD` and an encoded `DATABASE_URL` in
-`.env`. The migration script reads `DATABASE_URL` from the current process, so
-export the value from `.env` before initializing an empty database:
+For the existing Docker path, keep `.env` untracked and provide these database
+variables:
+
+- `POSTGRES_PASSWORD`: the password for the local `postgres` role.
+- `DATABASE_URL`: a URL-encoded PostgreSQL connection string using the same
+  password, Compose host `db`, port `5432`, and database `restaurant_agent`
+  (safe shape: `postgresql://postgres:<url-encoded-password>@db:5432/restaurant_agent`).
+
+Initialize an empty Docker database and start the API within the Compose
+network:
 
 ```powershell
 docker compose up -d db
-$databaseUrlLine = Get-Content .env | Where-Object { $_ -match '^DATABASE_URL=' } | Select-Object -First 1
-$env:DATABASE_URL = $databaseUrlLine.Substring("DATABASE_URL=".Length)
-python scripts/migrate.py --initialize-schema
-python db/seed.py
+docker compose run --rm web python scripts/migrate.py --initialize-schema
+docker compose run --rm web python db/seed.py
+docker compose up -d web
 ```
 
 For an existing database, never rerun the base schema:
 
 ```powershell
-$databaseUrlLine = Get-Content .env | Where-Object { $_ -match '^DATABASE_URL=' } | Select-Object -First 1
-$env:DATABASE_URL = $databaseUrlLine.Substring("DATABASE_URL=".Length)
-python scripts/migrate.py
-```
-
-Start the API:
-
-```powershell
-python -m uvicorn app.main:app --reload --port 8000
+docker compose run --rm web python scripts/migrate.py
+docker compose up -d --build web
 ```
 
 The health endpoint returns 503 until the pilot migration is installed.
