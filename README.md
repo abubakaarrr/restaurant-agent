@@ -54,7 +54,7 @@ Requirements:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
+python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 python scripts/bootstrap_local_secrets.py --apply
 ```
@@ -120,6 +120,10 @@ Chatterbox remains available only through Docker's `offline-tts` profile.
 
 ## Tests
 
+At this revision, `tests/`, `requirements-dev.txt`, and the pytest development
+dependencies are not tracked. The commands below document the intended split,
+but a clean checkout cannot run them until those test assets are restored.
+
 Unit and protocol suite:
 
 ```powershell
@@ -135,9 +139,10 @@ $env:TEST_DATABASE_URL = "postgresql://postgres:password@localhost:5432/restaura
 python -m pytest -q -p pytest_asyncio.plugin tests/test_database_integration.py tests/test_app_security_integration.py
 ```
 
-The suite covers behavior transitions, API authentication, CSRF, webhook
-signatures, replay protection, reminders, handoff, booking concurrency, order
-corrections, idempotency, migration/provisioning validation, and bakeoff gates.
+When restored, the suite should cover behavior transitions, API authentication,
+CSRF, webhook signatures, replay protection, reminders, handoff, booking
+concurrency, order corrections, idempotency, migration/provisioning validation,
+and bakeoff gates.
 
 ## Pilot operations
 
