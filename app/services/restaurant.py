@@ -1,8 +1,8 @@
 """Typed restaurant business operations for every voice transport.
 
 The managed Retell flow and the legacy LangGraph adapter both call this module.
-All externally visible write operations are guarded by an idempotency ledger and
-the rollout write flag.
+Externally visible booking and order-table writes are guarded by an idempotency
+ledger and the rollout write flag.
 """
 
 from __future__ import annotations

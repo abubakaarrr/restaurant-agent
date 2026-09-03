@@ -184,9 +184,10 @@ Call-event cleanup runs at application startup using
 ```bash
 docker compose logs -f web
 docker compose restart web
-docker compose up -d --build web
-docker compose run --rm web python scripts/migrate.py
 ```
+
+For upgrades, follow the database and application sequence in section 3 so the
+current `web` image is built before migrations run.
 
 Application rollback:
 

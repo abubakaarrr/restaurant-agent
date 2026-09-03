@@ -102,7 +102,8 @@ The health endpoint returns 503 until the pilot migration is installed.
 ## Managed voice tool API
 
 All routes are under `/api/voice-tools` and require
-`X-Voice-Tool-Secret`. Write routes also require `Idempotency-Key`.
+`X-Voice-Tool-Secret`. Booking and order mutation routes also require
+`Idempotency-Key`.
 
 Capabilities include:
 
