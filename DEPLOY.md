@@ -51,12 +51,14 @@ configuration.
 ```bash
 docker compose build web
 docker compose up -d db
-docker compose run --rm web python scripts/migrate.py --initialize-schema
+docker compose run --rm web python scripts/migrate.py
 docker compose run --rm web python db/seed.py
 docker compose up -d web
 ```
 
-Use `--initialize-schema` only for an empty database. On upgrades:
+The Compose `db` service loads `db/schema.sql` when it creates a new database
+volume. Use `--initialize-schema` only for an empty external database that was
+not initialized by Compose. On upgrades:
 
 ```bash
 docker compose build web

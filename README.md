@@ -78,16 +78,20 @@ variables:
   password, Compose host `db`, port `5432`, and database `restaurant_agent`
   (safe shape: `postgresql://postgres:<url-encoded-password>@db:5432/restaurant_agent`).
 
-Initialize an empty Docker database and start the API within the Compose
-network:
+Initialize a new Docker database and start the API within the Compose network.
+On first boot, the `db` service loads `db/schema.sql`; the migration command
+then records and applies the versioned migrations:
 
 ```powershell
 docker compose build web
 docker compose up -d db
-docker compose run --rm web python scripts/migrate.py --initialize-schema
+docker compose run --rm web python scripts/migrate.py
 docker compose run --rm web python db/seed.py
 docker compose up -d web
 ```
+
+Reserve `--initialize-schema` for an empty external database that was not
+initialized by the Compose `db` service.
 
 For an existing database, never rerun the base schema:
 
