@@ -28,6 +28,7 @@ from app.call_analytics import record_call_event
 from app.call_flags import consume_call_control
 from app.config import settings
 from app.restaurant_settings import load_restaurant_settings
+from app.transfer_availability import current_staff_transfer_number
 
 
 logger = logging.getLogger(__name__)
@@ -222,8 +223,8 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             final_content = ""
             no_interruption = False
             if control and control.action == "transfer":
-                if settings.staff_transfer_number:
-                    transfer_number = settings.staff_transfer_number
+                transfer_number = current_staff_transfer_number()
+                if transfer_number:
                     no_interruption = True
                 else:
                     final_content = (
@@ -257,6 +258,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             logger.error("Retell agent stream error", exc_info=True)
             if response_id == active_response_id:
                 with suppress(Exception):
+                    transfer_number = current_staff_transfer_number()
                     await send(
                         _response_event(
                             response_id,
@@ -264,12 +266,12 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                                 "I'm sorry, I had a technical issue. "
                                 + (
                                     "I can connect you with the restaurant team."
-                                    if settings.staff_transfer_number
+                                    if transfer_number
                                     else "I can't transfer right now, but I can take a callback message."
                                 )
                             ),
                             complete=True,
-                            transfer_number=settings.staff_transfer_number,
+                            transfer_number=transfer_number,
                         )
                     )
                     completed = True
@@ -383,7 +385,8 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 interrupted=was_interrupted,
             )
             if directive.locale and not _locale_supported(directive.locale):
-                can_transfer = bool(settings.staff_transfer_number)
+                transfer_number = current_staff_transfer_number()
+                can_transfer = bool(transfer_number)
                 await send(
                     _response_event(
                         active_response_id,
@@ -396,9 +399,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                             )
                         ),
                         complete=True,
-                        transfer_number=(
-                            settings.staff_transfer_number if can_transfer else ""
-                        ),
+                        transfer_number=transfer_number,
                         no_interruption_allowed=can_transfer,
                     )
                 )
@@ -406,7 +407,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
 
             if directive.direct_reply is not None:
                 transfer_number = (
-                    settings.staff_transfer_number
+                    current_staff_transfer_number()
                     if directive.control is BehaviorControl.HANDOFF
                     else ""
                 )

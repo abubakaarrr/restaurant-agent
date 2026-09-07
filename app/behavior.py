@@ -28,6 +28,12 @@ from enum import Enum
 from typing import Any
 
 from app.config import settings
+from app.restaurant_knowledge import (
+    KnowledgeFixtureError,
+    get_restaurant_knowledge,
+    text_tokens,
+)
+from app.transfer_availability import current_staff_transfer_number
 
 
 class BehaviorMode(str, Enum):
@@ -833,7 +839,7 @@ def _direct_reply(
     safe_humor: bool,
 ) -> str | None:
     if control is BehaviorControl.HANDOFF:
-        if not settings.staff_transfer_number:
+        if not current_staff_transfer_number():
             return (
                 "I can't transfer the call right now, but I can take a message and "
                 "callback details for the restaurant team."
@@ -1041,10 +1047,20 @@ def reduce_behavior(
     confusion = meaningful and _matches(_CONFUSION_PATTERNS, text)
     complaint = meaningful and _matches(_COMPLAINT_PATTERNS, text)
     personal_identity = meaningful and _matches(_PERSONAL_IDENTITY_PATTERNS, text)
-    unsafe_humor_context = bool(
-        {"allergy", "allergic", "payment", "refund", "injury", "safety", "emergency"}
-        & set(text.split())
-    )
+    caller_tokens = text_tokens(text)
+    try:
+        forbidden_humor_contexts = [
+            text_tokens(context)
+            for context in get_restaurant_knowledge().raw["conversation_style"][
+                "light_humor"
+            ]["forbidden_contexts"]
+        ]
+        unsafe_humor_context = any(
+            context_tokens <= caller_tokens
+            for context_tokens in forbidden_humor_contexts
+        )
+    except (KnowledgeFixtureError, KeyError, TypeError):
+        unsafe_humor_context = True
     safe_humor = (
         meaningful
         and not complaint

@@ -41,6 +41,7 @@ from app.services.restaurant import (
     format_menu_price,
     restaurant_service,
 )
+from app.transfer_availability import current_staff_transfer_number
 
 
 def _error_text(error: RestaurantServiceError) -> str:
@@ -932,7 +933,7 @@ async def request_handoff(session_id: str, reason: HandoffReason, topic: str = "
             "or update_reservation_draft. For water or table requests, say yes and "
             "save add_guest_note. Keep helping. Never say you are connecting them."
         )
-    if not settings.staff_transfer_number:
+    if not current_staff_transfer_number():
         return (
             "Staff transfer is not available. Never say you are connecting them or "
             "promise a transfer. Offer to take a callback number or message with "

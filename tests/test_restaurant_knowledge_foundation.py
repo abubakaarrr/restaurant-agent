@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -14,7 +15,12 @@ from app.restaurant_knowledge import (
     RestaurantKnowledge,
     get_restaurant_knowledge,
 )
-from app.services.restaurant import RestaurantServiceError, restaurant_service
+from app.services.restaurant import (
+    RestaurantServiceError,
+    format_availability_speech,
+    restaurant_service,
+)
+from app.transfer_availability import current_staff_transfer_number
 from app.tools.db import _format_order
 from app.tools.rag import search_menu
 
@@ -257,6 +263,61 @@ def test_modifier_semantics_cover_free_paid_removal_unavailable_and_clarificatio
         rejected = knowledge.resolve_customization(burger, **duplicate)
         assert rejected["status"] == "clarification_required"
 
+    substituted = knowledge.resolve_customization(
+        burger,
+        modifier_ids=["modifier.extra-cheddar"],
+        substitutions=["modifier.side-salad"],
+    )
+    assert substituted["status"] == "valid"
+    assert [row["option_id"] for row in substituted["modifiers"]] == [
+        "modifier.extra-cheddar"
+    ]
+    assert [row["option_id"] for row in substituted["substitutions"]] == [
+        "modifier.side-salad"
+    ]
+    assert substituted["price_delta"] == 4
+
+    duplicate_readback = _format_order(
+        {
+            "order_id": 18,
+            "draft_version": 1,
+            "fulfillment": "pickup",
+            "total": 25,
+            "items": [
+                {
+                    "item_name": "Hearth Burger",
+                    "quantity": 1,
+                    "subtotal": 25,
+                    **substituted,
+                }
+            ],
+        }
+    )
+    assert duplicate_readback.casefold().count("market greens") == 1
+
+
+@pytest.mark.asyncio
+async def test_alcohol_menu_data_cannot_enter_order_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = get_restaurant_knowledge().find_menu_item("Harbor House Lager").item
+
+    async def alcohol_match(item_name: str) -> dict:
+        return {
+            "match": {**item, "id": 91, "available": True},
+            "needs_confirmation": False,
+            "candidates": [],
+        }
+
+    monkeypatch.setattr(restaurant_service, "find_menu_item", alcohol_match)
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.add_order_item(
+            call_id="alcohol-read-only",
+            idempotency_key="alcohol-add-1",
+            item_name="Harbor House Lager",
+        )
+    assert exc.value.code == "alcohol_transaction_unsupported"
+
 
 def test_order_notes_and_customizations_are_confirmation_integrity_data() -> None:
     summary = {
@@ -335,10 +396,25 @@ def test_conversation_inputs_execute_behavior_interface(
     assert all(phrase in observable for phrase in expected_phrases)
 
 
-def test_safe_humor_is_suppressed_for_allergy_context() -> None:
+@pytest.mark.parametrize(
+    "unsafe_context",
+    [
+        "allergy?",
+        "complaint!",
+        "payment.",
+        "refund?",
+        "injury!",
+        "safety?",
+        "emergency!",
+        "repeated failure.",
+    ],
+)
+def test_safe_humor_is_suppressed_for_configured_contexts(
+    unsafe_context: str,
+) -> None:
     result = reduce_behavior(
         None,
-        TurnObservation(text="Are the fries famous and safe for my allergy?"),
+        TurnObservation(text=f"Are the fries famous? This is about {unsafe_context}"),
     )
     assert result.directive.direct_reply is None
 
@@ -401,6 +477,66 @@ async def test_dated_hours_queries_resolve_canonical_exceptions(
     result = await restaurant_service.restaurant_info(query)
     assert result["topic_id"] == "topic.hours"
     assert expected in result["formatted"]
+
+
+@pytest.mark.asyncio
+async def test_named_holiday_does_not_reuse_another_year() -> None:
+    result = await restaurant_service.restaurant_info(
+        "Are you open Thanksgiving 2027?"
+    )
+    assert result["matched"] is False
+    assert result["status"] == "unavailable"
+    assert result["answers"] == []
+    assert "won't reuse another year's hours" in result["formatted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "expected_kind"),
+    [
+        (datetime(2026, 9, 14, 19, 0), "regular_hours"),
+        (datetime(2026, 11, 26, 19, 0), "holiday_closure"),
+        (datetime(2026, 10, 18, 19, 0), "temporary_private_event_closure"),
+        (datetime(2026, 10, 18, 15, 30), "temporary_private_event_closure"),
+    ],
+)
+async def test_table_availability_rejects_canonical_closures_before_database_query(
+    monkeypatch: pytest.MonkeyPatch,
+    requested: datetime,
+    expected_kind: str,
+) -> None:
+    called = False
+
+    class Connection:
+        async def fetch(self, *args: object) -> list[dict]:
+            nonlocal called
+            called = True
+            return [{"id": 1, "table_number": 1, "capacity": 4, "location": "main"}]
+
+    monkeypatch.setattr(
+        restaurant_service,
+        "_parse_booking_datetime",
+        lambda date_value, time_value: requested,
+    )
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.get_available_tables(
+            requested.date().isoformat(),
+            requested.strftime("%H:%M"),
+            2,
+            conn=Connection(),
+        )
+    assert exc.value.code == "restaurant_closed"
+    assert called is False
+
+    result = await restaurant_service.check_availability(
+        requested.date().isoformat(),
+        requested.strftime("%H:%M"),
+        2,
+    )
+    assert result["available"] is False
+    assert result["restaurant_closed"] is True
+    assert result["hours_kind"] == expected_kind
+    assert "Unavailable" in format_availability_speech(result)
 
 
 @pytest.mark.asyncio
@@ -479,6 +615,10 @@ async def test_menu_read_boundary_excludes_stale_restaurant_rows(
 
 
 def test_human_handoff_copy_depends_on_configured_destination(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.transfer_availability._now",
+        lambda timezone_info: datetime(2026, 9, 8, 12, tzinfo=timezone_info),
+    )
     monkeypatch.setattr(settings, "staff_transfer_number", "")
     unavailable = reduce_behavior(None, TurnObservation(text="Connect me to a person"))
     assert unavailable.directive.control is BehaviorControl.HANDOFF
@@ -496,6 +636,10 @@ def test_human_handoff_copy_depends_on_configured_destination(monkeypatch: pytes
 async def test_tool_limit_handoff_copy_depends_on_configured_destination(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "app.transfer_availability._now",
+        lambda timezone_info: datetime(2026, 9, 8, 12, tzinfo=timezone_info),
+    )
     monkeypatch.setattr(settings, "staff_transfer_number", "")
     unavailable = await tool_limit_response({})
     unavailable_text = unavailable["messages"][0].content.casefold()
@@ -506,6 +650,86 @@ async def test_tool_limit_handoff_copy_depends_on_configured_destination(
     monkeypatch.setattr(settings, "staff_transfer_number", "+15035550149")
     configured = await tool_limit_response({})
     assert "connect you" in configured["messages"][0].content.casefold()
+
+
+def test_staff_transfer_requires_configured_open_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "staff_transfer_number", "+15035550149")
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    assert current_staff_transfer_number(
+        datetime(2026, 9, 8, 10, 0, tzinfo=timezone_info)
+    ) == "+15035550149"
+    assert current_staff_transfer_number(
+        datetime(2026, 9, 8, 21, 0, tzinfo=timezone_info)
+    ) == ""
+    assert current_staff_transfer_number(
+        datetime(2026, 9, 14, 12, 0, tzinfo=timezone_info)
+    ) == ""
+    assert current_staff_transfer_number(
+        datetime(2026, 10, 18, 17, 0, tzinfo=timezone_info)
+    ) == ""
+
+
+@pytest.mark.asyncio
+async def test_knowledge_gap_rows_match_public_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 9, 7, 12, 0)
+    responses = iter(
+        [
+            [
+                {
+                    "id": 4,
+                    "session_id": "call-4",
+                    "question": "Unknown policy?",
+                    "context_excerpt": "",
+                    "agent_response": "",
+                    "status": "unresolved",
+                    "resolved_answer": "",
+                    "resolved_by": "",
+                    "created_at": now,
+                    "resolved_at": None,
+                }
+            ],
+            [],
+        ]
+    )
+
+    class Connection:
+        async def fetch(self, query: str) -> list[dict]:
+            return next(responses)
+
+    class Acquire:
+        async def __aenter__(self) -> Connection:
+            return Connection()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class Pool:
+        def acquire(self) -> Acquire:
+            return Acquire()
+
+    async def fake_pool() -> Pool:
+        return Pool()
+
+    monkeypatch.setattr("app.services.restaurant.get_pool", fake_pool)
+    result = await restaurant_service.list_knowledge_gaps()
+    assert result["gaps"] == [
+        {
+            "id": 4,
+            "session_id": "call-4",
+            "question": "Unknown policy?",
+            "context_excerpt": "",
+            "agent_response": "",
+            "status": "unresolved",
+            "resolved_answer": "",
+            "resolved_by": "",
+            "created_at": "2026-09-07T12:00:00",
+            "resolved_at": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio

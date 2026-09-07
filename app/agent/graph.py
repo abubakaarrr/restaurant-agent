@@ -23,7 +23,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.agent.state import RestaurantAgentState
 from app.agent.nodes import generate_response, tool_node
-from app.config import settings
+from app.transfer_availability import current_staff_transfer_number
 
 # ── Build graph ───────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ def route_after_agent(state: RestaurantAgentState) -> Literal["tools", "limit", 
 
 
 async def tool_limit_response(state: RestaurantAgentState) -> dict:
-    if settings.staff_transfer_number:
+    if current_staff_transfer_number():
         recovery = "I can connect you with the restaurant staff."
     else:
         recovery = "I can't transfer right now, but I can take a callback message for the restaurant staff."

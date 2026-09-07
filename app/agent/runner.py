@@ -28,7 +28,14 @@ logger = logging.getLogger(__name__)
 _sessions: dict[str, list[dict]] = {}
 
 _CANCELLATION_INQUIRY_REVERSAL_RE = re.compile(
-    r"\b(?:do\s+not|don't|no)\s+cancel\b.*\b(?:checking|process|policy|question)\b",
+    r"^\s*(?:"
+    r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
+    r"(?:please\s+)?(?:do\s+not|don't)\s+cancel"
+    r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation))?"
+    r"(?:[,;:]?\s+(?:please|i\s+was\s+just\s+(?:checking|asking)))?"
+    r"|(?:actually[,;:]?\s+)?no[.,;:]?\s+(?:do\s+not|don't)\s+cancel\s+it\s+yet[.!]?\s+"
+    r"i\s+was\s+just\s+checking\s+(?:what\s+)?the\s+cancellation\s+(?:process|policy)\s+is"
+    r")[.!?]*\s*$",
     re.IGNORECASE,
 )
 _FAREWELL_RE = re.compile(
@@ -157,10 +164,7 @@ def _action_scope(session_id: str, history_length: int, user_message: str) -> st
 def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
     """Handle narrow non-mutating reversals and terminal farewells locally."""
     if _CANCELLATION_INQUIRY_REVERSAL_RE.search(user_message):
-        return (
-            "Nothing has been cancelled from that request. I can explain the "
-            "cancellation policy without changing your reservation."
-        )
+        return "Nothing has been cancelled. Your reservation is unchanged."
     if _FAREWELL_RE.fullmatch(user_message):
         request_end_call(session_id)
         return "You're welcome. Goodbye!"

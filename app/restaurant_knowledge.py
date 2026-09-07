@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -430,6 +431,7 @@ class RestaurantKnowledge:
     ) -> dict[str, Any]:
         allowed = set(item.get("modifier_options") or [])
         selected: list[dict[str, Any]] = []
+        selected_substitutions: list[dict[str, Any]] = []
         selected_ids: set[str] = set()
         for raw in modifier_ids:
             option_id, separator, choice = str(raw).partition(":")
@@ -487,12 +489,16 @@ class RestaurantKnowledge:
                 "message": f"That substitution is not supported for {item['name']}.",
             }
         for value in substitution_ids:
-            if value not in selected_ids:
-                option = self.modifier_options.get(value)
-                if not option or option.get("availability") != "available":
-                    return {"status": "unavailable", "message": f"{value} is unavailable."}
-                selected.append(deepcopy(option))
-                selected_ids.add(value)
+            if value in selected_ids:
+                return {
+                    "status": "clarification_required",
+                    "message": f"Choose {value} as a modifier or substitution, not both.",
+                }
+            option = self.modifier_options.get(value)
+            if not option or option.get("availability") != "available":
+                return {"status": "unavailable", "message": f"{value} is unavailable."}
+            selected_substitutions.append(deepcopy(option))
+            selected_ids.add(value)
 
         for conflict in item.get("incompatible_choices") or []:
             if set(conflict.get("option_ids") or []) <= selected_ids:
@@ -520,16 +526,92 @@ class RestaurantKnowledge:
             "status": "valid",
             "modifiers": selected,
             "removals": [removable[normalize_text(value)] for value in normalized_removals],
-            "substitutions": [
-                deepcopy(self.modifier_options[value]) for value in substitution_ids
-            ],
-            "price_delta": round(sum(float(option.get("price_delta") or 0) for option in selected), 2),
+            "substitutions": selected_substitutions,
+            "price_delta": round(
+                sum(
+                    float(option.get("price_delta") or 0)
+                    for option in [*selected, *selected_substitutions]
+                ),
+                2,
+            ),
+        }
+
+    def operating_status(self, at: datetime) -> dict[str, Any]:
+        timezone_info = ZoneInfo(self.identity["timezone"])
+        local = at.astimezone(timezone_info) if at.tzinfo else at.replace(tzinfo=timezone_info)
+        local_date = local.date()
+
+        for exception in self.raw["hours"].get("exceptions") or []:
+            start = datetime.fromisoformat(exception["starts_at"]).astimezone(timezone_info)
+            end = datetime.fromisoformat(exception["ends_at"]).astimezone(timezone_info)
+            if exception["kind"] == "holiday_hours" and local_date == start.date():
+                available = start <= local < end
+                return {
+                    "available": available,
+                    "status": "open" if available else "closed",
+                    "kind": exception["kind"],
+                    "customer_message": (
+                        exception["customer_message"]
+                        if available
+                        else (
+                            f"The restaurant is closed at {local.strftime('%I:%M %p').lstrip('0')} "
+                            f"on {local.strftime('%B')} {local.day}, {local.year}. "
+                            f"{exception['customer_message']}"
+                        )
+                    ),
+                }
+            if exception["status"] == "closed" and start <= local < end:
+                return {
+                    "available": False,
+                    "status": "closed",
+                    "kind": exception["kind"],
+                    "customer_message": exception["customer_message"],
+                }
+
+        weekday = local.strftime("%a").casefold()
+        regular = next(
+            row for row in self.raw["hours"]["regular"] if row["day"] == weekday
+        )
+        if regular["status"] == "closed":
+            return {
+                "available": False,
+                "status": "closed",
+                "kind": "regular_hours",
+                "customer_message": f"Harbor & Hearth Kitchen is closed on {local.strftime('%A')}.",
+            }
+        opening = datetime.combine(
+            local_date,
+            datetime.strptime(regular["open"], "%H:%M").time(),
+            timezone_info,
+        )
+        closing = datetime.combine(
+            local_date,
+            datetime.strptime(regular["close"], "%H:%M").time(),
+            timezone_info,
+        )
+        available = opening <= local < closing
+        return {
+            "available": available,
+            "status": "open" if available else "closed",
+            "kind": "regular_hours",
+            "customer_message": (
+                f"Harbor & Hearth Kitchen is open {regular['open']} to {regular['close']} "
+                f"on {local.strftime('%A')}."
+                if available
+                else (
+                    f"Harbor & Hearth Kitchen is closed at {local.strftime('%I:%M %p').lstrip('0')} "
+                    f"on {local.strftime('%A')}; regular hours are "
+                    f"{regular['open']} to {regular['close']}."
+                )
+            ),
         }
 
     def resolve_hours_query(self, query: str) -> dict[str, Any] | None:
         normalized = normalize_text(query)
         tokens = text_tokens(query)
         requested_date: date | None = None
+        supplied_year_match = re.search(r"\b(20\d{2})\b", query)
+        supplied_year = int(supplied_year_match.group(1)) if supplied_year_match else None
         iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", query)
         if iso_match:
             try:
@@ -554,6 +636,7 @@ class RestaurantKnowledge:
                     return None
 
         exceptions = self.raw["hours"].get("exceptions") or []
+        mismatched_named_exception = False
         for exception in exceptions:
             start = datetime.fromisoformat(exception["starts_at"])
             end = datetime.fromisoformat(exception["ends_at"])
@@ -563,7 +646,14 @@ class RestaurantKnowledge:
                 for token in text_tokens(exception["exception_id"])
                 if token not in {"hours", "holiday", "private", "event", str(exception_date.year)}
             }
-            named_exception = len(name_tokens) > 0 and name_tokens <= tokens
+            named_exception = bool(name_tokens) and name_tokens <= tokens
+            if (
+                named_exception
+                and supplied_year is not None
+                and supplied_year != exception_date.year
+            ):
+                mismatched_named_exception = True
+                continue
             if requested_date == exception_date or named_exception:
                 return {
                     "status": exception["status"],
@@ -573,6 +663,17 @@ class RestaurantKnowledge:
                     "kind": exception["kind"],
                     "customer_message": exception["customer_message"],
                 }
+
+        if mismatched_named_exception:
+            return {
+                "status": "unavailable",
+                "date": str(supplied_year),
+                "kind": "exception_not_published",
+                "customer_message": (
+                    f"Hours for that {supplied_year} holiday are not in the current "
+                    "Harbor & Hearth schedule. I won't reuse another year's hours."
+                ),
+            }
 
         if requested_date is None:
             return None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -39,6 +40,10 @@ def isolated_behavior_store(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(handler, "load_behavior_state", fake_load)
     monkeypatch.setattr(handler, "save_behavior_state", fake_save)
+    monkeypatch.setattr(
+        "app.transfer_availability._now",
+        lambda timezone_info: datetime(2026, 9, 8, 12, tzinfo=timezone_info),
+    )
 
 
 @pytest.mark.asyncio

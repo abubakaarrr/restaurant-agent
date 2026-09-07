@@ -10,6 +10,7 @@ import pytest
 import pytest_asyncio
 
 from app.config import settings
+from app.agent.runner import clear_session, run_agent
 from app.call_analytics import ingest_retell_webhook
 from app.behavior import TurnObservation, reduce_behavior
 from app.behavior_store import load_behavior_state, save_behavior_state
@@ -58,19 +59,10 @@ async def isolated_database(monkeypatch: pytest.MonkeyPatch):
         RESTART IDENTITY CASCADE
         """
     )
+    await seed(connection, with_embeddings=False)
+    await connection.execute("TRUNCATE tables RESTART IDENTITY CASCADE")
     await connection.execute(
-        """
-        INSERT INTO tables (table_number, capacity, location)
-        VALUES (1, 4, 'main')
-        """
-    )
-    await connection.execute(
-        """
-        INSERT INTO menu_items (name, category, price, description, dietary, available)
-        VALUES
-            ('Margherita Pizza', 'main', 18.00, 'Tomato and mozzarella', ARRAY['vegetarian'], TRUE),
-            ('Garden Salad', 'starter', 9.00, 'Seasonal vegetables', ARRAY['vegan'], TRUE)
-        """
+        "INSERT INTO tables (table_number, capacity, location) VALUES (1, 4, 'main')"
     )
     await connection.close()
     yield
@@ -78,7 +70,11 @@ async def isolated_database(monkeypatch: pytest.MonkeyPatch):
 
 
 def _future_date() -> str:
-    return (datetime.now() + timedelta(days=30)).date().isoformat()
+    candidate = (datetime.now() + timedelta(days=30)).date()
+    excluded = {"2026-10-18", "2026-11-26", "2026-12-24"}
+    while candidate.weekday() == 0 or candidate.isoformat() in excluded:
+        candidate += timedelta(days=1)
+    return candidate.isoformat()
 
 
 async def test_booking_race_and_idempotent_replay() -> None:
@@ -140,18 +136,62 @@ async def test_booking_race_and_idempotent_replay() -> None:
     assert restored["customer_name"] == "Taylor"
 
 
+async def test_public_agent_cancellation_reversal_preserves_booking() -> None:
+    call_id = "reservation-reversal"
+    clear_session(call_id)
+    booked_at = datetime.fromisoformat(f"{_future_date()}T19:00")
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        table_id = await connection.fetchval(
+            "SELECT id FROM tables WHERE table_number = 1"
+        )
+        booking_id = await connection.fetchval(
+            """
+            INSERT INTO bookings
+                (customer_name, customer_phone, table_id, booked_at, party_size, status)
+            VALUES ('Taylor', '+14155550123', $1, $2, 2, 'confirmed')
+            RETURNING id
+            """,
+            table_id,
+            booked_at,
+        )
+        await connection.execute(
+            """
+            INSERT INTO call_sessions (session_id, state)
+            VALUES ($1, $2::jsonb)
+            """,
+            call_id,
+            json.dumps({"booking_id": booking_id}),
+        )
+    finally:
+        await connection.close()
+
+    reply = await run_agent(call_id, "Don't cancel it.")
+    assert "unchanged" in reply.casefold()
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        status = await connection.fetchval(
+            "SELECT status FROM bookings WHERE id = $1", booking_id
+        )
+        assert status == "confirmed"
+    finally:
+        await connection.close()
+        clear_session(call_id)
+
+
 async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
     ambiguous = await restaurant_service.add_order_item(
         call_id="order-call",
         idempotency_key="must-not-be-consumed",
-        item_name="pizza",
+        item_name="market",
         quantity=1,
         customer_name="Jordan",
         customer_phone="+14155550124",
     )
     assert ambiguous["added"] is False
     assert ambiguous["needs_confirmation"] is True
-    assert ambiguous["candidates"][0]["name"] == "Margherita Pizza"
+    assert ambiguous["candidates"][0]["name"] == "Market Greens"
     connection = await asyncpg.connect(settings.database_url)
     try:
         assert await connection.fetchval("SELECT COUNT(*) FROM orders") == 0
@@ -160,16 +200,16 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
 
     first = await restaurant_service.add_order_item(
         call_id="order-call",
-        idempotency_key="add-pizza-1",
-        item_name="Margherita Pizza",
+        idempotency_key="add-greens-1",
+        item_name="Market Greens",
         quantity=1,
         customer_name="Jordan",
         customer_phone="+14155550124",
     )
     replay = await restaurant_service.add_order_item(
         call_id="order-call",
-        idempotency_key="add-pizza-1",
-        item_name="Margherita Pizza",
+        idempotency_key="add-greens-1",
+        item_name="Market Greens",
         quantity=1,
         customer_name="Jordan",
         customer_phone="+14155550124",
@@ -180,7 +220,7 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
 
     updated = await restaurant_service.update_order_item(
         call_id="order-call",
-        idempotency_key="update-pizza-1",
+        idempotency_key="update-greens-1",
         order_item_id=first["order_item_id"],
         quantity=2,
         notes="one without basil",
@@ -190,7 +230,7 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
 
     preserved = await restaurant_service.update_order_item(
         call_id="order-call",
-        idempotency_key="update-pizza-quantity-only",
+        idempotency_key="update-greens-quantity-only",
         order_item_id=first["order_item_id"],
         quantity=3,
     )
@@ -198,7 +238,7 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
 
     updated = await restaurant_service.update_order_item(
         call_id="order-call",
-        idempotency_key="update-pizza-clear-note",
+        idempotency_key="update-greens-clear-note",
         order_item_id=first["order_item_id"],
         quantity=2,
         notes="",
@@ -229,7 +269,7 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
         approved=True,
     )
     assert confirmed["confirmed"] is True
-    assert confirmed["total"] == 36.0
+    assert confirmed["total"] == 26.0
     assert confirmed_replay["order_id"] == confirmed["order_id"]
     assert confirmed_replay["idempotent_replay"] is True
     assert summary["draft_version"] == version
@@ -398,6 +438,17 @@ async def test_canonical_modifiers_delivery_and_order_notes_survive_confirmation
     first_summary = await restaurant_service.get_order_summary(call_id=call_id)
     first_hash = first_summary["pending_confirmation_hash"]
     first_version = first_summary["draft_version"]
+    noted = await restaurant_service.add_guest_note(
+        call_id=call_id,
+        idempotency_key="knowledge-guest-note-1",
+        note="Pack sauces separately",
+    )
+    assert noted["saved"] is True
+    noted_summary = await restaurant_service.get_order_summary(call_id=call_id)
+    assert noted_summary["draft_version"] == first_version + 1
+    assert noted_summary["pending_confirmation_hash"] != first_hash
+    first_hash = noted_summary["pending_confirmation_hash"]
+    first_version = noted_summary["draft_version"]
     changed = await restaurant_service.set_order_notes(
         call_id=call_id,
         idempotency_key="knowledge-notes-change-1",
@@ -410,7 +461,7 @@ async def test_canonical_modifiers_delivery_and_order_notes_survive_confirmation
     clear_call_memory(call_id)
     await hydrate_call_memory(call_id)
     restarted = await restaurant_service.get_order_summary(call_id=call_id)
-    assert restarted["order_notes"] == "No utensils"
+    assert restarted["order_notes"] == "No utensils; Pack sauces separately"
     assert "dairy and sesame" in restarted["allergy_notes"]
     assert restarted["items"][0]["notes"] == "Cut both in half"
     assert restarted["items"][0]["modifiers"][0]["option_id"] == "modifier.extra-cheddar"
@@ -425,7 +476,7 @@ async def test_canonical_modifiers_delivery_and_order_notes_survive_confirmation
     )
     assert confirmed["confirmed"] is True
     assert confirmed["total"] == 51
-    assert confirmed["order_notes"] == "No utensils"
+    assert confirmed["order_notes"] == "No utensils; Pack sauces separately"
     assert "dairy and sesame" in confirmed["allergy_notes"]
 
     readback = await restaurant_service.lookup_order(
@@ -433,3 +484,53 @@ async def test_canonical_modifiers_delivery_and_order_notes_survive_confirmation
     )
     assert readback["allergy_notes"] == confirmed["allergy_notes"]
     assert readback["fulfillment"] == "delivery"
+
+
+async def test_seeded_alcohol_item_cannot_be_confirmed_as_transaction() -> None:
+    call_id = "alcohol-confirmation-rejected"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        await seed(connection, with_embeddings=False)
+        menu_item = await connection.fetchrow(
+            "SELECT id, name, price FROM menu_items WHERE canonical_id = $1",
+            "menu.alcohol.lager",
+        )
+        order_id = await connection.fetchval(
+            """
+            INSERT INTO orders
+                (session_id, customer_name, customer_phone, fulfillment_type)
+            VALUES ($1, 'Morgan', '+15035550101', 'pickup')
+            RETURNING id
+            """,
+            call_id,
+        )
+        await connection.execute(
+            """
+            INSERT INTO order_items
+                (order_id, menu_item_id, item_name, quantity, unit_price)
+            VALUES ($1, $2, $3, 1, $4)
+            """,
+            order_id,
+            menu_item["id"],
+            menu_item["name"],
+            menu_item["price"],
+        )
+    finally:
+        await connection.close()
+
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.confirm_order(
+            call_id=call_id,
+            idempotency_key="alcohol-confirm-1",
+            expected_draft_version=1,
+            approved=True,
+        )
+    assert exc.value.code == "alcohol_transaction_unsupported"
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        assert await connection.fetchval(
+            "SELECT status FROM orders WHERE id = $1", order_id
+        ) == "pending"
+    finally:
+        await connection.close()

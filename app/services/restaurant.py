@@ -62,10 +62,12 @@ from app.turn_evidence import (
     record_availability,
     record_order_summary,
 )
+from app.transfer_availability import current_staff_transfer_number
 
 
 JsonDict = dict[str, Any]
 T = TypeVar("T", bound=JsonDict)
+RESERVATION_DURATION_MINUTES = 90
 
 
 class RestaurantServiceError(Exception):
@@ -105,6 +107,11 @@ def format_menu_price(item: Mapping[str, Any]) -> str:
 
 def format_availability_speech(result: Mapping[str, Any]) -> str:
     nonce = result.get("availability_nonce") or ""
+    if result.get("restaurant_closed"):
+        return (
+            f"Unavailable: {result.get('message') or 'The restaurant is closed at that time.'} "
+            f"availability_nonce={nonce}."
+        )
     if result.get("available"):
         tables = ", ".join(
             f"table {row['table_number']} ({row['capacity']} seats, {row['location']})"
@@ -290,6 +297,36 @@ class RestaurantService:
         )
 
     @staticmethod
+    async def _update_order_notes_with_conn(
+        conn: Any,
+        *,
+        order_notes: str | None = None,
+        allergy_notes: str | None = None,
+        order_id: int = 0,
+        booking_id: int = 0,
+    ) -> None:
+        if bool(order_id) == bool(booking_id):
+            raise ValueError("Specify exactly one order note owner")
+        owner_column = "id" if order_id else "booking_id"
+        owner_value = order_id or booking_id
+        await conn.execute(
+            f"""
+            UPDATE orders
+            SET notes = CASE WHEN $1::text IS NULL THEN notes ELSE $1 END,
+                allergy_notes = CASE WHEN $2::text IS NULL THEN allergy_notes ELSE $2 END,
+                draft_version = draft_version + 1
+            WHERE {owner_column} = $3
+              AND (
+                  ($1::text IS NOT NULL AND notes IS DISTINCT FROM $1)
+                  OR ($2::text IS NOT NULL AND allergy_notes IS DISTINCT FROM $2)
+              )
+            """,
+            order_notes,
+            allergy_notes,
+            owner_value,
+        )
+
+    @staticmethod
     def _coerce_state(value: Any) -> dict[str, Any]:
         if isinstance(value, str):
             try:
@@ -434,8 +471,15 @@ class RestaurantService:
     ) -> list[JsonDict]:
         dt = self._parse_booking_datetime(date, time)
         party_size = self._validate_party_size(party_size)
+        operating_status = self._reservation_operating_status(dt)
+        if not operating_status["available"]:
+            raise RestaurantServiceError(
+                operating_status["customer_message"],
+                code="restaurant_closed",
+                status=409,
+            )
         window_start = dt - timedelta(minutes=30)
-        window_end = dt + timedelta(minutes=90)
+        window_end = dt + timedelta(minutes=RESERVATION_DURATION_MINUTES)
         location = (preferred_location or "").strip().casefold()
         if require_location_match is None:
             require_location_match = bool(location)
@@ -499,6 +543,28 @@ class RestaurantService:
         call_id: str = "",
     ) -> JsonDict:
         preferred = normalize_preferred_location(preferred_location)
+        requested = self._parse_booking_datetime(date, time)
+        party_size = self._validate_party_size(party_size)
+        operating_status = self._reservation_operating_status(requested)
+        if not operating_status["available"]:
+            result = {
+                "available": False,
+                "restaurant_closed": True,
+                "date": date,
+                "time": time,
+                "party_size": party_size,
+                "preferred_location": preferred,
+                "availability_nonce": secrets.token_hex(8),
+                "impossible_at_location": False,
+                "max_seats_at_location": 0,
+                "tables": [],
+                "available_sections": [],
+                "alternatives": [],
+                "message": operating_status["customer_message"],
+                "hours_kind": operating_status["kind"],
+            }
+            self._record_availability_result(result, call_id)
+            return result
         limits = await self.seating_limits()
         max_at_location = int((limits.get("max_seats_by_location") or {}).get(preferred) or 0)
         impossible_at_location = bool(preferred and max_at_location and party_size > max_at_location)
@@ -548,16 +614,29 @@ class RestaurantService:
             ),
             "alternatives": alternatives,
         }
+        self._record_availability_result(result, call_id)
+        return result
+
+    @staticmethod
+    def _record_availability_result(result: JsonDict, call_id: str) -> None:
         record_availability(result)
         from app.availability_offer import remember_availability_offer
         from app.call_memory import resolve_session_id
 
-        # Always remember — including negative results — so party-size edits can
-        # ground accept/reject on a real check_table_availability outcome.
         sid = resolve_session_id(call_id) if call_id else resolve_session_id()
         if sid:
             remember_availability_offer(sid, result)
-        return result
+
+    @staticmethod
+    def _reservation_operating_status(requested: datetime) -> JsonDict:
+        knowledge = get_restaurant_knowledge()
+        status = knowledge.operating_status(requested)
+        if not status["available"]:
+            return status
+        end = requested + timedelta(minutes=RESERVATION_DURATION_MINUTES) - timedelta(
+            microseconds=1
+        )
+        return knowledge.operating_status(end)
 
     async def _availability_alternatives(
         self,
@@ -581,6 +660,10 @@ class RestaurantService:
         if preferred and not skip_preferred_times:
             for minutes in (-60, 60, -120, 120, -30, 30):
                 candidate = requested + timedelta(minutes=minutes)
+                if not self._reservation_operating_status(candidate)[
+                    "available"
+                ]:
+                    continue
                 candidate_tables = await self.get_available_tables(
                     candidate.date().isoformat(),
                     candidate.strftime("%H:%M"),
@@ -1152,11 +1235,13 @@ class RestaurantService:
                 booking_id,
                 require_approval_for_paid_items,
             )
+            await self._update_order_notes_with_conn(
+                conn,
+                order_notes=rebuilt_notes,
+                booking_id=booking_id,
+            )
             await conn.execute(
-                """
-                UPDATE orders SET notes = $1, customer_name = $2 WHERE booking_id = $3
-                """,
-                rebuilt_notes,
+                "UPDATE orders SET customer_name = $1 WHERE booking_id = $2",
                 updated_name,
                 booking_id,
             )
@@ -1272,10 +1357,10 @@ class RestaurantService:
                     combined,
                     row["id"],
                 )
-                await conn.execute(
-                    "UPDATE orders SET notes = $1 WHERE booking_id = $2",
-                    combined,
-                    row["id"],
+                await self._update_order_notes_with_conn(
+                    conn,
+                    order_notes=combined,
+                    booking_id=row["id"],
                 )
                 saved_on_booking = True
                 target_booking = int(row["id"])
@@ -1292,10 +1377,10 @@ class RestaurantService:
                 )
                 if order:
                     combined = _combine_notes(order["notes"] or "", note)
-                    await conn.execute(
-                        "UPDATE orders SET notes = $1 WHERE id = $2",
-                        combined,
-                        order["id"],
+                    await self._update_order_notes_with_conn(
+                        conn,
+                        order_notes=combined,
+                        order_id=order["id"],
                     )
                 else:
                     combined = _combine_notes(str(session_state.get("notes") or ""), note)
@@ -1809,6 +1894,14 @@ class RestaurantService:
                     if item.get("item_id") in set(menu_item.get("alternative_item_ids") or [])
                 ],
             }
+        if menu_item.get("item_id", "").startswith("menu.alcohol.") or "alcohol" in (
+            menu_item.get("dietary_tags") or []
+        ):
+            raise RestaurantServiceError(
+                "Alcohol is available as read-only synthetic menu information and cannot be added to an order.",
+                code="alcohol_transaction_unsupported",
+                status=409,
+            )
         customization = get_restaurant_knowledge().resolve_customization(
             menu_item,
             modifier_ids=modifier_ids,
@@ -2361,17 +2454,11 @@ class RestaurantService:
                 call_id=call_id,
                 caller_confirmed=caller_confirmed,
             )
-            await conn.execute(
-                """
-                UPDATE orders
-                SET notes = CASE WHEN $1::text IS NULL THEN notes ELSE $1 END,
-                    allergy_notes = CASE WHEN $2::text IS NULL THEN allergy_notes ELSE $2 END,
-                    draft_version = draft_version + 1
-                WHERE id = $3
-                """,
-                cleaned_order_notes,
-                cleaned_allergy_notes,
-                order["id"],
+            await self._update_order_notes_with_conn(
+                conn,
+                order_notes=cleaned_order_notes,
+                allergy_notes=cleaned_allergy_notes,
+                order_id=order["id"],
             )
             return {"updated": True, **await self._order_summary_with_conn(conn, order["id"])}
 
@@ -2564,6 +2651,16 @@ class RestaurantService:
                 raise RestaurantServiceError(
                     "The draft order is empty.", code="empty_order", status=409
                 )
+            if any(
+                item.get("item_id", "").startswith("menu.alcohol.")
+                or "alcohol" in (item.get("dietary_tags") or [])
+                for item in summary["items"]
+            ):
+                raise RestaurantServiceError(
+                    "Alcohol is read-only synthetic menu information and cannot be confirmed as an order transaction.",
+                    code="alcohol_transaction_unsupported",
+                    status=409,
+                )
             require_pending_confirmation(
                 call_id,
                 ACTION_CONFIRM_ORDER,
@@ -2580,10 +2677,6 @@ class RestaurantService:
             )
             clear_pending_confirmation(call_id, ACTION_CONFIRM_ORDER)
             await self._merge_session_state(conn, call_id, pending_state_patch(call_id))
-            has_alcohol = any(
-                "alcohol" in (item.get("dietary_tags") or [])
-                for item in summary.get("items") or []
-            )
             return {
                 **summary,
                 "confirmed": True,
@@ -2597,11 +2690,7 @@ class RestaurantService:
                         else "ready for pickup in about 30 minutes"
                     )
                 ),
-                "alcohol_verification": (
-                    "Recipient must be 21 or older with valid government photo ID; alcohol cannot be left unattended."
-                    if has_alcohol
-                    else ""
-                ),
+                "alcohol_verification": "",
             }
 
         result, replayed = await self._idempotent_write(
@@ -2740,10 +2829,19 @@ class RestaurantService:
                 resolved_hours = knowledge.resolve_hours_query(query)
                 if resolved_hours:
                     result["formatted"] = resolved_hours["customer_message"]
-                    result["answers"][0]["content"] = resolved_hours[
-                        "customer_message"
-                    ]
                     result["hours_resolution"] = resolved_hours
+                    if resolved_hours["status"] == "unavailable":
+                        result.update(
+                            {
+                                "matched": False,
+                                "status": "unavailable",
+                                "answers": [],
+                            }
+                        )
+                    else:
+                        result["answers"][0]["content"] = resolved_hours[
+                            "customer_message"
+                        ]
             return result
 
         if topic_match.status in {"ambiguous", "expired", "future"}:
@@ -2801,7 +2899,7 @@ class RestaurantService:
                 "restaurant_name": identity["name"],
                 "source_id": "operator_knowledge",
             }
-        transfer_available = bool(settings.staff_transfer_number)
+        transfer_available = bool(current_staff_transfer_number())
         return {
             "matched": False,
             "status": "unknown",
@@ -2891,7 +2989,6 @@ class RestaurantService:
             "gaps": [
                 {
                     "id": row["id"],
-                    "restaurant_id": row["restaurant_id"],
                     "session_id": row["session_id"],
                     "question": row["question"],
                     "context_excerpt": row["context_excerpt"] or "",

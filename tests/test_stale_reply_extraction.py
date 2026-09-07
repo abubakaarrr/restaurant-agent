@@ -159,6 +159,24 @@ async def test_cancellation_repair_never_uses_generic_repeat_fallback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancellation_reversal_with_new_request_routes_remaining_intent() -> None:
+    session_id = "cancel-reversal-with-change"
+    clear_session(session_id)
+    model = AsyncMock()
+    model.ainvoke.return_value = {
+        "messages": [AIMessage(content="I can check whether seven is available.")]
+    }
+    with patch("app.agent.runner.restaurant_agent", new=model):
+        reply = await run_agent(
+            session_id,
+            "Don't cancel it; I'm checking whether I can move it to seven.",
+        )
+    assert "seven" in reply.casefold()
+    model.ainvoke.assert_awaited_once()
+    clear_session(session_id)
+
+
+@pytest.mark.asyncio
 async def test_thanks_you_bye_is_a_natural_farewell() -> None:
     session_id = "farewell-direct"
     clear_session(session_id)
