@@ -1579,6 +1579,9 @@ class RestaurantService:
 
     async def list_menu(self, *, available_only: bool = True) -> JsonDict:
         try:
+            knowledge = get_restaurant_knowledge()
+            canonical_source_id = knowledge.metadata["source_id"]
+            canonical_item_ids = [item["item_id"] for item in knowledge.menu_items]
             pool = await get_pool()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
@@ -1596,18 +1599,22 @@ class RestaurantService:
                                AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
                            ) AS available
                     FROM menu_items
-                    WHERE (
-                        $1::boolean = FALSE
-                        OR (
-                            available = TRUE
-                            AND availability_status = 'available'
-                            AND (effective_from IS NULL OR effective_from <= CURRENT_DATE)
-                            AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
-                        )
+                    WHERE source_id = $2
+                      AND canonical_id = ANY($3::text[])
+                      AND (
+                          $1::boolean = FALSE
+                          OR (
+                              available = TRUE
+                              AND availability_status = 'available'
+                              AND (effective_from IS NULL OR effective_from <= CURRENT_DATE)
+                              AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+                          )
                     )
                     ORDER BY category, name
                     """,
                     available_only,
+                    canonical_source_id,
+                    canonical_item_ids,
                 )
         except Exception as exc:
             raise RestaurantServiceError(
@@ -1643,10 +1650,16 @@ class RestaurantService:
                 "effective_from": str(row["effective_from"] or ""),
                 "effective_to": str(row["effective_to"] or ""),
             }
+        canonical_rows = [
+            row
+            for row in rows
+            if row["source_id"] == canonical_source_id
+            and row["canonical_id"] in canonical_item_ids
+        ]
         return {
-            "restaurant_name": "Harbor & Hearth Kitchen",
+            "restaurant_name": knowledge.identity["name"],
             "status": "current",
-            "items": [_menu_payload(row) for row in rows],
+            "items": [_menu_payload(row) for row in canonical_rows],
             "allergen_notice": (
                 "Harbor & Hearth uses shared equipment and preparation areas. No item is "
                 "guaranteed allergen-free or free from cross-contact. For a severe allergy, "
@@ -2378,18 +2391,18 @@ class RestaurantService:
         idempotency_key: str,
         order_item_id: int,
         quantity: int,
-        notes: str = "",
+        notes: str | None = None,
         caller_confirmed: bool = False,
     ) -> JsonDict:
         call_id = self._require_call_id(call_id)
         if not 1 <= quantity <= 20:
             raise RestaurantServiceError("Quantity must be between 1 and 20.")
-        notes = notes.strip()[:300]
+        cleaned_notes = None if notes is None else notes.strip()[:300]
         payload = {
             "call_id": call_id,
             "order_item_id": order_item_id,
             "quantity": quantity,
-            "notes": notes,
+            "notes": cleaned_notes,
             "caller_confirmed": bool(caller_confirmed),
         }
 
@@ -2401,9 +2414,14 @@ class RestaurantService:
                 order_item_id=order_item_id,
             )
             await conn.execute(
-                "UPDATE order_items SET quantity = $1, notes = $2 WHERE id = $3",
+                """
+                UPDATE order_items
+                SET quantity = $1,
+                    notes = CASE WHEN $2::text IS NULL THEN notes ELSE $2 END
+                WHERE id = $3
+                """,
                 quantity,
-                notes,
+                cleaned_notes,
                 order_item_id,
             )
             await conn.execute(
@@ -2682,17 +2700,11 @@ class RestaurantService:
         metadata = knowledge.metadata
         if not query:
             return {
-                "matched": True,
-                "status": "known",
+                "matched": False,
+                "status": "missing",
                 "answers": [],
-                "formatted": "",
+                "formatted": "A restaurant information topic is required.",
                 "log_unknown": False,
-                "restaurant_name": identity["name"],
-                "street_address": identity["address"]["street"],
-                "city": f"{identity['address']['city']}, {identity['address']['region']} {identity['address']['postal_code']}",
-                "phone_number": identity["phone_e164"],
-                "timezone": identity["timezone"],
-                "languages": identity["languages"],
                 **metadata,
             }
 
@@ -2725,6 +2737,13 @@ class RestaurantService:
             }
             if record["topic_id"] == "topic.hours":
                 result["hours"] = deepcopy(knowledge.raw["hours"])
+                resolved_hours = knowledge.resolve_hours_query(query)
+                if resolved_hours:
+                    result["formatted"] = resolved_hours["customer_message"]
+                    result["answers"][0]["content"] = resolved_hours[
+                        "customer_message"
+                    ]
+                    result["hours_resolution"] = resolved_hours
             return result
 
         if topic_match.status in {"ambiguous", "expired", "future"}:

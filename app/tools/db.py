@@ -98,6 +98,8 @@ def _format_order(summary: dict) -> str:
     fulfillment_details = summary.get("fulfillment_details") or {}
     if fulfillment_details.get("address"):
         text += f" Delivery address: {fulfillment_details['address']}."
+    if fulfillment_details.get("instructions"):
+        text += f" Delivery instructions: {fulfillment_details['instructions']}."
     for fee in summary.get("fees") or []:
         text += f" {fee.get('name', 'Fee')}: ${float(fee.get('amount') or 0):.2f}."
     if nonce:
@@ -805,10 +807,10 @@ async def update_order_item(
     session_id: str,
     order_item_id: int,
     quantity: int,
-    notes: str = "",
+    notes: str | None = None,
     caller_confirmed: bool = False,
 ) -> str:
-    """Correct an item quantity or notes. If the order is already confirmed, set caller_confirmed=true after an explicit yes."""
+    """Correct an item quantity or notes. Omit notes to preserve them; pass an empty string to clear them. If the order is already confirmed, set caller_confirmed=true after an explicit yes."""
     session_id = resolve_session_id(session_id)
     try:
         result = await restaurant_service.update_order_item(
@@ -831,7 +833,7 @@ async def update_order_item(
         return _error_text(error)
     return (
         f"Item updated to quantity {quantity}"
-        + (f" with notes: {notes}" if notes else "")
+        + (f" with notes: {notes or 'cleared'}" if notes is not None else "")
         + ". Acknowledge only what changed; do not restate the full order."
     )
 

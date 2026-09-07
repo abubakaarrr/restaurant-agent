@@ -107,7 +107,7 @@ class AddOrderItemRequest(CallRequest, MenuItemRequest):
 class UpdateOrderItemRequest(CallRequest):
     order_item_id: int = Field(gt=0)
     quantity: int = Field(ge=1, le=20)
-    notes: str = Field(default="", max_length=300)
+    notes: str | None = Field(default=None, max_length=300)
     confirmed: bool = False
 
 

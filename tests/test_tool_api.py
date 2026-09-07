@@ -94,3 +94,36 @@ def test_write_forwards_idempotency_key(
     assert response.status_code == 200
     assert captured["idempotency_key"] == "retell-call-1-booking-1"
     assert captured["confirmed"] is True
+
+
+@pytest.mark.parametrize(("payload_notes", "expected"), [(None, None), ("", "")])
+def test_update_order_item_distinguishes_omitted_notes_from_clear(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    payload_notes: str | None,
+    expected: str | None,
+) -> None:
+    captured: dict = {}
+
+    async def fake_update_order_item(**kwargs):
+        captured.update(kwargs)
+        return {"updated": True}
+
+    monkeypatch.setattr(
+        tool_api.restaurant_service,
+        "update_order_item",
+        fake_update_order_item,
+    )
+    payload = {"call_id": "call-1", "order_item_id": 3, "quantity": 2}
+    if payload_notes is not None:
+        payload["notes"] = payload_notes
+    response = client.post(
+        "/api/voice-tools/orders/items/update",
+        headers={
+            "X-Voice-Tool-Secret": "test-tool-secret",
+            "Idempotency-Key": "update-item-1",
+        },
+        json=payload,
+    )
+    assert response.status_code == 200
+    assert captured["notes"] == expected

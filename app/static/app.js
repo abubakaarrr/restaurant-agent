@@ -717,8 +717,12 @@ async function loadSettings() {
       const h = hours[day] || {};
       const openEl = document.getElementById(`hours-${day}-open`);
       const closeEl = document.getElementById(`hours-${day}-close`);
+      const closedEl = document.getElementById(`hours-${day}-closed`);
       if (openEl && h.open) openEl.value = h.open;
       if (closeEl && h.close) closeEl.value = h.close;
+      if (closedEl) closedEl.checked = !h.open || !h.close;
+      if (openEl) openEl.disabled = Boolean(closedEl?.checked);
+      if (closeEl) closeEl.disabled = Boolean(closedEl?.checked);
     });
   } catch (e) {
     console.error('Load settings error:', e);
@@ -741,9 +745,10 @@ async function saveSettings() {
 
   const opening_hours = {};
   DAYS.forEach(day => {
+    const closed = document.getElementById(`hours-${day}-closed`).checked;
     const open = document.getElementById(`hours-${day}-open`).value;
     const close = document.getElementById(`hours-${day}-close`).value;
-    if (open && close) {
+    if (!closed && open && close) {
       opening_hours[day] = { open, close };
     }
   });
@@ -783,3 +788,10 @@ async function saveSettings() {
 // ── Init ──────────────────────────────────────────────────────
 
 document.getElementById('input').focus();
+DAYS.forEach(day => {
+  const closedEl = document.getElementById(`hours-${day}-closed`);
+  closedEl?.addEventListener('change', () => {
+    document.getElementById(`hours-${day}-open`).disabled = closedEl.checked;
+    document.getElementById(`hours-${day}-close`).disabled = closedEl.checked;
+  });
+});

@@ -186,6 +186,24 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
         notes="one without basil",
     )
     assert updated["items"][0]["quantity"] == 2
+    assert updated["items"][0]["notes"] == "one without basil"
+
+    preserved = await restaurant_service.update_order_item(
+        call_id="order-call",
+        idempotency_key="update-pizza-quantity-only",
+        order_item_id=first["order_item_id"],
+        quantity=3,
+    )
+    assert preserved["items"][0]["notes"] == "one without basil"
+
+    updated = await restaurant_service.update_order_item(
+        call_id="order-call",
+        idempotency_key="update-pizza-clear-note",
+        order_item_id=first["order_item_id"],
+        quantity=2,
+        notes="",
+    )
+    assert updated["items"][0]["notes"] == ""
     version = updated["draft_version"]
 
     with pytest.raises(RestaurantServiceError, match="changed after the readback"):

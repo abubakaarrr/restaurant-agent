@@ -1200,6 +1200,14 @@ textarea::placeholder { color: var(--text-dim); }
   color: var(--text-dim);
 }
 
+.hours-closed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
 /* ── Add menu item card ───────────────────────────────── */
 
 .add-item-card {

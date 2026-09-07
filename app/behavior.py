@@ -401,6 +401,14 @@ _COMPLAINT_PATTERNS = (
     re.compile(r"\bterrible\s+service\b"),
     re.compile(r"\byou\s+keep\s+(?:asking|repeating|interrupting)\b"),
     re.compile(r"\bstop\s+interrupting\b"),
+    re.compile(r"\bthis\s+is\s+the\s+(?:third|fourth|fifth)\s+time\s+this\s+failed\b"),
+)
+_PERSONAL_IDENTITY_PATTERNS = (
+    re.compile(r"\b(?:are|am)\s+(?:you|i)\s+(?:a\s+)?(?:real\s+person|human|ai|robot|bot)\b"),
+    re.compile(r"\bwhat\s+(?:are|kind\s+of\s+bot\s+are)\s+you\b"),
+)
+_SAFE_HUMOR_PATTERNS = (
+    re.compile(r"\b(?:are|how)\s+(?:the\s+)?fries\s+(?:famous|popular)\b"),
 )
 
 _HANDOFF_MANAGER_PATTERNS = (
@@ -821,6 +829,8 @@ def _direct_reply(
     boundary_kind: str | None,
     boundary_strikes: int,
     unintelligible: bool,
+    personal_identity: bool,
+    safe_humor: bool,
 ) -> str | None:
     if control is BehaviorControl.HANDOFF:
         if not settings.staff_transfer_number:
@@ -835,6 +845,16 @@ def _direct_reply(
         if terminal_reason == "silence":
             return "I haven't heard you, so I'll end the call for now. Please call back anytime."
         return "I'm ending the call now."
+    if personal_identity:
+        return (
+            f"I'm {settings.ai_agent_name}, Harbor & Hearth's virtual host. "
+            "I can help with a reservation, an order, or restaurant questions."
+        )
+    if safe_humor:
+        return (
+            "The fries have a loyal following, but I try not to let it go to their heads. "
+            "I can check whether they're available right now."
+        )
 
     if silence_count == 1:
         return "Take your time—I'm here when you're ready."
@@ -1020,6 +1040,17 @@ def reduce_behavior(
     )
     confusion = meaningful and _matches(_CONFUSION_PATTERNS, text)
     complaint = meaningful and _matches(_COMPLAINT_PATTERNS, text)
+    personal_identity = meaningful and _matches(_PERSONAL_IDENTITY_PATTERNS, text)
+    unsafe_humor_context = bool(
+        {"allergy", "allergic", "payment", "refund", "injury", "safety", "emergency"}
+        & set(text.split())
+    )
+    safe_humor = (
+        meaningful
+        and not complaint
+        and not unsafe_humor_context
+        and _matches(_SAFE_HUMOR_PATTERNS, text)
+    )
 
     fingerprint = _utterance_fingerprint(text) if meaningful else ""
     repetition_proxy = bool(
@@ -1220,6 +1251,8 @@ def reduce_behavior(
         boundary_kind=boundary_kind,
         boundary_strikes=boundary_strikes,
         unintelligible=unintelligible,
+        personal_identity=personal_identity,
+        safe_humor=safe_humor,
     )
     prompt_instruction = _prompt_instruction(
         mode=mode,

@@ -11,7 +11,7 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
@@ -21,6 +21,27 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_FIXTURE_PATH = ROOT / "db" / "fixtures" / "harbor_and_hearth.v1.json"
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_MONTHS = {
+    name: index
+    for index, names in enumerate(
+        (
+            (),
+            ("january", "jan"),
+            ("february", "feb"),
+            ("march", "mar"),
+            ("april", "apr"),
+            ("may",),
+            ("june", "jun"),
+            ("july", "jul"),
+            ("august", "aug"),
+            ("september", "sep", "sept"),
+            ("october", "oct"),
+            ("november", "nov"),
+            ("december", "dec"),
+        )
+    )
+    for name in names
+}
 
 
 class KnowledgeFixtureError(ValueError):
@@ -412,6 +433,11 @@ class RestaurantKnowledge:
         selected_ids: set[str] = set()
         for raw in modifier_ids:
             option_id, separator, choice = str(raw).partition(":")
+            if option_id in selected_ids:
+                return {
+                    "status": "clarification_required",
+                    "message": f"Choose {option_id} only once.",
+                }
             option = self.modifier_options.get(option_id)
             if not option or option_id not in allowed:
                 return {"status": "incompatible", "message": f"{raw} is not available for {item['name']}."}
@@ -434,6 +460,12 @@ class RestaurantKnowledge:
             selected_ids.add(option_id)
 
         normalized_removals = [" ".join(str(value).split()) for value in removals if str(value).strip()]
+        normalized_removal_ids = [normalize_text(value) for value in normalized_removals]
+        if len(normalized_removal_ids) != len(set(normalized_removal_ids)):
+            return {
+                "status": "clarification_required",
+                "message": "Choose each removal only once.",
+            }
         removable = {normalize_text(value): value for value in item.get("removable_ingredients") or []}
         for removal in normalized_removals:
             if normalize_text(removal) not in removable:
@@ -443,6 +475,11 @@ class RestaurantKnowledge:
                 }
 
         substitution_ids = [str(value) for value in substitutions]
+        if len(substitution_ids) != len(set(substitution_ids)):
+            return {
+                "status": "clarification_required",
+                "message": "Choose each substitution only once.",
+            }
         permitted_substitutions = set(item.get("substitutions") or [])
         if any(value not in permitted_substitutions for value in substitution_ids):
             return {
@@ -487,6 +524,79 @@ class RestaurantKnowledge:
                 deepcopy(self.modifier_options[value]) for value in substitution_ids
             ],
             "price_delta": round(sum(float(option.get("price_delta") or 0) for option in selected), 2),
+        }
+
+    def resolve_hours_query(self, query: str) -> dict[str, Any] | None:
+        normalized = normalize_text(query)
+        tokens = text_tokens(query)
+        requested_date: date | None = None
+        iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", query)
+        if iso_match:
+            try:
+                requested_date = date.fromisoformat(iso_match.group(1))
+            except ValueError:
+                return None
+        if requested_date is None:
+            month_match = re.search(
+                r"\b(" + "|".join(_MONTHS) + r")\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?\b",
+                normalized,
+            )
+            if month_match:
+                fixture_year = date.fromisoformat(self.raw["effective_from"]).year
+                year = int(month_match.group(3) or fixture_year)
+                try:
+                    requested_date = date(
+                        year,
+                        _MONTHS[month_match.group(1)],
+                        int(month_match.group(2)),
+                    )
+                except ValueError:
+                    return None
+
+        exceptions = self.raw["hours"].get("exceptions") or []
+        for exception in exceptions:
+            start = datetime.fromisoformat(exception["starts_at"])
+            end = datetime.fromisoformat(exception["ends_at"])
+            exception_date = start.date()
+            name_tokens = {
+                token
+                for token in text_tokens(exception["exception_id"])
+                if token not in {"hours", "holiday", "private", "event", str(exception_date.year)}
+            }
+            named_exception = len(name_tokens) > 0 and name_tokens <= tokens
+            if requested_date == exception_date or named_exception:
+                return {
+                    "status": exception["status"],
+                    "date": exception_date.isoformat(),
+                    "starts_at": start.isoformat(),
+                    "ends_at": end.isoformat(),
+                    "kind": exception["kind"],
+                    "customer_message": exception["customer_message"],
+                }
+
+        if requested_date is None:
+            return None
+        weekday = requested_date.strftime("%a").casefold()
+        regular = next(
+            row for row in self.raw["hours"]["regular"] if row["day"] == weekday
+        )
+        display_date = (
+            f"{requested_date.strftime('%A, %B')} {requested_date.day}, "
+            f"{requested_date.year}"
+        )
+        if regular["status"] == "closed":
+            message = f"Harbor & Hearth Kitchen is closed on {display_date}."
+        else:
+            message = (
+                f"On {display_date}, Harbor & Hearth Kitchen "
+                f"is open {regular['open']} to {regular['close']}; kitchen last call is "
+                f"{regular['kitchen_last_call']}."
+            )
+        return {
+            "status": regular["status"],
+            "date": requested_date.isoformat(),
+            "kind": "regular_hours",
+            "customer_message": message,
         }
 
     def escalation_route(self, owner: str) -> dict[str, Any] | None:

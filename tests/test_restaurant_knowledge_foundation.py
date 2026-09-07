@@ -5,7 +5,8 @@ from datetime import date
 
 import pytest
 
-from app.behavior import BehaviorControl, TurnObservation, reduce_behavior
+from app.behavior import BehaviorControl, BehaviorMode, TurnObservation, reduce_behavior
+from app.agent.graph import tool_limit_response
 from app.config import settings
 from app.pending_confirmation import order_confirmation_payload, payload_hash
 from app.restaurant_knowledge import (
@@ -15,6 +16,7 @@ from app.restaurant_knowledge import (
 )
 from app.services.restaurant import RestaurantServiceError, restaurant_service
 from app.tools.db import _format_order
+from app.tools.rag import search_menu
 
 
 def test_fixture_is_complete_versioned_synthetic_and_queryable() -> None:
@@ -247,6 +249,14 @@ def test_modifier_semantics_cover_free_paid_removal_unavailable_and_clarificatio
     )
     assert valid_temperature["status"] == "valid"
 
+    for duplicate in (
+        {"modifier_ids": ["modifier.extra-cheddar", "modifier.extra-cheddar", "modifier.side-fries"]},
+        {"removals": ["onion jam", "ONION   JAM"], "modifier_ids": ["modifier.side-fries"]},
+        {"substitutions": ["modifier.side-salad", "modifier.side-salad"]},
+    ):
+        rejected = knowledge.resolve_customization(burger, **duplicate)
+        assert rejected["status"] == "clarification_required"
+
 
 def test_order_notes_and_customizations_are_confirmation_integrity_data() -> None:
     summary = {
@@ -254,7 +264,10 @@ def test_order_notes_and_customizations_are_confirmation_integrity_data() -> Non
         "draft_version": 4,
         "booking_id": 0,
         "fulfillment": "delivery",
-        "fulfillment_details": {"address": "101 Test Avenue"},
+        "fulfillment_details": {
+            "address": "101 Test Avenue",
+            "instructions": "Leave with the front desk",
+        },
         "order_notes": "No utensils",
         "allergy_notes": "Severe sesame allergy",
         "fees": [{"fee_id": "fee.delivery", "name": "delivery fee", "amount": 5}],
@@ -282,26 +295,187 @@ def test_order_notes_and_customizations_are_confirmation_integrity_data() -> Non
     readback = _format_order(summary)
     for expected in (
         "extra cheddar", "remove: onion jam", "Cut in half", "No utensils",
-        "Severe sesame allergy", "Delivery address", "delivery fee", "$29.00",
+        "Severe sesame allergy", "Delivery address", "front desk", "delivery fee", "$29.00",
     ):
         assert expected.casefold() in readback.casefold()
 
 
-def test_conversation_fixture_and_brand_safety_coverage() -> None:
+@pytest.mark.parametrize(
+    ("caller_input", "expected_mode", "expected_phrases"),
+    [
+        (
+            "This is the third time this failed.",
+            BehaviorMode.DEESCALATING,
+            ("acknowledge the concern", "concrete next step"),
+        ),
+        (
+            "Are the fries famous?",
+            BehaviorMode.STANDARD,
+            ("loyal following", "check whether they're available"),
+        ),
+        (
+            "Are you a real person?",
+            BehaviorMode.STANDARD,
+            ("virtual host", "restaurant questions"),
+        ),
+    ],
+)
+def test_conversation_inputs_execute_behavior_interface(
+    caller_input: str,
+    expected_mode: BehaviorMode,
+    expected_phrases: tuple[str, ...],
+) -> None:
+    result = reduce_behavior(None, TurnObservation(text=caller_input))
+    observable = " ".join(
+        value
+        for value in (result.directive.direct_reply, result.directive.prompt_instruction)
+        if value
+    ).casefold()
+    assert result.directive.mode is expected_mode
+    assert all(phrase in observable for phrase in expected_phrases)
+
+
+def test_safe_humor_is_suppressed_for_allergy_context() -> None:
+    result = reduce_behavior(
+        None,
+        TurnObservation(text="Are the fries famous and safe for my allergy?"),
+    )
+    assert result.directive.direct_reply is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "expected_phrases"),
+    [
+        ("What's in the Market Greens?", ("hazelnut", "tree_nut", "cross-contact")),
+        ("Can you guarantee no hazelnut contact?", ("zero cross-contact cannot be guaranteed",)),
+    ],
+)
+async def test_conversation_inputs_execute_grounded_menu_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    expected_phrases: tuple[str, ...],
+) -> None:
+    item = get_restaurant_knowledge().find_menu_item("Market Greens").item
+
+    async def canonical_menu(*, available_only: bool = True) -> dict:
+        return {
+            "items": [
+                {
+                    "name": item["name"],
+                    "category": item["category_id"],
+                    "description": item["description"],
+                    "dietary": item["dietary_tags"],
+                    "aliases": item["aliases"],
+                    "ingredients": item["ingredients"],
+                    "allergens": item["allergens"],
+                    "price": item["price"],
+                    "price_estimated": False,
+                    "available": True,
+                    "availability": item["availability"],
+                    "cross_contact": item["cross_contact"],
+                }
+            ],
+            "allergen_notice": item["cross_contact"],
+        }
+
+    monkeypatch.setattr(restaurant_service, "list_menu", canonical_menu)
+    result = (await search_menu.ainvoke({"query": query})).casefold()
+    assert all(phrase.casefold() in result for phrase in expected_phrases)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Are you open October 18?", "closes at 4:00 PM"),
+        ("Are you open on Thanksgiving?", "closed on Thanksgiving Day"),
+        ("Are you open 2026-12-24?", "open 11:30 AM to 8:00 PM"),
+        ("Are you open September 8?", "open 11:30 to 22:00"),
+    ],
+)
+async def test_dated_hours_queries_resolve_canonical_exceptions(
+    query: str,
+    expected: str,
+) -> None:
+    result = await restaurant_service.restaurant_info(query)
+    assert result["topic_id"] == "topic.hours"
+    assert expected in result["formatted"]
+
+
+@pytest.mark.asyncio
+async def test_blank_restaurant_topic_is_explicitly_missing() -> None:
+    result = await restaurant_service.restaurant_info("  ")
+    assert result["matched"] is False
+    assert result["status"] == "missing"
+    assert result["answers"] == []
+    assert "restaurant_name" not in result
+
+
+@pytest.mark.asyncio
+async def test_menu_read_boundary_excludes_stale_restaurant_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     knowledge = get_restaurant_knowledge()
-    intents = {fixture["intent"] for fixture in knowledge.raw["conversation_fixtures"]}
-    assert {
-        "ingredient_question", "severe_allergy", "paid_and_free_modifiers",
-        "unavailable_item", "ambiguous_item", "reservation_create_update_cancel_reversal",
-        "frustration", "light_humor", "personal_question", "human_transfer",
-        "unknown_policy", "provider_unavailable",
-    } <= intents
-    style = knowledge.raw["conversation_style"]
-    assert "allergy" in style["light_humor"]["forbidden_contexts"]
-    assert "payment" in style["light_humor"]["forbidden_contexts"]
-    assert "human" in style["personal_questions"]
-    assert "Acknowledge" in style["frustration"]
-    assert "Do not joke" in style["unsafe"]
+    item = knowledge.find_menu_item("Market Greens").item
+
+    def row_for(*, name: str, canonical_id: str, source_id: str) -> dict:
+        return {
+            "id": 1,
+            "canonical_id": canonical_id,
+            "name": name,
+            "aliases": [],
+            "category": "salads",
+            "price": 13,
+            "description": "Current description",
+            "dietary": [],
+            "ingredients": [],
+            "allergens": [],
+            "service_periods": [],
+            "availability_status": "available",
+            "knowledge_metadata": {},
+            "source_id": source_id,
+            "data_version": knowledge.metadata["data_version"],
+            "effective_from": None,
+            "effective_to": None,
+            "price_estimated": False,
+            "available": True,
+        }
+
+    rows = [
+        row_for(
+            name=item["name"],
+            canonical_id=item["item_id"],
+            source_id=knowledge.metadata["source_id"],
+        ),
+        row_for(
+            name="Legacy Example Chowder",
+            canonical_id="menu.legacy.chowder",
+            source_id="source.legacy-example",
+        ),
+    ]
+
+    class Connection:
+        async def fetch(self, query: str, *args: object) -> list[dict]:
+            return rows
+
+    class Acquire:
+        async def __aenter__(self) -> Connection:
+            return Connection()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class Pool:
+        def acquire(self) -> Acquire:
+            return Acquire()
+
+    async def fake_pool() -> Pool:
+        return Pool()
+
+    monkeypatch.setattr("app.services.restaurant.get_pool", fake_pool)
+    menu = await restaurant_service.list_menu(available_only=False)
+    assert [entry["name"] for entry in menu["items"]] == ["Market Greens"]
 
 
 def test_human_handoff_copy_depends_on_configured_destination(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -316,6 +490,22 @@ def test_human_handoff_copy_depends_on_configured_destination(monkeypatch: pytes
     configured = reduce_behavior(None, TurnObservation(text="Connect me to a person"))
     assert configured.directive.control is BehaviorControl.HANDOFF
     assert "connect you" in configured.directive.direct_reply.casefold()
+
+
+@pytest.mark.asyncio
+async def test_tool_limit_handoff_copy_depends_on_configured_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "staff_transfer_number", "")
+    unavailable = await tool_limit_response({})
+    unavailable_text = unavailable["messages"][0].content.casefold()
+    assert "can't transfer" in unavailable_text
+    assert "callback message" in unavailable_text
+    assert "connect you" not in unavailable_text
+
+    monkeypatch.setattr(settings, "staff_transfer_number", "+15035550149")
+    configured = await tool_limit_response({})
+    assert "connect you" in configured["messages"][0].content.casefold()
 
 
 @pytest.mark.asyncio
