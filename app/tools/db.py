@@ -48,13 +48,39 @@ def _error_text(error: RestaurantServiceError) -> str:
 
 
 def _format_order(summary: dict) -> str:
+    def _option_name(option: object) -> str:
+        if not isinstance(option, dict):
+            return str(option)
+        name = str(option.get("name") or option.get("option_id") or "option")
+        return name + (f" ({option['selection']})" if option.get("selection") else "")
+
+    def _format_item(item: dict) -> str:
+        details: list[str] = []
+        modifiers = item.get("modifiers") or []
+        if modifiers:
+            details.append(
+                "options: "
+                + ", ".join(_option_name(option) for option in modifiers)
+            )
+        if item.get("removals"):
+            details.append("remove: " + ", ".join(item["removals"]))
+        substitutions = item.get("substitutions") or []
+        if substitutions:
+            details.append(
+                "substitutions: "
+                + ", ".join(_option_name(option) for option in substitutions)
+            )
+        if item.get("notes"):
+            details.append(f"item note: {item['notes']}")
+        suffix = f", {', '.join(details)}" if details else ""
+        return f"{item['quantity']}x {item['item_name']} (${item['subtotal']:.2f}){suffix}"
+
     items = "; ".join(
-        f"{item['quantity']}x {item['item_name']} (${item['subtotal']:.2f})"
-        + (f", notes: {item['notes']}" if item.get("notes") else "")
+        _format_item(item)
         for item in summary.get("items", [])
     )
     proposed = "; ".join(
-        f"{item['quantity']}x {item['item_name']} (${item['subtotal']:.2f}) waiting for yes"
+        _format_item(item) + " waiting for yes"
         for item in summary.get("proposed_items", [])
     )
     nonce = summary.get("summary_nonce") or ""
@@ -65,6 +91,15 @@ def _format_order(summary: dict) -> str:
     )
     if proposed:
         text += f" Proposed (not added): {proposed}."
+    if summary.get("order_notes"):
+        text += f" Order notes: {summary['order_notes']}."
+    if summary.get("allergy_notes"):
+        text += f" Allergy notes: {summary['allergy_notes']}."
+    fulfillment_details = summary.get("fulfillment_details") or {}
+    if fulfillment_details.get("address"):
+        text += f" Delivery address: {fulfillment_details['address']}."
+    for fee in summary.get("fees") or []:
+        text += f" {fee.get('name', 'Fee')}: ${float(fee.get('amount') or 0):.2f}."
     if nonce:
         text += f" summary_nonce={nonce}."
     return text
@@ -603,6 +638,11 @@ async def add_order_item(
     item_name: str,
     quantity: int = 1,
     notes: str = "",
+    modifier_ids: list[str] | None = None,
+    removals: list[str] | None = None,
+    substitutions: list[str] | None = None,
+    order_notes: str = "",
+    allergy_notes: str = "",
     booking_id: int = 0,
     customer_name: str = "",
     customer_phone: str = "",
@@ -623,6 +663,11 @@ async def add_order_item(
                     "item_name": item_name,
                     "quantity": quantity,
                     "notes": notes,
+                    "modifier_ids": modifier_ids or [],
+                    "removals": removals or [],
+                    "substitutions": substitutions or [],
+                    "order_notes": order_notes,
+                    "allergy_notes": allergy_notes,
                     "booking_id": booking_id,
                     "caller_confirmed": caller_confirmed,
                 },
@@ -630,6 +675,11 @@ async def add_order_item(
             item_name=item_name,
             quantity=quantity,
             notes=notes,
+            modifier_ids=modifier_ids or [],
+            removals=removals or [],
+            substitutions=substitutions or [],
+            order_notes=order_notes,
+            allergy_notes=allergy_notes,
             booking_id=booking_id,
             customer_name=customer_name,
             customer_phone=customer_phone,
@@ -644,7 +694,13 @@ async def add_order_item(
                 "attaching a priced item. " + _format_order(result)
             )
         if result.get("unavailable"):
-            return f"{result['item']['name']} is currently unavailable."
+            alternatives = ", ".join(item["name"] for item in result.get("candidates") or [])
+            return (
+                f"{result['item']['name']} is currently unavailable."
+                + (f" Available alternatives: {alternatives}." if alternatives else "")
+            )
+        if result.get("customization_status"):
+            return f"{result['customization_status']}: {result.get('message', 'That choice cannot be added.')}"
         candidates = ", ".join(item["name"] for item in result.get("candidates", []))
         return (
             f"No exact item was added. Ask the caller to confirm one of: {candidates}."
@@ -659,8 +715,10 @@ async def set_order_fulfillment(
     session_id: str,
     fulfillment_type: str,
     booking_id: int = 0,
+    delivery_address: str = "",
+    delivery_instructions: str = "",
 ) -> str:
-    """Set dine_in or pickup on the existing pending order. Does not add items. Use pickup only on an explicit pickup request; reservation pre-orders default to dine_in."""
+    """Set dine_in, pickup, or synthetic local delivery on a pending order. Delivery requires an address before confirmation and has no live provider integration."""
     session_id = resolve_session_id(session_id)
     memory = get_call_memory(session_id)
     if fulfillment_type.strip().casefold() == "dine_in" and not booking_id:
@@ -673,10 +731,14 @@ async def set_order_fulfillment(
                 {
                     "fulfillment_type": fulfillment_type,
                     "booking_id": booking_id,
+                    "delivery_address": delivery_address,
+                    "delivery_instructions": delivery_instructions,
                 },
             ),
             fulfillment_type=fulfillment_type,
             booking_id=booking_id or None,
+            delivery_address=delivery_address,
+            delivery_instructions=delivery_instructions,
         )
     except RestaurantServiceError as error:
         return _error_text(error)
@@ -684,6 +746,35 @@ async def set_order_fulfillment(
         f"Fulfillment set to {result.get('fulfillment')}. "
         + _format_order(result)
     )
+
+
+@tool
+async def set_order_notes(
+    session_id: str,
+    order_notes: str | None = None,
+    allergy_notes: str | None = None,
+    caller_confirmed: bool = False,
+) -> str:
+    """Set or clear order-level instructions/allergy notes. These are distinct from an individual item's notes and appear in every full readback."""
+    session_id = resolve_session_id(session_id)
+    try:
+        result = await restaurant_service.set_order_notes(
+            call_id=session_id,
+            idempotency_key=make_idempotency_key(
+                "set_order_notes",
+                {
+                    "order_notes": order_notes,
+                    "allergy_notes": allergy_notes,
+                    "caller_confirmed": caller_confirmed,
+                },
+            ),
+            order_notes=order_notes,
+            allergy_notes=allergy_notes,
+            caller_confirmed=caller_confirmed,
+        )
+    except RestaurantServiceError as error:
+        return _error_text(error)
+    return "Order-level notes updated. " + _format_order(result)
 
 
 @tool
@@ -788,10 +879,10 @@ async def confirm_order(
         )
     except RestaurantServiceError as error:
         return _error_text(error)
-    return (
-        f"Order #{result['order_id']} confirmed. Total ${result['total']:.2f}; "
-        f"{result['timing']}."
-    )
+    text = "Order confirmed. " + _format_order(result) + f" {result['timing']}."
+    if result.get("alcohol_verification"):
+        text += " " + result["alcohol_verification"]
+    return text
 
 
 @tool
@@ -842,9 +933,8 @@ async def request_handoff(session_id: str, reason: HandoffReason, topic: str = "
     if not settings.staff_transfer_number:
         return (
             "Staff transfer is not available. Never say you are connecting them or "
-            "that a team member must handle it. You can change the reservation name, "
-            "time, party size, and notes yourself. If they want water on arrival, "
-            "say yes and save it as a guest note. Keep hosting."
+            "promise a transfer. Offer to take a callback number or message with "
+            "consent, and keep handling self-service requests directly."
         )
     request_transfer(session_id, reason)
     return "Staff transfer requested. Tell the caller you are connecting them now."

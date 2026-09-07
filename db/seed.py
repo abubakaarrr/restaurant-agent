@@ -8,6 +8,7 @@ pgvector embeddings require ``--with-embeddings`` and an OpenAI key.
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncpg
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from app.restaurant_knowledge import get_restaurant_knowledge
 
 load_dotenv()
 
@@ -25,8 +27,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@127.0.0
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 EMBEDDING_MODEL = "text-embedding-3-small"
 
-PRICE_ESTIMATED = "Price estimated pending client confirmation."
 PRICE_CONFIRMED = "Price confirmed."
+PRICE_ESTIMATED = "Price estimated pending client confirmation."
+
+KNOWLEDGE = get_restaurant_knowledge()
 
 # ── Restaurant tables ─────────────────────────────────────────
 # Phone bookings support parties up to 10. Each dining room has at least
@@ -53,130 +57,9 @@ TABLES = [
 ]
 
 
-def _menu_description(body: str, *, estimated: bool) -> str:
-    flag = PRICE_ESTIMATED if estimated else PRICE_CONFIRMED
-    return f"{body} {flag}".strip()
-
-
-# (name, category, price, description, dietary, price_estimated)
-# Dish names are venue-confirmed. Prices are estimated unless price_estimated is False.
-MENU_ITEMS = [
-    (
-        "Rosemary Fries",
-        "starter",
-        9.00,
-        _menu_description("Confirmed real item.", estimated=True),
-        ["vegetarian"],
-        True,
-    ),
-    (
-        "Fried Cauliflower",
-        "starter",
-        12.00,
-        _menu_description("Confirmed real item.", estimated=True),
-        ["vegetarian"],
-        True,
-    ),
-    (
-        "Dumplings",
-        "starter",
-        14.00,
-        _menu_description("Confirmed real item. Style unconfirmed.", estimated=True),
-        [],
-        True,
-    ),
-    (
-        "Chicken Katsu Burger",
-        "main",
-        19.00,
-        _menu_description("Confirmed real item; a reviewer favorite.", estimated=True),
-        [],
-        True,
-    ),
-    (
-        "Hangover Burger",
-        "main",
-        20.00,
-        _menu_description("Confirmed real item.", estimated=True),
-        [],
-        True,
-    ),
-    (
-        "Fish and Chips",
-        "main",
-        21.00,
-        _menu_description("Confirmed real item, recommended in reviews.", estimated=True),
-        [],
-        True,
-    ),
-    (
-        "BLT",
-        "main",
-        17.00,
-        _menu_description("Confirmed real item.", estimated=True),
-        [],
-        True,
-    ),
-    (
-        "Cobb Salad",
-        "main",
-        18.00,
-        _menu_description("Confirmed real item.", estimated=True),
-        [],
-        True,
-    ),
-    (
-        "Poutine",
-        "main",
-        16.00,
-        _menu_description("Confirmed real item. Ham hock variant seen.", estimated=True),
-        [],
-        True,
-    ),
-    (
-        "Sweet Potato Fries",
-        "starter",
-        8.00,
-        _menu_description("Confirmed real item.", estimated=True),
-        ["vegetarian"],
-        True,
-    ),
-    (
-        "Salted Pretzel Toffee Pudding",
-        "dessert",
-        11.00,
-        _menu_description("Confirmed real item.", estimated=True),
-        ["vegetarian"],
-        True,
-    ),
-    (
-        "Old Fashioned",
-        "drink",
-        15.00,
-        _menu_description('Confirmed real item; called "best in Gastown" in reviews.', estimated=True),
-        [],
-        True,
-    ),
-    (
-        "Craft Lager Pitcher",
-        "drink",
-        18.00,
-        _menu_description("Confirmed real item.", estimated=False),
-        ["vegetarian"],
-        False,
-    ),
-    (
-        "Wings (Wing Wednesday)",
-        "special",
-        12.50,
-        _menu_description(
-            "Wednesday only, $12.50 per pound. Not a daily menu item.",
-            estimated=False,
-        ),
-        [],
-        False,
-    ),
-]
+# Backward-compatible public constant used by integration checks.  Each row is
+# a fully normalized canonical item rather than the former six-field tuple.
+MENU_ITEMS = list(KNOWLEDGE.menu_items)
 
 
 # ── Knowledge chunking ────────────────────────────────────────
@@ -223,7 +106,7 @@ async def seed(conn: asyncpg.Connection, *, with_embeddings: bool = False) -> No
     print(f"  -> {len(TABLES)} tables seeded.")
 
     print("Seeding menu items...")
-    live_names = [name.casefold() for name, *_rest in MENU_ITEMS]
+    live_names = [item["name"].casefold() for item in MENU_ITEMS]
     await conn.execute(
         """
         DELETE FROM menu_items
@@ -243,28 +126,148 @@ async def seed(conn: asyncpg.Connection, *, with_embeddings: bool = False) -> No
         """,
         live_names,
     )
-    for name, category, price, description, dietary, price_estimated in MENU_ITEMS:
+    for item in MENU_ITEMS:
+        metadata = {
+            key: value
+            for key, value in item.items()
+            if key
+            not in {
+                "name",
+                "category_id",
+                "price",
+                "description",
+                "dietary_tags",
+                "aliases",
+                "ingredients",
+                "allergens",
+                "service_periods",
+                "availability",
+                "source_id",
+                "data_version",
+                "effective_from",
+                "effective_to",
+            }
+        }
         await conn.execute(
             """
             INSERT INTO menu_items
-                (name, category, price, description, dietary, available, price_estimated)
-            VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+                (name, category, price, description, dietary, available,
+                 price_estimated, canonical_id, aliases, ingredients, allergens,
+                 service_periods, availability_status, knowledge_metadata,
+                 source_id, data_version, effective_from, effective_to)
+            VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9, $10,
+                    $11, $12, $13::jsonb, $14, $15, $16::date, $17::date)
             ON CONFLICT ((LOWER(name))) DO UPDATE SET
                 category = EXCLUDED.category,
                 price = EXCLUDED.price,
                 description = EXCLUDED.description,
                 dietary = EXCLUDED.dietary,
-                available = TRUE,
-                price_estimated = EXCLUDED.price_estimated
+                available = EXCLUDED.available,
+                price_estimated = FALSE,
+                canonical_id = EXCLUDED.canonical_id,
+                aliases = EXCLUDED.aliases,
+                ingredients = EXCLUDED.ingredients,
+                allergens = EXCLUDED.allergens,
+                service_periods = EXCLUDED.service_periods,
+                availability_status = EXCLUDED.availability_status,
+                knowledge_metadata = EXCLUDED.knowledge_metadata,
+                source_id = EXCLUDED.source_id,
+                data_version = EXCLUDED.data_version,
+                effective_from = EXCLUDED.effective_from,
+                effective_to = EXCLUDED.effective_to
             """,
-            name,
-            category,
-            float(price),
-            description,
-            dietary,
-            price_estimated,
+            item["name"],
+            item["category_id"].removeprefix("category."),
+            float(item["price"]),
+            item["description"],
+            item["dietary_tags"],
+            item.get("availability") == "available",
+            item["item_id"],
+            item["aliases"],
+            item["ingredients"],
+            item["allergens"],
+            item["service_periods"],
+            item["availability"],
+            json.dumps(metadata, sort_keys=True),
+            item["source_id"],
+            item["data_version"],
+            item["effective_from"],
+            item.get("effective_to"),
         )
     print(f"  -> {len(MENU_ITEMS)} menu items seeded.")
+
+    print("Seeding canonical restaurant knowledge...")
+    meta = KNOWLEDGE.metadata
+    records: list[tuple[str, str, str, str, dict]] = [
+        (
+            KNOWLEDGE.identity["restaurant_id"],
+            "identity",
+            "category.identity",
+            KNOWLEDGE.identity.get("name", ""),
+            KNOWLEDGE.identity,
+        ),
+        ("hours.canonical", "hours", "category.operations", "Operating hours", KNOWLEDGE.raw["hours"]),
+        ("style.canonical", "conversation_style", "category.brand", "Brand conversation guidance", KNOWLEDGE.raw["conversation_style"]),
+    ]
+    records.extend(
+        (area["area_id"], "dining_area", "category.seating", area.get("name", ""), area)
+        for area in KNOWLEDGE.raw["dining_areas"]
+    )
+    records.extend(
+        (option["option_id"], "modifier", "category.modifiers", option.get("name", ""), option)
+        for option in KNOWLEDGE.raw["modifier_options"]
+    )
+    records.extend(
+        (topic["topic_id"], "topic", topic["category_id"], topic.get("answer", ""), topic)
+        for topic in KNOWLEDGE.topics
+    )
+    records.extend(
+        (route["route_id"], "escalation_route", "category.escalation", route.get("fallback", ""), route)
+        for route in KNOWLEDGE.raw["escalation_routes"]
+    )
+    canonical_ids = [record[0] for record in records]
+    await conn.execute(
+        "DELETE FROM restaurant_knowledge_records WHERE source_id = $1 AND NOT (canonical_id = ANY($2::text[]))",
+        meta["source_id"],
+        canonical_ids,
+    )
+    for canonical_id, record_type, category_id, display_text, payload in records:
+        effective_from = payload.get("effective_from") or meta["effective_from"]
+        effective_to = payload.get("effective_to", meta["effective_to"])
+        await conn.execute(
+            """
+            INSERT INTO restaurant_knowledge_records
+                (canonical_id, record_type, category_id, source_id, schema_version,
+                 data_version, effective_from, effective_to, status, display_text,
+                 payload, synthetic)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::date, $8::date, $9, $10,
+                    $11::jsonb, TRUE)
+            ON CONFLICT (canonical_id) DO UPDATE SET
+                record_type = EXCLUDED.record_type,
+                category_id = EXCLUDED.category_id,
+                source_id = EXCLUDED.source_id,
+                schema_version = EXCLUDED.schema_version,
+                data_version = EXCLUDED.data_version,
+                effective_from = EXCLUDED.effective_from,
+                effective_to = EXCLUDED.effective_to,
+                status = EXCLUDED.status,
+                display_text = EXCLUDED.display_text,
+                payload = EXCLUDED.payload,
+                synthetic = TRUE
+            """,
+            canonical_id,
+            record_type,
+            category_id,
+            meta["source_id"],
+            meta["schema_version"],
+            meta["data_version"],
+            effective_from,
+            effective_to,
+            payload.get("status", "current"),
+            display_text,
+            json.dumps(payload, sort_keys=True),
+        )
+    print(f"  -> {len(records)} canonical knowledge records seeded.")
 
     if not with_embeddings:
         print("Skipping legacy pgvector embeddings (use --with-embeddings to rebuild).")

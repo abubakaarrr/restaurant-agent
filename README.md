@@ -26,12 +26,20 @@ flowchart LR
 Production call audio does not pass through this server. Retell owns the audio
 path; the backend returns structured business results over HTTPS.
 
+Phase 1 restaurant facts come from the versioned synthetic fixture
+`db/fixtures/harbor_and_hearth.v1.json`. `db/seed.py` deterministically projects
+that source into normalized menu rows and versioned restaurant-knowledge
+records; it does not call an embedding or delivery provider unless the separate
+legacy `--with-embeddings` option is explicitly used.
+
 ## Safety properties
 
 - Write tools default off with `VOICE_LIVE_WRITES_ENABLED=false`.
 - Every booking, cancellation, order mutation, and order confirmation requires
   an idempotency key.
 - Orders remain drafts until the caller approves a complete itemized readback.
+- Order-level instructions and allergy notes are part of confirmation integrity
+  and persist with item options, removals, substitutions, fulfillment, and fees.
 - Booking creation locks the selected table and prevents a double booking.
 - Fuzzy menu matches return candidates without mutating an order.
 - Human transfer uses a server-configured E.164 number, never caller/model text.
@@ -89,10 +97,11 @@ All routes are under `/api/voice-tools` and require
 
 Capabilities include:
 
-- live menu and exact item matching;
-- grounded restaurant hours/location;
+- versioned menu, ingredients, allergens, modifiers, and conservative item matching;
+- grounded restaurant identity, hours, policies, seating, and amenities;
 - availability, booking creation, verified lookup, and cancellation;
-- order draft add/update/remove and summary;
+- dine-in, pickup, and synthetic local-delivery draft flows with no live courier integration;
+- order draft add/update/remove, order-level notes, and complete canonical summaries;
 - explicit versioned order confirmation;
 - authenticated tool health with write-flag status.
 

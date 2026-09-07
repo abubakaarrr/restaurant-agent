@@ -1,14 +1,21 @@
 {
-  "restaurant_name": "The Lamplighter Public House",
-  "tagline": "Vancouver's oldest pub, Gastown, est. 1925",
-  "phone_number": "+16046874424",
-  "timezone": "America/Vancouver",
-  "seating_capacity": 60,
-  "street_address": "92 Water St",
-  "city": "Vancouver, BC V6B 2K8",
-  "ai_agent_name": "Clough",
+  "restaurant_name": "Harbor & Hearth Kitchen",
+  "tagline": "A neighborhood table with a Pacific Northwest hearth",
+  "phone_number": "+15035550148",
+  "timezone": "America/Los_Angeles",
+  "seating_capacity": 130,
+  "street_address": "1842 Market Street",
+  "city": "Portland, OR 97205",
+  "ai_agent_name": "Avery",
   "languages": ["English"],
-  "opening_hours": {},
-  "hours_unconfirmed": true,
-  "hours_note": "Opening hours are not confirmed with the venue. Public listings disagree, including whether Monday is open. Do not invent a weekly schedule."
+  "opening_hours": {
+    "tue": {"open": "11:30", "close": "22:00"},
+    "wed": {"open": "11:30", "close": "22:00"},
+    "thu": {"open": "11:30", "close": "22:00"},
+    "fri": {"open": "11:30", "close": "23:00"},
+    "sat": {"open": "09:00", "close": "23:00"},
+    "sun": {"open": "09:00", "close": "21:00"}
+  },
+  "hours_unconfirmed": false,
+  "hours_note": "Date-specific exceptions in the canonical knowledge fixture override regular hours."
 }

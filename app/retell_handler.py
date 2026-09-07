@@ -227,8 +227,8 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     no_interruption = True
                 else:
                     final_content = (
-                        "I'm sorry, the staff transfer line is not configured. "
-                        "Please call the restaurant directly."
+                        "I'm sorry, I can't transfer the call right now. "
+                        "I can take a message and callback details for the restaurant team."
                     )
             await send(
                 _response_event(
@@ -262,7 +262,11 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                             response_id,
                             (
                                 "I'm sorry, I had a technical issue. "
-                                "I can connect you with the restaurant team."
+                                + (
+                                    "I can connect you with the restaurant team."
+                                    if settings.staff_transfer_number
+                                    else "I can't transfer right now, but I can take a callback message."
+                                )
                             ),
                             complete=True,
                             transfer_number=settings.staff_transfer_number,
@@ -388,7 +392,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                             + (
                                 "I'll connect you with the restaurant team."
                                 if can_transfer
-                                else "Please call the restaurant team directly."
+                                else "I can't transfer right now, but I can take a callback message."
                             )
                         ),
                         complete=True,

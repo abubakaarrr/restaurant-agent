@@ -62,9 +62,10 @@ docker compose run --rm web python scripts/migrate.py
 docker compose up -d --build web
 ```
 
-The default seed is idempotent and populates only live tables/menu data. Legacy
-pgvector chunks are outside the critical call path; rebuild them only when
-needed with `python db/seed.py --with-embeddings`.
+The default seed is idempotent and projects the versioned synthetic fixture at
+`db/fixtures/harbor_and_hearth.v1.json` into live menu and canonical restaurant
+knowledge records. Legacy pgvector chunks are outside the critical call path;
+rebuild them only when needed with `python db/seed.py --with-embeddings`.
 
 Migrations are checksum-tracked and advisory-locked. Never edit an applied SQL
 migration; add a new migration.

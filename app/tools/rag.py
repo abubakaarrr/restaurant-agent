@@ -6,6 +6,7 @@ import re
 
 from langchain_core.tools import tool
 
+from app.call_memory import resolve_session_id
 from app.services.restaurant import (
     RestaurantServiceError,
     format_menu_price,
@@ -22,10 +23,12 @@ def _tokens(value: str) -> set[str]:
 
 
 @tool
-async def search_menu(query: str) -> str:
-    """Search live menu names, descriptions, categories, dietary tags, and prices."""
+async def search_menu(query: str, session_id: str = "") -> str:
+    """Search canonical menu ingredients, allergens, dietary tags, availability, and prices."""
     try:
-        menu = await restaurant_service.list_menu()
+        # Ingredient and allergen questions must remain answerable for sold-out
+        # items; availability is reported separately and never inferred.
+        menu = await restaurant_service.list_menu(available_only=False)
     except RestaurantServiceError as error:
         return f"{error.code}: {error.message}"
 
@@ -38,6 +41,9 @@ async def search_menu(query: str) -> str:
                 item["category"],
                 item["description"],
                 " ".join(item["dietary"]),
+                " ".join(item.get("aliases") or []),
+                " ".join(item.get("ingredients") or []),
+                " ".join(item.get("allergens") or []),
             ]
         )
         score = len(query_tokens & _tokens(searchable))
@@ -46,25 +52,78 @@ async def search_menu(query: str) -> str:
     matches.sort(key=lambda item: (-item["_score"], item["name"]))
     if not matches:
         return "No grounded menu result matched that question. Ask the caller to clarify."
+    selected = matches[:8]
+    def _availability_label(item: dict) -> str:
+        if item.get("available"):
+            return "available"
+        status = str(item.get("availability") or "")
+        if status == "sold_out":
+            return "sold out"
+        if status == "not_yet_available":
+            return "not yet available"
+        return "not currently effective"
+
     lines = [
         (
             f"{item['name']} ({format_menu_price(item)}, "
-            f"{'available' if item['available'] else 'sold out'}): "
+            f"{_availability_label(item)}): "
             f"{item['description'] or 'No additional description.'} "
-            f"Dietary tags: {', '.join(item['dietary']) or 'none listed'}."
+            f"Ingredients: {', '.join(item.get('ingredients') or []) or 'not listed'}. "
+            f"Allergens: {', '.join(item.get('allergens') or []) or 'no recipe allergen listed'}. "
+            f"Dietary tags: {', '.join(item['dietary']) or 'none listed'}. "
+            f"Cross-contact: {item.get('cross_contact') or menu['allergen_notice']}"
         )
-        for item in matches[:8]
+        for item in selected
     ]
-    return " ".join(lines) + f" Allergy safety: {menu['allergen_notice']}"
+    missing: list[str] = []
+    lowered = query.casefold()
+    if any(word in lowered for word in ("ingredient", "what's in", "what is in")) and any(
+        not item.get("ingredients") for item in selected
+    ):
+        missing.append("ingredients")
+    if any(word in lowered for word in ("serving", "how many people", "portion")) and any(
+        not item.get("portion") for item in selected
+    ):
+        missing.append("serving_size")
+    suffix = f" Allergy safety: {menu['allergen_notice']}"
+    if missing and session_id:
+        try:
+            gap = await restaurant_service.log_unknown_question(
+                call_id=session_id,
+                question=query,
+                context_excerpt="Missing canonical menu fields: " + ", ".join(missing),
+                agent_response="The requested menu detail is not in current canonical data.",
+            )
+            suffix += (
+                f" Missing canonical fields: {', '.join(missing)}. "
+                f"Knowledge gap logged (id {gap['gap_id']})."
+            )
+        except RestaurantServiceError as error:
+            suffix += f" Missing canonical fields: {', '.join(missing)}; {error.code}."
+    return " ".join(lines) + suffix
 
 
 @tool
-async def search_restaurant_info(query: str) -> str:
+async def search_restaurant_info(query: str, session_id: str = "") -> str:
     """Answer hours, address, parking, cancellation, late arrival, patio, birthday cake, and other restaurant policy questions from approved knowledge. If nothing matches, do not transfer; call log_unknown_question."""
     try:
         result = await restaurant_service.restaurant_info(query)
     except RestaurantServiceError as error:
         return f"{error.code}: {error.message}"
+    if result.get("log_unknown"):
+        try:
+            logged = await restaurant_service.log_unknown_question(
+                call_id=resolve_session_id(session_id),
+                question=query,
+                context_excerpt=f"knowledge_status={result.get('status', 'unknown')}",
+                agent_response=result.get("formatted") or "The answer is not in current restaurant information.",
+            )
+            return (
+                (result.get("formatted") or "No grounded restaurant answer matched that question.")
+                + f" Knowledge gap logged (id {logged['gap_id']})."
+            )
+        except RestaurantServiceError as error:
+            return f"{error.code}: {error.message}"
     if result.get("formatted"):
         return result["formatted"]
     parts: list[str] = []

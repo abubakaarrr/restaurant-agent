@@ -104,17 +104,9 @@ def score_text(query: str, *parts: str) -> int:
     if not query_tokens:
         return 0
     haystack = tokens(" ".join(parts))
-    score = len(query_tokens & haystack)
-    for query_token in query_tokens:
-        if query_token in haystack:
-            continue
-        if any(
-            query_token in hay_token or hay_token in query_token
-            for hay_token in haystack
-            if min(len(query_token), len(hay_token)) >= 4
-        ):
-            score += 1
-    return score
+    # Whole-token overlap is deliberately conservative. Substring matching made
+    # unrelated words such as "dress" and "address" equivalent.
+    return len(query_tokens & haystack)
 
 
 def search_static_knowledge(query: str, *, limit: int = 4) -> list[dict[str, Any]]:

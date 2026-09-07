@@ -1,0 +1,501 @@
+"""Canonical, versioned Harbor & Hearth restaurant knowledge.
+
+The JSON fixture is the source of truth for synthetic restaurant facts.  This
+module exposes normalized records to both the seed process and runtime callers
+without requiring an embedding service or a network connection.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import date
+from difflib import SequenceMatcher
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Iterable
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_FIXTURE_PATH = ROOT / "db" / "fixtures" / "harbor_and_hearth.v1.json"
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+class KnowledgeFixtureError(ValueError):
+    """The local canonical fixture is absent or structurally unsafe."""
+
+
+def normalize_text(value: str) -> str:
+    return " ".join(_WORD_RE.findall(str(value or "").casefold()))
+
+
+def text_tokens(value: str) -> set[str]:
+    return set(_WORD_RE.findall(str(value or "").casefold()))
+
+
+def _as_date(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise KnowledgeFixtureError(f"Invalid effective date: {value}") from exc
+
+
+def _effective_status(record: dict[str, Any], on_date: date) -> str:
+    start = _as_date(record.get("effective_from"))
+    end = _as_date(record.get("effective_to"))
+    if start and on_date < start:
+        return "future"
+    if end and on_date > end:
+        return "expired"
+    return str(record.get("status") or "current")
+
+
+def _merged(defaults: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    value = deepcopy(defaults)
+    value.update(deepcopy(record))
+    return value
+
+
+@dataclass(frozen=True)
+class TopicMatch:
+    status: str
+    records: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class MenuMatch:
+    status: str
+    item: dict[str, Any] | None = None
+    candidates: tuple[dict[str, Any], ...] = ()
+
+
+class RestaurantKnowledge:
+    """Validated, deterministic view over one synthetic dataset version."""
+
+    def __init__(self, raw: dict[str, Any], *, path: Path) -> None:
+        self.path = path
+        self.raw = deepcopy(raw)
+        self._validate()
+        source = self.raw["source"]
+        common = {
+            "schema_version": self.raw["schema_version"],
+            "data_version": self.raw["data_version"],
+            "source_id": source["source_id"],
+            "effective_from": self.raw["effective_from"],
+            "effective_to": self.raw.get("effective_to"),
+        }
+        self.menu_items = tuple(
+            _merged({**common, **self.raw["menu_defaults"]}, item)
+            for item in self.raw["menu_items"]
+        )
+        self.topics = tuple(
+            _merged({**common, **self.raw["policy_defaults"]}, topic)
+            for topic in self.raw["topics"]
+        )
+        self.modifier_options = {
+            option["option_id"]: deepcopy(option)
+            for option in self.raw["modifier_options"]
+        }
+
+    @classmethod
+    def from_path(cls, path: Path | str = DEFAULT_FIXTURE_PATH) -> "RestaurantKnowledge":
+        fixture_path = Path(path)
+        try:
+            raw = json.loads(fixture_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise KnowledgeFixtureError(
+                f"Canonical restaurant knowledge is unavailable: {fixture_path}"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise KnowledgeFixtureError("Canonical restaurant fixture must be an object")
+        return cls(raw, path=fixture_path)
+
+    def _validate(self) -> None:
+        required = {
+            "schema_version",
+            "data_version",
+            "fixture_id",
+            "synthetic",
+            "effective_from",
+            "source",
+            "restaurant",
+            "hours",
+            "dining_areas",
+            "menu_defaults",
+            "menu_items",
+            "modifier_options",
+            "topics",
+            "policy_defaults",
+            "escalation_routes",
+            "conversation_style",
+            "conversation_fixtures",
+        }
+        missing = sorted(required - self.raw.keys())
+        if missing:
+            raise KnowledgeFixtureError(
+                "Canonical restaurant fixture is missing: " + ", ".join(missing)
+            )
+        if self.raw.get("synthetic") is not True:
+            raise KnowledgeFixtureError("Only an explicitly synthetic fixture may load")
+        restaurant = self.raw.get("restaurant") or {}
+        if restaurant.get("name") != "Harbor & Hearth Kitchen":
+            raise KnowledgeFixtureError("Unexpected canonical restaurant identity")
+        source_id = str((self.raw.get("source") or {}).get("source_id") or "")
+        if not source_id:
+            raise KnowledgeFixtureError("source.source_id is required")
+        if not str(self.raw.get("schema_version") or ""):
+            raise KnowledgeFixtureError("schema_version is required")
+        if not str(self.raw.get("data_version") or ""):
+            raise KnowledgeFixtureError("data_version is required")
+        fixture_start = _as_date(self.raw.get("effective_from"))
+        fixture_end = _as_date(self.raw.get("effective_to"))
+        if fixture_start is None:
+            raise KnowledgeFixtureError("effective_from is required")
+        if fixture_end and fixture_end < fixture_start:
+            raise KnowledgeFixtureError("effective_to cannot precede effective_from")
+        self._require_unique(self.raw["menu_items"], "item_id")
+        self._require_unique(self.raw["modifier_options"], "option_id")
+        self._require_unique(self.raw["topics"], "topic_id")
+        self._require_unique(self.raw["dining_areas"], "area_id")
+        self._require_unique(self.raw["escalation_routes"], "route_id")
+        self._require_unique(self.raw["conversation_fixtures"], "fixture_id")
+        self._require_unique(self.raw["hours"].get("exceptions") or [], "exception_id")
+        if len(self.raw["menu_items"]) < 25:
+            raise KnowledgeFixtureError("At least 25 canonical menu items are required")
+
+        option_ids = {option["option_id"] for option in self.raw["modifier_options"]}
+        for option in self.raw["modifier_options"]:
+            if not option["option_id"].startswith("modifier."):
+                raise KnowledgeFixtureError("Modifier identifiers must start with modifier.")
+            if option.get("availability") not in {"available", "unavailable"}:
+                raise KnowledgeFixtureError(
+                    f"Invalid availability for {option['option_id']}"
+                )
+            try:
+                price_delta = float(option.get("price_delta") or 0)
+            except (TypeError, ValueError) as exc:
+                raise KnowledgeFixtureError(
+                    f"Invalid price_delta for {option['option_id']}"
+                ) from exc
+            if price_delta < 0:
+                raise KnowledgeFixtureError(
+                    f"price_delta cannot be negative for {option['option_id']}"
+                )
+            if option.get("requires_clarification") and not option.get("choices"):
+                raise KnowledgeFixtureError(
+                    f"Clarification choices are required for {option['option_id']}"
+                )
+
+        item_ids = {item["item_id"] for item in self.raw["menu_items"]}
+        list_fields = (
+            "aliases",
+            "ingredients",
+            "allergens",
+            "dietary_tags",
+            "service_periods",
+            "modifier_options",
+            "removable_ingredients",
+            "substitutions",
+            "incompatible_choices",
+        )
+        for raw_item in self.raw["menu_items"]:
+            item = _merged(self.raw["menu_defaults"], raw_item)
+            item_id = item["item_id"]
+            if not item_id.startswith("menu."):
+                raise KnowledgeFixtureError("Menu identifiers must start with menu.")
+            if not str(item.get("name") or "") or not str(item.get("description") or ""):
+                raise KnowledgeFixtureError(f"Name and description are required for {item_id}")
+            if not str(item.get("customer_safe_answer") or ""):
+                raise KnowledgeFixtureError(
+                    f"customer_safe_answer is required for {item_id}"
+                )
+            if not str(item.get("category_id") or "").startswith("category."):
+                raise KnowledgeFixtureError(f"Invalid category_id for {item_id}")
+            try:
+                price = float(item.get("price"))
+            except (TypeError, ValueError) as exc:
+                raise KnowledgeFixtureError(f"Invalid price for {item_id}") from exc
+            if price <= 0 or item.get("currency") != "USD":
+                raise KnowledgeFixtureError(f"Invalid price or currency for {item_id}")
+            if item.get("availability") not in {
+                "available",
+                "sold_out",
+                "not_yet_available",
+            }:
+                raise KnowledgeFixtureError(f"Invalid availability for {item_id}")
+            for field in list_fields:
+                if not isinstance(item.get(field), list):
+                    raise KnowledgeFixtureError(f"{field} must be a list for {item_id}")
+            if not str(item.get("cross_contact") or ""):
+                raise KnowledgeFixtureError(f"cross_contact is required for {item_id}")
+            item_start = _as_date(item.get("effective_from"))
+            item_end = _as_date(item.get("effective_to"))
+            if item_start is None or (item_end and item_end < item_start):
+                raise KnowledgeFixtureError(f"Invalid effective period for {item_id}")
+            referenced_options = set(item["modifier_options"]) | set(item["substitutions"])
+            for group in item.get("required_modifier_groups") or []:
+                referenced_options.update(group.get("option_ids") or [])
+            for conflict in item["incompatible_choices"]:
+                referenced_options.update(conflict.get("option_ids") or [])
+            unknown_options = sorted(referenced_options - option_ids)
+            if unknown_options:
+                raise KnowledgeFixtureError(
+                    f"Unknown modifier references for {item_id}: {', '.join(unknown_options)}"
+                )
+            unknown_alternatives = sorted(
+                set(item.get("alternative_item_ids") or []) - item_ids
+            )
+            if unknown_alternatives:
+                raise KnowledgeFixtureError(
+                    f"Unknown alternatives for {item_id}: {', '.join(unknown_alternatives)}"
+                )
+
+        for raw_topic in self.raw["topics"]:
+            topic = _merged(self.raw["policy_defaults"], raw_topic)
+            topic_id = topic["topic_id"]
+            if not topic_id.startswith("topic."):
+                raise KnowledgeFixtureError("Topic identifiers must start with topic.")
+            if not str(topic.get("category_id") or "").startswith("category."):
+                raise KnowledgeFixtureError(f"Invalid category_id for {topic_id}")
+            if not isinstance(topic.get("aliases"), list) or not topic["aliases"]:
+                raise KnowledgeFixtureError(f"Aliases are required for {topic_id}")
+            if not str(topic.get("answer") or "") or not isinstance(topic.get("rule"), dict):
+                raise KnowledgeFixtureError(f"Answer and structured rule are required for {topic_id}")
+            if not str(topic.get("version") or "") or not str(topic.get("escalation_owner") or ""):
+                raise KnowledgeFixtureError(f"Version and escalation owner are required for {topic_id}")
+            topic_start = _as_date(topic.get("effective_from"))
+            topic_end = _as_date(topic.get("effective_to"))
+            if topic_start is None or (topic_end and topic_end < topic_start):
+                raise KnowledgeFixtureError(f"Invalid effective period for {topic_id}")
+
+    @staticmethod
+    def _require_unique(records: Iterable[dict[str, Any]], key: str) -> None:
+        values = [str(record.get(key) or "") for record in records]
+        if any(not value for value in values) or len(values) != len(set(values)):
+            raise KnowledgeFixtureError(f"Every {key} must be present and unique")
+
+    @property
+    def identity(self) -> dict[str, Any]:
+        return deepcopy(self.raw["restaurant"])
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.raw["schema_version"],
+            "data_version": self.raw["data_version"],
+            "fixture_id": self.raw["fixture_id"],
+            "source_id": self.raw["source"]["source_id"],
+            "effective_from": self.raw["effective_from"],
+            "effective_to": self.raw.get("effective_to"),
+            "synthetic": True,
+        }
+
+    def current_menu(self, *, on_date: date | None = None) -> list[dict[str, Any]]:
+        today = on_date or date.today()
+        return [
+            deepcopy(item)
+            for item in self.menu_items
+            if _effective_status(item, today) == "current"
+        ]
+
+    def find_menu_item(self, query: str, *, on_date: date | None = None) -> MenuMatch:
+        requested = normalize_text(query)
+        if not requested:
+            return MenuMatch("missing")
+        today = on_date or date.today()
+        current = self.current_menu(on_date=today)
+        all_records = list(self.menu_items)
+
+        def names(item: dict[str, Any]) -> set[str]:
+            return {
+                normalize_text(value)
+                for value in [item["name"], *(item.get("aliases") or [])]
+                if normalize_text(value)
+            }
+
+        exact = [item for item in current if requested in names(item)]
+        if len(exact) == 1:
+            return MenuMatch("known", deepcopy(exact[0]))
+        if len(exact) > 1:
+            return MenuMatch("ambiguous", candidates=tuple(deepcopy(exact)))
+
+        stale = [item for item in all_records if requested in names(item)]
+        if stale:
+            return MenuMatch(
+                _effective_status(stale[0], today), candidates=tuple(deepcopy(stale))
+            )
+
+        # A partial or spelling match is only ever a clarification candidate.
+        # It must never silently select an item or mutate an order.
+        requested_tokens = text_tokens(requested)
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for item in current:
+            item_names = names(item)
+            token_overlap = max(
+                (len(requested_tokens & text_tokens(name)) for name in item_names),
+                default=0,
+            )
+            ratio = max(
+                (SequenceMatcher(None, requested, name).ratio() for name in item_names),
+                default=0.0,
+            )
+            if token_overlap or ratio >= 0.72:
+                ranked.append((token_overlap * 2 + ratio, item))
+        ranked.sort(key=lambda pair: (-pair[0], pair[1]["name"]))
+        candidates = tuple(deepcopy(item) for _, item in ranked[:3])
+        return MenuMatch("ambiguous" if candidates else "unknown", candidates=candidates)
+
+    def find_topic(self, query: str, *, on_date: date | None = None) -> TopicMatch:
+        normalized = normalize_text(query)
+        query_tokens = text_tokens(normalized)
+        if not query_tokens:
+            return TopicMatch("missing")
+        today = on_date or date.today()
+        ranked: list[tuple[int, int, dict[str, Any]]] = []
+        stale: list[dict[str, Any]] = []
+        for topic in self.topics:
+            best_score = 0
+            best_length = 0
+            phrases = [topic["topic_id"].removeprefix("topic.").replace("-", " ")]
+            phrases.extend(topic.get("aliases") or [])
+            for phrase in phrases:
+                alias = normalize_text(phrase)
+                alias_tokens = text_tokens(alias)
+                if not alias_tokens or not alias_tokens <= query_tokens:
+                    continue
+                score = len(alias_tokens) * 10
+                if normalized == alias:
+                    score += 100
+                if alias in normalized:
+                    score += 2
+                if score > best_score:
+                    best_score = score
+                    best_length = len(alias)
+            if not best_score:
+                continue
+            status = _effective_status(topic, today)
+            if status != "current":
+                stale.append(topic)
+                continue
+            ranked.append((best_score, best_length, topic))
+        if not ranked:
+            if stale:
+                return TopicMatch(
+                    _effective_status(stale[0], today), tuple(deepcopy(stale))
+                )
+            return TopicMatch("unknown")
+        ranked.sort(key=lambda value: (-value[0], -value[1], value[2]["topic_id"]))
+        top_score, top_length, _ = ranked[0]
+        winners = [
+            deepcopy(topic)
+            for score, length, topic in ranked
+            if score == top_score and length == top_length
+        ]
+        if len(winners) > 1:
+            return TopicMatch("ambiguous", tuple(winners))
+        return TopicMatch("known", (deepcopy(ranked[0][2]),))
+
+    def resolve_customization(
+        self,
+        item: dict[str, Any],
+        *,
+        modifier_ids: Iterable[str] = (),
+        removals: Iterable[str] = (),
+        substitutions: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        allowed = set(item.get("modifier_options") or [])
+        selected: list[dict[str, Any]] = []
+        selected_ids: set[str] = set()
+        for raw in modifier_ids:
+            option_id, separator, choice = str(raw).partition(":")
+            option = self.modifier_options.get(option_id)
+            if not option or option_id not in allowed:
+                return {"status": "incompatible", "message": f"{raw} is not available for {item['name']}."}
+            if option.get("availability") != "available":
+                return {
+                    "status": "unavailable",
+                    "message": option.get("availability_note") or f"{option['name']} is unavailable.",
+                }
+            choices = option.get("choices") or []
+            if option.get("requires_clarification") and (not separator or choice not in choices):
+                return {
+                    "status": "clarification_required",
+                    "message": f"Choose {option['name']}: {', '.join(choices)}.",
+                    "choices": list(choices),
+                }
+            canonical = deepcopy(option)
+            if choice:
+                canonical["selection"] = choice
+            selected.append(canonical)
+            selected_ids.add(option_id)
+
+        normalized_removals = [" ".join(str(value).split()) for value in removals if str(value).strip()]
+        removable = {normalize_text(value): value for value in item.get("removable_ingredients") or []}
+        for removal in normalized_removals:
+            if normalize_text(removal) not in removable:
+                return {
+                    "status": "incompatible",
+                    "message": f"{removal} cannot be promised as a removal from {item['name']}.",
+                }
+
+        substitution_ids = [str(value) for value in substitutions]
+        permitted_substitutions = set(item.get("substitutions") or [])
+        if any(value not in permitted_substitutions for value in substitution_ids):
+            return {
+                "status": "incompatible",
+                "message": f"That substitution is not supported for {item['name']}.",
+            }
+        for value in substitution_ids:
+            if value not in selected_ids:
+                option = self.modifier_options.get(value)
+                if not option or option.get("availability") != "available":
+                    return {"status": "unavailable", "message": f"{value} is unavailable."}
+                selected.append(deepcopy(option))
+                selected_ids.add(value)
+
+        for conflict in item.get("incompatible_choices") or []:
+            if set(conflict.get("option_ids") or []) <= selected_ids:
+                return {
+                    "status": "clarification_required",
+                    "message": conflict.get("message") or "Those choices conflict.",
+                }
+
+        for group in item.get("required_modifier_groups") or []:
+            choices = set(group.get("option_ids") or [])
+            count = len(choices & selected_ids)
+            if count < int(group.get("min") or 0):
+                names = [self.modifier_options[value]["name"] for value in choices]
+                return {
+                    "status": "clarification_required",
+                    "message": f"Choose one {group.get('group_id')}: {', '.join(sorted(names))}.",
+                }
+            if count > int(group.get("max") or len(choices)):
+                return {
+                    "status": "clarification_required",
+                    "message": f"Choose fewer options for {group.get('group_id')}.",
+                }
+
+        return {
+            "status": "valid",
+            "modifiers": selected,
+            "removals": [removable[normalize_text(value)] for value in normalized_removals],
+            "substitutions": [
+                deepcopy(self.modifier_options[value]) for value in substitution_ids
+            ],
+            "price_delta": round(sum(float(option.get("price_delta") or 0) for option in selected), 2),
+        }
+
+    def escalation_route(self, owner: str) -> dict[str, Any] | None:
+        for route in self.raw["escalation_routes"]:
+            if route.get("owner") == owner:
+                return deepcopy(route)
+        return None
+
+
+@lru_cache(maxsize=1)
+def get_restaurant_knowledge() -> RestaurantKnowledge:
+    return RestaurantKnowledge.from_path()

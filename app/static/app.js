@@ -704,7 +704,7 @@ async function loadSettings() {
     document.getElementById('setCapacity').value = s.seating_capacity || '';
     document.getElementById('setAddress').value = s.street_address || '';
     document.getElementById('setCity').value = s.city || '';
-    document.getElementById('setAgentName').value = s.ai_agent_name || 'Clough';
+    document.getElementById('setAgentName').value = s.ai_agent_name || 'Avery';
 
     const langs = s.languages || ['English'];
     Object.entries(LANG_CHECKBOXES).forEach(([lang, id]) => {
@@ -755,7 +755,7 @@ async function saveSettings() {
     seating_capacity: parseInt(document.getElementById('setCapacity').value) || 60,
     street_address: document.getElementById('setAddress').value.trim(),
     city: document.getElementById('setCity').value.trim(),
-    ai_agent_name: document.getElementById('setAgentName').value.trim() || 'Clough',
+    ai_agent_name: document.getElementById('setAgentName').value.trim() || 'Avery',
     languages,
     opening_hours,
     hours_unconfirmed: Object.keys(opening_hours).length === 0,

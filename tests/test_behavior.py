@@ -276,7 +276,10 @@ def test_silence_ladder_resets_on_speech_and_ends_after_three_silences() -> None
     assert late_packet.directive.control is BehaviorControl.END_CALL
 
 
-def test_explicit_human_and_manager_requests_handoff_and_stay_sticky() -> None:
+def test_explicit_human_and_manager_requests_handoff_and_stay_sticky(monkeypatch) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "staff_transfer_number", "+15035550149")
     unrelated = _reduce(BehaviorState(), "I need a table for my manager.")
     assert unrelated.directive.control is BehaviorControl.CONTINUE
     assert unrelated.state.explicit_handoff_reason is None

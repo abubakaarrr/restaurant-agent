@@ -14,25 +14,28 @@ from app.security import is_e164
 
 SETTINGS_FILE = Path(settings.restaurant_settings_file)
 
-HOURS_UNCONFIRMED_NOTE = (
-    "Opening hours are not confirmed with the venue. Public listings disagree, "
-    "including whether Monday is open. Do not invent a weekly schedule."
-)
+HOURS_UNCONFIRMED_NOTE = "Opening hours are unavailable from the canonical local fixture."
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "restaurant_name": settings.restaurant_name,
-    "tagline": "Vancouver's oldest pub, Gastown, est. 1925",
-    "phone_number": "+16046874424",
+    "tagline": "A neighborhood table with a Pacific Northwest hearth",
+    "phone_number": "+15035550148",
     "timezone": settings.restaurant_timezone,
-    "seating_capacity": 60,
-    "street_address": "92 Water St",
-    "city": "Vancouver, BC V6B 2K8",
+    "seating_capacity": 130,
+    "street_address": "1842 Market Street",
+    "city": "Portland, OR 97205",
     "ai_agent_name": settings.ai_agent_name,
     "languages": ["English"],
-    # Empty until the venue confirms a weekly grid. Do not copy public listings.
-    "opening_hours": {},
-    "hours_unconfirmed": True,
-    "hours_note": HOURS_UNCONFIRMED_NOTE,
+    "opening_hours": {
+        "tue": {"open": "11:30", "close": "22:00"},
+        "wed": {"open": "11:30", "close": "22:00"},
+        "thu": {"open": "11:30", "close": "22:00"},
+        "fri": {"open": "11:30", "close": "23:00"},
+        "sat": {"open": "09:00", "close": "23:00"},
+        "sun": {"open": "09:00", "close": "21:00"},
+    },
+    "hours_unconfirmed": False,
+    "hours_note": "Date-specific exceptions in the canonical knowledge fixture override regular hours.",
 }
 
 _settings_cache: tuple[float | None, dict[str, Any]] | None = None

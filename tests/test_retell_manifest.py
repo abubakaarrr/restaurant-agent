@@ -28,6 +28,8 @@ def test_retell_manifest_references_real_routes_and_prompts() -> None:
             "cancel_booking",
             "add_guest_note",
             "add_order_item",
+            "set_order_fulfillment",
+            "set_order_notes",
             "update_order_item",
             "remove_order_item",
             "confirm_order",

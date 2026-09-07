@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import AsyncIterator
 
 from app.agent.graph import restaurant_agent
@@ -20,11 +21,21 @@ from app.turn_evidence import audit_assistant_speech, begin_turn, end_turn
 from app.reply_guard import is_clerk_inventory, is_repeated_reply
 from app.restaurant_settings import load_restaurant_settings
 from app.config import settings
-from app.call_flags import clear_call_control
+from app.call_flags import clear_call_control, request_end_call
 
 logger = logging.getLogger(__name__)
 
 _sessions: dict[str, list[dict]] = {}
+
+_CANCELLATION_INQUIRY_REVERSAL_RE = re.compile(
+    r"\b(?:do\s+not|don't|no)\s+cancel\b.*\b(?:checking|process|policy|question)\b",
+    re.IGNORECASE,
+)
+_FAREWELL_RE = re.compile(
+    r"^\s*(?:(?:thanks?|thank\s+you)(?:\s+you)?[,\s]*)?"
+    r"(?:bye|goodbye|see\s+you)(?:\s+(?:now|then))?[\s.!?]*$",
+    re.IGNORECASE,
+)
 
 # Re-export so callers can do: from app.agent.runner import consume_end_call
 from app.call_flags import consume_end_call as consume_end_call  # noqa: E402
@@ -143,6 +154,19 @@ def _action_scope(session_id: str, history_length: int, user_message: str) -> st
     return f"{session_id}:{history_length}:{digest}"
 
 
+def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
+    """Handle narrow non-mutating reversals and terminal farewells locally."""
+    if _CANCELLATION_INQUIRY_REVERSAL_RE.search(user_message):
+        return (
+            "Nothing has been cancelled from that request. I can explain the "
+            "cancellation policy without changing your reservation."
+        )
+    if _FAREWELL_RE.fullmatch(user_message):
+        request_end_call(session_id)
+        return "You're welcome. Goodbye!"
+    return None
+
+
 async def run_agent(session_id: str, user_message: str, caller_phone: str = "") -> str:
     """Run one agent turn and return the full text reply."""
     await hydrate_call_memory(session_id)
@@ -173,6 +197,12 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
         _history_digest(history),
     )
     try:
+        direct_reply = _direct_safe_reply(session_id, user_message)
+        if direct_reply is not None:
+            audit_assistant_speech(direct_reply)
+            history.append({"role": "assistant", "content": direct_reply})
+            _sessions[session_id] = history[-40:]
+            return direct_reply
         payload = {
             "messages": history,
             "session_id": session_id,

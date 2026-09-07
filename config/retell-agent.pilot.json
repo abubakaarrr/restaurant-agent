@@ -74,6 +74,7 @@
       "greeting_and_intent_route",
       "menu_and_allergen_information",
       "pickup_order",
+      "synthetic_local_delivery_order",
       "reservation_and_confirmation",
       "booking_or_order_lookup",
       "staff_transfer",
@@ -172,6 +173,20 @@
         "method": "POST",
         "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/summary",
         "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>"
+      },
+      {
+        "name": "set_order_fulfillment",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/fulfillment",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:fulfillment:{{turn_id}}"
+      },
+      {
+        "name": "set_order_notes",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/orders/notes",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "idempotency_header": "Idempotency-Key: {{call_id}}:order_notes:{{turn_id}}"
       },
       {
         "name": "update_order_item",

@@ -27,6 +27,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+from app.config import settings
+
 
 class BehaviorMode(str, Enum):
     """High-level response style selected by the reducer."""
@@ -426,6 +428,10 @@ _HANDOFF_MANAGER_PATTERNS = (
 )
 _HANDOFF_HUMAN_PATTERNS = (
     re.compile(
+        r"\b(?:transfer|connect|put)\s+me\s+(?:to|through\s+to)\s+"
+        r"(?:a\s+)?(?:human|person|staff\s+member|employee|real\s+person)\b"
+    ),
+    re.compile(
         r"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?"
         r"(?:transfer|connect|put)\s+me\s+(?:to|through\s+to)\s+"
         r"(?:a\s+)?(?:human|person|staff\s+member|employee|real\s+person)\b"
@@ -817,6 +823,11 @@ def _direct_reply(
     unintelligible: bool,
 ) -> str | None:
     if control is BehaviorControl.HANDOFF:
+        if not settings.staff_transfer_number:
+            return (
+                "I can't transfer the call right now, but I can take a message and "
+                "callback details for the restaurant team."
+            )
         if handoff_reason == "manager_requested":
             return "Of course. I'll connect you with a manager now."
         return "Of course. I'll connect you with a staff member now."

@@ -24,6 +24,7 @@ from app.pending_confirmation import (
     register_pending_confirmation,
 )
 from app.services.restaurant import RestaurantServiceError, restaurant_service
+from app.tools.rag import search_menu
 from db.seed import MENU_ITEMS, TABLES, seed
 
 
@@ -53,7 +54,7 @@ async def isolated_database(monkeypatch: pytest.MonkeyPatch):
         """
         TRUNCATE voice_action_idempotency, call_events, provider_webhook_events,
                  order_items, orders, bookings, call_sessions, menu_items, tables,
-                 knowledge_gaps, operator_knowledge
+                 knowledge_gaps, operator_knowledge, restaurant_knowledge_records
         RESTART IDENTITY CASCADE
         """
     )
@@ -275,5 +276,142 @@ async def test_live_menu_seed_is_idempotent_without_embeddings() -> None:
         assert await connection.fetchval("SELECT COUNT(*) FROM menu_items") == len(
             MENU_ITEMS
         )
+        assert await connection.fetchval(
+            "SELECT COUNT(*) FROM restaurant_knowledge_records"
+        ) >= 50
+        assert await connection.fetchval(
+            "SELECT COUNT(*) FROM restaurant_knowledge_records WHERE synthetic IS NOT TRUE"
+        ) == 0
     finally:
         await connection.close()
+
+
+async def test_canonical_modifiers_delivery_and_order_notes_survive_confirmation() -> None:
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        await seed(connection, with_embeddings=False)
+    finally:
+        await connection.close()
+
+    ingredient_answer = await search_menu.ainvoke(
+        {"query": "What ingredients and allergens are in the Market Greens?"}
+    )
+    assert "pear" in ingredient_answer.casefold()
+    assert "hazelnut" in ingredient_answer.casefold()
+    assert "tree_nut" in ingredient_answer.casefold()
+    assert "cross-contact" in ingredient_answer.casefold()
+
+    unavailable = await restaurant_service.add_order_item(
+        call_id="knowledge-order-unavailable",
+        idempotency_key="knowledge-unavailable-1",
+        item_name="Smoked Salmon Dip",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert unavailable["unavailable"] is True
+    assert {item["item_id"] for item in unavailable["candidates"]} == {
+        "menu.main.cedar-salmon", "menu.starter.hearth-bread"
+    }
+
+    ambiguous = await restaurant_service.add_order_item(
+        call_id="knowledge-order-ambiguous",
+        idempotency_key="knowledge-ambiguous-1",
+        item_name="chicken",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert ambiguous["added"] is False
+    assert ambiguous["needs_confirmation"] is True
+
+    incompatible = await restaurant_service.add_order_item(
+        call_id="knowledge-order-incompatible",
+        idempotency_key="knowledge-incompatible-1",
+        item_name="Hearth Burger",
+        modifier_ids=[
+            "modifier.extra-cheddar", "modifier.remove-cheese", "modifier.side-fries"
+        ],
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert incompatible["customization_status"] == "clarification_required"
+
+    with pytest.raises(RestaurantServiceError) as outside_zone:
+        await restaurant_service.set_order_fulfillment(
+            call_id="knowledge-order-ambiguous",
+            idempotency_key="knowledge-delivery-outside-1",
+            fulfillment_type="delivery",
+            delivery_address="55 Example Road, Portland, OR 99999",
+        )
+    assert outside_zone.value.code == "delivery_outside_zone"
+
+    call_id = "knowledge-order-complete"
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="knowledge-add-complete-1",
+        item_name="Hearth Burger",
+        quantity=2,
+        notes="Cut both in half",
+        modifier_ids=["modifier.extra-cheddar", "modifier.side-fries"],
+        removals=["onion jam"],
+        order_notes="No utensils",
+        allergy_notes="Severe sesame allergy; no safety guarantee requested",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert added["added"] is True
+    assert added["items"][0]["unit_price"] == 23
+    assert added["items"][0]["subtotal"] == 46
+    assert added["items"][0]["removals"] == ["onion jam"]
+    assert added["order_notes"] == "No utensils"
+    assert "sesame" in added["allergy_notes"]
+
+    delivered = await restaurant_service.set_order_fulfillment(
+        call_id=call_id,
+        idempotency_key="knowledge-delivery-1",
+        fulfillment_type="delivery",
+        delivery_address="101 Test Avenue, Portland, OR 97205",
+        delivery_instructions="Leave with recipient only",
+    )
+    assert delivered["fulfillment"] == "delivery"
+    assert delivered["item_total"] == 46
+    assert delivered["total"] == 51
+    assert delivered["fulfillment_details"]["live_integration"] is False
+
+    first_summary = await restaurant_service.get_order_summary(call_id=call_id)
+    first_hash = first_summary["pending_confirmation_hash"]
+    first_version = first_summary["draft_version"]
+    changed = await restaurant_service.set_order_notes(
+        call_id=call_id,
+        idempotency_key="knowledge-notes-change-1",
+        allergy_notes="Severe dairy and sesame allergies; shared kitchen acknowledged",
+    )
+    assert changed["draft_version"] == first_version + 1
+    second_summary = await restaurant_service.get_order_summary(call_id=call_id)
+    assert second_summary["pending_confirmation_hash"] != first_hash
+
+    clear_call_memory(call_id)
+    await hydrate_call_memory(call_id)
+    restarted = await restaurant_service.get_order_summary(call_id=call_id)
+    assert restarted["order_notes"] == "No utensils"
+    assert "dairy and sesame" in restarted["allergy_notes"]
+    assert restarted["items"][0]["notes"] == "Cut both in half"
+    assert restarted["items"][0]["modifiers"][0]["option_id"] == "modifier.extra-cheddar"
+    assert restarted["fulfillment_details"]["address"].startswith("101 Test Avenue")
+
+    begin_caller_turn(call_id, "yes")
+    confirmed = await restaurant_service.confirm_order(
+        call_id=call_id,
+        idempotency_key="knowledge-confirm-complete-1",
+        expected_draft_version=restarted["draft_version"],
+        approved=True,
+    )
+    assert confirmed["confirmed"] is True
+    assert confirmed["total"] == 51
+    assert confirmed["order_notes"] == "No utensils"
+    assert "dairy and sesame" in confirmed["allergy_notes"]
+
+    readback = await restaurant_service.lookup_order(
+        order_id=confirmed["order_id"], customer_name="Morgan"
+    )
+    assert readback["allergy_notes"] == confirmed["allergy_notes"]
+    assert readback["fulfillment"] == "delivery"
