@@ -844,8 +844,8 @@ def _direct_reply(
             return "Of course. I'll connect you with a staff member now."
         if destination["owner"] == "manager_callback":
             return (
-                "I can't connect you to a manager now, but I can take a message and "
-                "callback details for the manager."
+                "A manager isn't available by transfer now, but I can take a message "
+                "and callback details for the manager."
             )
         return (
             "I can't transfer the call right now, but I can take a message and "

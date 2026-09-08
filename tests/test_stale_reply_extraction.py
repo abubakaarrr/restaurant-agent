@@ -152,7 +152,7 @@ async def test_cancellation_repair_never_uses_generic_repeat_fallback() -> None:
             session_id,
             "Actually, no. Don't cancel it yet. I was just checking what the cancellation process is.",
         )
-    assert "nothing has been cancelled" in reply.casefold()
+    assert "no cancellation action was taken" in reply.casefold()
     assert "repeat" not in reply.casefold()
     model.assert_not_awaited()
     clear_session(session_id)
