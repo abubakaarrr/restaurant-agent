@@ -386,62 +386,10 @@
 
       <div class="page-header">
         <h1>Restaurant Settings</h1>
-        <p>Manage your restaurant's profile information — the AI agent uses this during calls</p>
+        <p>Manage the AI host name; restaurant facts come from canonical local knowledge</p>
       </div>
 
       <div class="settings-card">
-        <div class="settings-section">
-          <h2>Restaurant Profile</h2>
-
-          <div class="form-grid">
-            <div class="form-group">
-              <label for="setName">Restaurant name</label>
-              <input type="text" id="setName" placeholder="e.g. Harbor &amp; Hearth Kitchen">
-            </div>
-            <div class="form-group">
-              <label for="setPhone">Phone number</label>
-              <input type="tel" id="setPhone" placeholder="e.g. +14165550100">
-            </div>
-          </div>
-
-          <div class="form-grid">
-            <div class="form-group">
-              <label for="setTimezone">Timezone</label>
-              <select id="setTimezone">
-                <option value="UTC">UTC</option>
-                <option value="America/New_York">America/New_York (ET)</option>
-                <option value="America/Chicago">America/Chicago (CT)</option>
-                <option value="America/Denver">America/Denver (MT)</option>
-                <option value="America/Los_Angeles">America/Los_Angeles (PT)</option>
-                <option value="America/Toronto">America/Toronto (ET)</option>
-                <option value="Europe/London">Europe/London (GMT)</option>
-                <option value="Europe/Paris">Europe/Paris (CET)</option>
-                <option value="Asia/Dubai">Asia/Dubai (GST)</option>
-                <option value="Asia/Karachi">Asia/Karachi (PKT)</option>
-                <option value="Asia/Kolkata">Asia/Kolkata (IST)</option>
-                <option value="Asia/Tokyo">Asia/Tokyo (JST)</option>
-                <option value="Australia/Sydney">Australia/Sydney (AEST)</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label for="setCapacity">Seating capacity</label>
-              <input type="number" id="setCapacity" placeholder="e.g. 60" min="1">
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label for="setAddress">Street address</label>
-            <input type="text" id="setAddress" placeholder="e.g. 124 King Street West">
-          </div>
-
-          <div class="form-group">
-            <label for="setCity">City</label>
-            <input type="text" id="setCity" placeholder="e.g. Toronto, ON">
-          </div>
-        </div>
-
-        <div class="settings-divider"></div>
-
         <div class="settings-section">
           <h2>AI Agent</h2>
 
@@ -450,86 +398,6 @@
               <label for="setAgentName">Agent name</label>
               <input type="text" id="setAgentName" placeholder="e.g. Avery">
               <small class="form-hint">The name your AI receptionist introduces itself as</small>
-            </div>
-          </div>
-
-          <div class="form-group">
-            <label>Languages</label>
-            <div class="checkbox-group">
-              <label class="checkbox-label">
-                <input type="checkbox" id="langEn" value="English" checked> English
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" id="langFr" value="French"> French
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" id="langEs" value="Spanish"> Spanish
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" id="langAr" value="Arabic"> Arabic
-              </label>
-              <label class="checkbox-label">
-                <input type="checkbox" id="langUr" value="Urdu"> Urdu
-              </label>
-            </div>
-          </div>
-        </div>
-
-        <div class="settings-divider"></div>
-
-        <div class="settings-section">
-          <h2>Opening Hours</h2>
-          <p class="settings-hint">These hours feed the dashboard, grounded information tools, and rollback agent.</p>
-
-          <div class="hours-list" id="hoursList">
-            <div class="hours-row">
-              <span class="hours-day">Monday</span>
-              <input type="time" id="hours-mon-open" value="11:30">
-              <span class="hours-to">to</span>
-              <input type="time" id="hours-mon-close" value="22:00">
-              <label class="hours-closed"><input type="checkbox" id="hours-mon-closed" checked> Closed</label>
-            </div>
-            <div class="hours-row">
-              <span class="hours-day">Tuesday</span>
-              <input type="time" id="hours-tue-open" value="11:30">
-              <span class="hours-to">to</span>
-              <input type="time" id="hours-tue-close" value="22:00">
-              <label class="hours-closed"><input type="checkbox" id="hours-tue-closed"> Closed</label>
-            </div>
-            <div class="hours-row">
-              <span class="hours-day">Wednesday</span>
-              <input type="time" id="hours-wed-open" value="11:30">
-              <span class="hours-to">to</span>
-              <input type="time" id="hours-wed-close" value="22:00">
-              <label class="hours-closed"><input type="checkbox" id="hours-wed-closed"> Closed</label>
-            </div>
-            <div class="hours-row">
-              <span class="hours-day">Thursday</span>
-              <input type="time" id="hours-thu-open" value="11:30">
-              <span class="hours-to">to</span>
-              <input type="time" id="hours-thu-close" value="23:00">
-              <label class="hours-closed"><input type="checkbox" id="hours-thu-closed"> Closed</label>
-            </div>
-            <div class="hours-row">
-              <span class="hours-day">Friday</span>
-              <input type="time" id="hours-fri-open" value="11:30">
-              <span class="hours-to">to</span>
-              <input type="time" id="hours-fri-close" value="23:30">
-              <label class="hours-closed"><input type="checkbox" id="hours-fri-closed"> Closed</label>
-            </div>
-            <div class="hours-row">
-              <span class="hours-day">Saturday</span>
-              <input type="time" id="hours-sat-open" value="10:00">
-              <span class="hours-to">to</span>
-              <input type="time" id="hours-sat-close" value="23:30">
-              <label class="hours-closed"><input type="checkbox" id="hours-sat-closed"> Closed</label>
-            </div>
-            <div class="hours-row">
-              <span class="hours-day">Sunday</span>
-              <input type="time" id="hours-sun-open" value="10:00">
-              <span class="hours-to">to</span>
-              <input type="time" id="hours-sun-close" value="21:00">
-              <label class="hours-closed"><input type="checkbox" id="hours-sun-closed"> Closed</label>
             </div>
           </div>
         </div>

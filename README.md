@@ -26,6 +26,10 @@ flowchart LR
 Production call audio does not pass through this server. Retell owns the audio
 path; the backend returns structured business results over HTTPS.
 
+Phase 1 does not provide deterministic cancellation reversal for the managed
+Conversation Flow. That stateful boundary is supported only by the local text
+and self-hosted streaming transports.
+
 Phase 1 restaurant facts come from the versioned synthetic fixture
 `db/fixtures/harbor_and_hearth.v1.json`. `db/seed.py` deterministically projects
 that source into normalized menu rows and versioned restaurant-knowledge

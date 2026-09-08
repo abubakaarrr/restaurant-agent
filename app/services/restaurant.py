@@ -195,6 +195,30 @@ def _delivery_rule() -> JsonDict:
     return deepcopy(match.records[0].get("rule") or {})
 
 
+def _fulfillment_delay_minutes(fulfillment: str) -> int:
+    if fulfillment == "delivery":
+        estimates = _delivery_rule().get("delivery_eta_minutes") or [45]
+        return int(estimates[0])
+    return 30
+
+
+def _fulfillment_at(
+    fulfillment: str,
+    details: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    stored = str(details.get("fulfillment_at") or "")
+    if stored:
+        try:
+            return datetime.fromisoformat(stored)
+        except ValueError:
+            pass
+    return (now or _restaurant_now()) + timedelta(
+        minutes=_fulfillment_delay_minutes(fulfillment)
+    )
+
+
 class RestaurantService:
     """Database-backed, provider-neutral restaurant operations."""
 
@@ -1361,7 +1385,7 @@ class RestaurantService:
         note: str,
         booking_id: int = 0,
     ) -> JsonDict:
-        """Save a caller instruction on the booking, order, and call session."""
+        """Save a caller instruction on its booking or order owner and call session."""
         call_id = self._require_call_id(call_id)
         note = " ".join(note.split())
         if not 2 <= len(note) <= 500:
@@ -1420,22 +1444,6 @@ class RestaurantService:
                     combined,
                     row["id"],
                 )
-                attached_order = await conn.fetchrow(
-                    """
-                    SELECT id, notes FROM orders
-                    WHERE booking_id = $1 AND status IN ('pending', 'confirmed')
-                    ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
-                    LIMIT 1
-                    FOR UPDATE
-                    """,
-                    row["id"],
-                )
-                if attached_order:
-                    await self._update_order_notes_with_conn(
-                        conn,
-                        order_notes=_combine_notes(attached_order["notes"] or "", note),
-                        order_id=attached_order["id"],
-                    )
                 saved_on_booking = True
                 target_booking = int(row["id"])
             else:
@@ -2041,7 +2049,9 @@ class RestaurantService:
                     )
                     or 0
                 )
-            service_at = _restaurant_now()
+            operation_now = _restaurant_now()
+            service_at = operation_now
+            fulfillment_details: JsonDict = {}
             if resolved_booking:
                 booked_at = await conn.fetchval(
                     "SELECT booked_at FROM bookings WHERE id = $1 AND status = 'confirmed'",
@@ -2049,6 +2059,31 @@ class RestaurantService:
                 )
                 if booked_at is not None:
                     service_at = booked_at
+            else:
+                existing_fulfillment = await conn.fetchrow(
+                    """
+                    SELECT fulfillment_type, fulfillment_details
+                    FROM orders
+                    WHERE session_id = $1 AND status IN ('pending', 'confirmed')
+                    ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
+                    LIMIT 1
+                    """,
+                    call_id,
+                )
+                fulfillment = (
+                    str(existing_fulfillment["fulfillment_type"] or "pickup")
+                    if existing_fulfillment
+                    else "pickup"
+                )
+                fulfillment_details = dict(
+                    _json_value(existing_fulfillment["fulfillment_details"] or {})
+                    if existing_fulfillment
+                    else {}
+                )
+                service_at = _fulfillment_at(
+                    fulfillment, fulfillment_details, now=operation_now
+                )
+                fulfillment_details["fulfillment_at"] = service_at.isoformat()
             match = await self.find_menu_item(item_name, at=service_at, conn=conn)
             if not match["match"]:
                 return {
@@ -2106,6 +2141,12 @@ class RestaurantService:
                 customer_phone=phone,
             )
             order_id = order["id"]
+            if not resolved_booking:
+                await conn.execute(
+                    "UPDATE orders SET fulfillment_details = $1::jsonb WHERE id = $2",
+                    json.dumps(fulfillment_details, sort_keys=True),
+                    order_id,
+                )
             if order.get("existing"):
                 await conn.execute(
                     """
@@ -2385,9 +2426,18 @@ class RestaurantService:
             fulfillment = stored
         else:
             fulfillment = "dine_in" if order["booking_id"] else "pickup"
+        fulfillment_details = dict(_json_value(order["fulfillment_details"] or {}))
         delivery_fee = 0.0
         if fulfillment == "delivery":
-            delivery_fee = float(_delivery_rule().get("delivery_fee") or 0)
+            stored_fee = fulfillment_details.get("delivery_fee")
+            if stored_fee is not None:
+                delivery_fee = float(stored_fee)
+            elif order["status"] == "confirmed":
+                delivery_fee = max(
+                    0.0, round(float(order["total_amount"] or 0) - item_total, 2)
+                )
+            else:
+                delivery_fee = float(_delivery_rule().get("delivery_fee") or 0)
         calculated_total = round(item_total + delivery_fee, 2)
         return {
             "order_id": order["id"],
@@ -2403,7 +2453,7 @@ class RestaurantService:
             "proposed_items": [_item_payload(item) for item in proposed],
             "fulfillment": fulfillment,
             "fulfillment_type": fulfillment,
-            "fulfillment_details": _json_value(order["fulfillment_details"] or {}),
+            "fulfillment_details": fulfillment_details,
             "order_notes": order["notes"] or "",
             "allergy_notes": order["allergy_notes"] or "",
         }
@@ -2486,6 +2536,7 @@ class RestaurantService:
         if fulfillment in {"pickup", "delivery"}:
             resolved_booking = None
         fulfillment_details: JsonDict = {}
+        fulfillment_at = _fulfillment_at(fulfillment, {}, now=_restaurant_now())
         if fulfillment == "delivery":
             address = " ".join(delivery_address.split())[:300]
             delivery_rule = _delivery_rule()
@@ -2514,7 +2565,11 @@ class RestaurantService:
                 "zone_status": "eligible",
                 "provider": "synthetic_local",
                 "live_integration": False,
+                "delivery_fee": float(delivery_rule.get("delivery_fee") or 0),
+                "fulfillment_at": fulfillment_at.isoformat(),
             }
+        elif fulfillment == "pickup":
+            fulfillment_details = {"fulfillment_at": fulfillment_at.isoformat()}
         payload = {
             "call_id": call_id,
             "fulfillment_type": fulfillment,
@@ -2808,10 +2863,16 @@ class RestaurantService:
                         code="delivery_minimum_not_met",
                         status=409,
                     )
+            service_at = _restaurant_now()
             if summary.get("fulfillment") in {"pickup", "delivery"}:
+                service_at = _fulfillment_at(
+                    str(summary["fulfillment"]),
+                    summary.get("fulfillment_details") or {},
+                    now=service_at,
+                )
                 fulfillment_status = get_restaurant_knowledge().schedule_status(
                     str(summary["fulfillment"]),
-                    _restaurant_now(),
+                    service_at,
                     apply_cutoff=True,
                 )
                 if not fulfillment_status["available"]:
@@ -2824,7 +2885,6 @@ class RestaurantService:
                 raise RestaurantServiceError(
                     "The draft order is empty.", code="empty_order", status=409
                 )
-            service_at = _restaurant_now()
             if summary["fulfillment"] == "dine_in":
                 service_at = await conn.fetchval(
                     "SELECT booked_at FROM bookings WHERE id = $1 AND status = 'confirmed'",

@@ -59,7 +59,7 @@ def test_availability_returns_typed_envelope(
     assert response.json()["result"]["available"] is True
 
 
-def test_managed_caller_turn_uses_shared_reversal_boundary(
+def test_authenticated_caller_turn_endpoint_uses_shared_reversal_boundary(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

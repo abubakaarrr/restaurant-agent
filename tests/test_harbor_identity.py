@@ -20,9 +20,15 @@ def test_default_identity_is_canonical_harbor_and_hearth() -> None:
     assert DEFAULT_SETTINGS["hours_unconfirmed"] is False
 
 
-def test_empty_opening_hours_are_valid_for_operator_override() -> None:
-    result = validate_restaurant_settings_update({"opening_hours": {}})
-    assert result["opening_hours"] == {}
+def test_fixture_owned_identity_and_hours_are_not_operator_editable() -> None:
+    result = validate_restaurant_settings_update(
+        {
+            "restaurant_name": "Pilot Bistro",
+            "timezone": "America/New_York",
+            "opening_hours": {},
+        }
+    )
+    assert result == {}
 
 
 def test_seed_menu_is_the_canonical_confirmed_fixture() -> None:

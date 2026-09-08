@@ -13,6 +13,7 @@ import pytest_asyncio
 
 from app.config import settings
 from app.agent.runner import clear_session, stream_agent_tokens
+from app.caller_turn import process_caller_turn
 from app.call_analytics import ingest_retell_webhook
 from app.behavior import TurnObservation, reduce_behavior
 from app.behavior_store import load_behavior_state, save_behavior_state
@@ -188,10 +189,12 @@ async def test_public_agent_cancellation_reversal_preserves_booking() -> None:
     clear_call_memory(call_id)
     assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is None
 
-    reply = "".join(
-        [token async for token in stream_agent_tokens(call_id, "Don't cancel it.")]
+    processed = await process_caller_turn(
+        call_id,
+        "Don't cancel it; I'm checking whether I can move it to seven.",
     )
-    assert "stopped the pending cancellation" in reply.casefold()
+    assert processed["handled"] is False
+    assert processed["kind"] == "cancellation_reversal_with_remaining_intent"
     assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is None
 
     connection = await asyncpg.connect(settings.database_url)
@@ -666,7 +669,7 @@ async def test_seeded_alcohol_item_cannot_be_confirmed_as_transaction() -> None:
         await connection.close()
 
 
-async def test_booking_note_sync_preserves_order_owned_notes() -> None:
+async def test_booking_notes_do_not_modify_order_owned_notes() -> None:
     call_id = "booking-order-note-ownership"
     connection = await asyncpg.connect(settings.database_url)
     try:
@@ -725,9 +728,107 @@ async def test_booking_note_sync_preserves_order_owned_notes() -> None:
     try:
         assert await connection.fetchval(
             "SELECT notes FROM orders WHERE id = $1", order_id
-        ) == "No utensils; Quiet table if possible"
+        ) == "No utensils"
     finally:
         await connection.close()
+
+
+async def test_pickup_items_use_one_persisted_fulfillment_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 14, 45, tzinfo=timezone_info),
+    )
+    unavailable = await restaurant_service.add_order_item(
+        call_id="pickup-between-services",
+        idempotency_key="pickup-between-services-add",
+        item_name="Market Greens",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert unavailable["added"] is False
+    assert unavailable["unavailable"] is True
+
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 16, 45, tzinfo=timezone_info),
+    )
+    added = await restaurant_service.add_order_item(
+        call_id="pickup-dinner-service",
+        idempotency_key="pickup-dinner-service-add",
+        item_name="Market Greens",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert added["added"] is True
+    assert added["fulfillment_details"]["fulfillment_at"] == (
+        "2026-09-08T17:15:00-07:00"
+    )
+
+    summary = await restaurant_service.get_order_summary(
+        call_id="pickup-dinner-service"
+    )
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 16, 55, tzinfo=timezone_info),
+    )
+    begin_caller_turn("pickup-dinner-service", "yes")
+    confirmed = await restaurant_service.confirm_order(
+        call_id="pickup-dinner-service",
+        idempotency_key="pickup-dinner-confirm",
+        expected_draft_version=summary["draft_version"],
+        approved=True,
+    )
+    assert confirmed["confirmed"] is True
+    assert confirmed["fulfillment_details"]["fulfillment_at"] == (
+        "2026-09-08T17:15:00-07:00"
+    )
+
+
+async def test_confirmed_delivery_total_uses_persisted_fee(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_id = "persisted-delivery-fee"
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="persisted-delivery-add",
+        item_name="Market Greens",
+        quantity=2,
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert added["added"] is True
+    delivered = await restaurant_service.set_order_fulfillment(
+        call_id=call_id,
+        idempotency_key="persisted-delivery-fulfillment",
+        fulfillment_type="delivery",
+        delivery_address="101 Test Avenue, Portland, OR 97205",
+    )
+    assert delivered["fees"][0]["amount"] == 5
+
+    summary = await restaurant_service.get_order_summary(call_id=call_id)
+    begin_caller_turn(call_id, "yes")
+    confirmed = await restaurant_service.confirm_order(
+        call_id=call_id,
+        idempotency_key="persisted-delivery-confirm",
+        expected_draft_version=summary["draft_version"],
+        approved=True,
+    )
+    monkeypatch.setattr(
+        "app.services.restaurant._delivery_rule",
+        lambda: {
+            "delivery_fee": 7,
+            "delivery_minimum": 20,
+            "delivery_eta_minutes": [45, 60],
+        },
+    )
+    restarted = await restaurant_service.lookup_order(
+        order_id=confirmed["order_id"], customer_name="Morgan"
+    )
+    assert restarted["fees"][0]["amount"] == 5
+    assert restarted["total"] == confirmed["total"]
 
 
 async def test_dine_in_menu_period_uses_booking_time_and_rechecks_confirmation(

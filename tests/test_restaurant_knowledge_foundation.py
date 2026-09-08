@@ -205,7 +205,23 @@ def test_operator_faq_requires_specific_question_overlap() -> None:
     assert search_faq_rows("room?", rows) == []
     assert search_faq_rows("Do you have a rooftop room?", rows) == []
     assert search_faq_rows("Can I reserve a rooftop room?", rows) == []
+    assert search_faq_rows("reserve room", rows) == []
     assert search_faq_rows("private room wedding", rows)[0]["kind"] == "operator_faq"
+
+
+def test_relative_hours_queries_apply_local_date_exceptions() -> None:
+    knowledge = get_restaurant_knowledge()
+    tonight = knowledge.resolve_hours_query(
+        "Are you open tonight?", on_date=date(2026, 12, 24)
+    )
+    tomorrow = knowledge.resolve_hours_query(
+        "Are you open tomorrow?", on_date=date(2026, 12, 23)
+    )
+    assert tonight is not None
+    assert tomorrow is not None
+    assert tonight["kind"] == "holiday_hours"
+    assert tomorrow["kind"] == "holiday_hours"
+    assert "8:00 PM" in tonight["customer_message"]
 
 
 def test_fixture_rejects_dangling_escalation_owner() -> None:
@@ -498,6 +514,7 @@ def test_safe_humor_is_suppressed_for_configured_contexts(
     [
         "They gave me food poisoning",
         "I'm allergic to sesame",
+        "I have a tree nut concern",
         "I'm complaining about an injury",
     ],
 )

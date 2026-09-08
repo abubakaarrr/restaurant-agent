@@ -111,6 +111,11 @@ Managed Conversation Flow does not use this WebSocket.
 
 ## 5. Retell managed flow
 
+Phase 1 does not support deterministic cancellation reversal in the managed
+Conversation Flow. Do not configure or describe the caller-turn endpoint as a
+required managed pre-turn hook; the supported boundary is limited to local text
+and self-hosted streaming transports.
+
 Configure each custom function from `config/retell-agent.pilot.json`:
 
 - base path: `https://API_HOST/api/voice-tools`;

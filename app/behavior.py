@@ -437,9 +437,10 @@ def _canonical_humor_risk(text: str, caller_tokens: set[str]) -> bool:
         if topic.get("topic_id") == "topic.safety-emergency":
             phrases.extend(topic.get("aliases") or [])
     allergen_tokens = {
-        str(allergen).casefold()
+        token
         for item in knowledge.menu_items
         for allergen in item.get("allergens") or []
+        for token in text_tokens(str(allergen))
     }
     return bool(caller_tokens & allergen_tokens) or any(
         text_tokens(phrase) <= caller_tokens

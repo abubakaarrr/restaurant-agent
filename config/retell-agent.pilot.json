@@ -3,6 +3,9 @@
   "manifest_version": "2026-08-12",
   "directly_importable": false,
   "notice": "Redacted, version-controlled desired state for dashboard/API review. It is not a Retell API request body.",
+  "phase1_limitations": {
+    "managed_cancellation_reversal": "unsupported; deterministic cancellation reversal is limited to local and self-hosted transports"
+  },
   "pilot_scope": {
     "market": "US_OR_CANADA",
     "direction": "inbound",
@@ -91,13 +94,6 @@
       "required_phone_only_test": true
     },
     "tool_endpoint_placeholders": [
-      {
-        "name": "process_caller_turn",
-        "method": "POST",
-        "url": "https://<PILOT_API_HOST>/api/voice-tools/caller-turn",
-        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
-        "required_before_each_caller_turn": true
-      },
       {
         "name": "get_menu",
         "method": "GET",

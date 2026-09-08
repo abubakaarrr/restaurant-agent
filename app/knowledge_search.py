@@ -145,9 +145,9 @@ def search_faq_rows(
                 or normalized_faq in normalized_query
             )
         )
-        query_coverage = len(overlap) / len(query_tokens)
+        faq_coverage = len(overlap) / len(question_tokens) if question_tokens else 0
         if not phrase_match and not (
-            len(overlap) >= 2 and query_coverage >= 0.75
+            len(overlap) >= 2 and faq_coverage >= 0.75
         ):
             continue
         points = len(overlap) + (100 if phrase_match else 0)

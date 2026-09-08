@@ -838,6 +838,11 @@ class RestaurantKnowledge:
         normalized = normalize_text(query)
         tokens = text_tokens(query)
         requested_date: date | None = None
+        local_date = on_date or self.local_date()
+        if tokens & {"today", "tonight"}:
+            requested_date = local_date
+        elif "tomorrow" in tokens:
+            requested_date = local_date + timedelta(days=1)
         supplied_year_match = re.search(r"\b(20\d{2})\b", query)
         supplied_year = int(supplied_year_match.group(1)) if supplied_year_match else None
         iso_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", query)
@@ -852,7 +857,7 @@ class RestaurantKnowledge:
                 normalized,
             )
             if month_match:
-                year = int(month_match.group(3) or (on_date or self.local_date()).year)
+                year = int(month_match.group(3) or local_date.year)
                 try:
                     requested_date = date(
                         year,
@@ -863,7 +868,7 @@ class RestaurantKnowledge:
                     return None
 
         exceptions = self.raw["hours"].get("exceptions") or []
-        requested_year = supplied_year or (on_date or self.local_date()).year
+        requested_year = supplied_year or local_date.year
         mismatched_named_exception = False
         for exception in exceptions:
             start = datetime.fromisoformat(exception["starts_at"])

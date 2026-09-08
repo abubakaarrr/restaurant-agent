@@ -13,6 +13,13 @@ def test_retell_manifest_references_real_routes_and_prompts() -> None:
         (ROOT / "config" / "retell-agent.pilot.json").read_text(encoding="utf-8")
     )
     assert manifest["directly_importable"] is False
+    assert manifest["phase1_limitations"]["managed_cancellation_reversal"].startswith(
+        "unsupported"
+    )
+    assert all(
+        tool["name"] != "process_caller_turn"
+        for tool in manifest["conversation_flow_review"]["tool_endpoint_placeholders"]
+    )
 
     routes = {
         (route.path, method)
