@@ -1194,6 +1194,38 @@ class RestaurantService:
             )
 
             if changing_slot or location_changed:
+                proposed_at = self._parse_booking_datetime(new_date, new_time)
+                slot_changed = (
+                    proposed_at.date() != booked_at.date()
+                    or proposed_at.strftime("%H:%M") != booked_at.strftime("%H:%M")
+                )
+                if slot_changed:
+                    attached_items = await conn.fetch(
+                        """
+                        SELECT oi.item_name, mi.service_periods
+                        FROM orders o
+                        JOIN order_items oi ON oi.order_id = o.id
+                        LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
+                        WHERE o.booking_id = $1
+                          AND o.status = 'confirmed'
+                          AND o.fulfillment_type = 'dine_in'
+                          AND COALESCE(oi.proposed, FALSE) IS FALSE
+                        """,
+                        booking_id,
+                    )
+                    knowledge = get_restaurant_knowledge()
+                    for attached_item in attached_items:
+                        service_status = knowledge.menu_service_status(
+                            attached_item["service_periods"] or [], proposed_at
+                        )
+                        if not service_status["available"]:
+                            raise RestaurantServiceError(
+                                f"{attached_item['item_name']} is not available during "
+                                "the proposed reservation service period. The booking "
+                                "was not changed.",
+                                code="service_period_unavailable",
+                                status=409,
+                            )
                 tables = await self.get_available_tables(
                     new_date,
                     new_time,
@@ -1229,14 +1261,13 @@ class RestaurantService:
                 table_id = chosen["id"]
                 table_number = chosen["table_number"]
                 location = chosen["location"]
-                dt = self._parse_booking_datetime(new_date, new_time)
                 await conn.execute(
                     """
                     UPDATE bookings
                     SET booked_at = $1, party_size = $2, table_id = $3
                     WHERE id = $4
                     """,
-                    dt,
+                    proposed_at,
                     new_party,
                     table_id,
                     booking_id,
@@ -1819,6 +1850,17 @@ class RestaurantService:
             metadata = _json_value(row["knowledge_metadata"] or {})
             if not isinstance(metadata, dict):
                 metadata = {}
+            effective_from = row["effective_from"]
+            effective_to = row["effective_to"]
+            effective_status = (
+                "future"
+                if effective_from and local_date < effective_from
+                else (
+                    "expired"
+                    if effective_to and local_date > effective_to
+                    else "current"
+                )
+            )
             service_status = knowledge.menu_service_status(
                 row["service_periods"] or [], moment
             )
@@ -1841,12 +1883,13 @@ class RestaurantService:
                 "service_periods": list(row["service_periods"] or []),
                 "availability": row["availability_status"],
                 "available": available,
+                "effective_status": effective_status,
                 "service_status": service_status["status"],
                 "service_message": service_status["customer_message"],
                 "source_id": row["source_id"] or "",
                 "data_version": row["data_version"] or "",
-                "effective_from": str(row["effective_from"] or ""),
-                "effective_to": str(row["effective_to"] or ""),
+                "effective_from": str(effective_from or ""),
+                "effective_to": str(effective_to or ""),
             }
         canonical_rows = [
             row
@@ -1959,18 +2002,6 @@ class RestaurantService:
         if not 1 <= quantity <= 20:
             raise RestaurantServiceError(
                 "Quantity must be between 1 and 20.", code="invalid_quantity"
-            )
-        canonical_item = get_restaurant_knowledge().find_menu_item(
-            item_name, on_date=_restaurant_now().date()
-        ).item
-        if canonical_item and (
-            canonical_item.get("item_id", "").startswith("menu.alcohol.")
-            or "alcohol" in (canonical_item.get("dietary_tags") or [])
-        ):
-            raise RestaurantServiceError(
-                "Alcohol is available as read-only synthetic menu information and cannot be added to an order.",
-                code="alcohol_transaction_unsupported",
-                status=409,
             )
         name = self._validate_name(customer_name) if customer_name else ""
         phone = self._validate_phone(customer_phone) if customer_phone else ""

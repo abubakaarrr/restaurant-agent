@@ -417,6 +417,35 @@ _PERSONAL_IDENTITY_PATTERNS = (
 _SAFE_HUMOR_PATTERNS = (
     re.compile(r"\b(?:are|how)\s+(?:the\s+)?fries\s+(?:famous|popular)\b"),
 )
+_HUMOR_RISK_INFLECTIONS = re.compile(
+    r"\b(?:allerg(?:y|ies|ic|en|ens)|complain(?:t|ts|ed|ing)?|"
+    r"frustrat(?:ed|ing|ion)|injur(?:y|ies|ed)|poison(?:ing|ed)|"
+    r"emergenc(?:y|ies)|refunds?|payments?|unsafe|"
+    r"repeated\s+fail(?:ure|ures|ed|ing))\b"
+)
+
+
+def _canonical_humor_risk(text: str, caller_tokens: set[str]) -> bool:
+    """Recognize canonical unsafe aliases and ordinary inflections before humor."""
+    if _HUMOR_RISK_INFLECTIONS.search(text):
+        return True
+    knowledge = get_restaurant_knowledge()
+    phrases = list(
+        knowledge.raw["conversation_style"]["light_humor"]["forbidden_contexts"]
+    )
+    for topic in knowledge.topics:
+        if topic.get("topic_id") == "topic.safety-emergency":
+            phrases.extend(topic.get("aliases") or [])
+    allergen_tokens = {
+        str(allergen).casefold()
+        for item in knowledge.menu_items
+        for allergen in item.get("allergens") or []
+    }
+    return bool(caller_tokens & allergen_tokens) or any(
+        text_tokens(phrase) <= caller_tokens
+        for phrase in phrases
+        if text_tokens(phrase)
+    )
 
 _HANDOFF_MANAGER_PATTERNS = (
     re.compile(
@@ -1055,16 +1084,7 @@ def reduce_behavior(
     personal_identity = meaningful and _matches(_PERSONAL_IDENTITY_PATTERNS, text)
     caller_tokens = text_tokens(text)
     try:
-        forbidden_humor_contexts = [
-            text_tokens(context)
-            for context in get_restaurant_knowledge().raw["conversation_style"][
-                "light_humor"
-            ]["forbidden_contexts"]
-        ]
-        unsafe_humor_context = any(
-            context_tokens <= caller_tokens
-            for context_tokens in forbidden_humor_contexts
-        )
+        unsafe_humor_context = _canonical_humor_risk(text, caller_tokens)
     except (KnowledgeFixtureError, KeyError, TypeError):
         unsafe_humor_context = True
     safe_humor = (

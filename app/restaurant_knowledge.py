@@ -377,8 +377,11 @@ class RestaurantKnowledge:
 
         stale = [item for item in all_records if requested in names(item)]
         if stale:
+            # Exact inactive records are explicit stale/unavailable results,
+            # never choices in an ambiguity prompt.
             return MenuMatch(
-                _effective_status(stale[0], today), candidates=tuple(deepcopy(stale))
+                _effective_status(stale[0], today),
+                item=deepcopy(stale[0]),
             )
 
         # A partial or spelling match is only ever a clarification candidate.
@@ -497,6 +500,11 @@ class RestaurantKnowledge:
                     "message": option.get("availability_note") or f"{option['name']} is unavailable.",
                 }
             choices = option.get("choices") or []
+            if separator and not choices:
+                return {
+                    "status": "incompatible",
+                    "message": f"{option['name']} does not accept a choice value.",
+                }
             if option.get("requires_clarification") and (not separator or choice not in choices):
                 return {
                     "status": "clarification_required",
@@ -764,12 +772,13 @@ class RestaurantKnowledge:
     def local_date(self) -> date:
         return datetime.now(ZoneInfo(self.identity["timezone"])).date()
 
-    @staticmethod
     def _hours_alias_has_context(
-        alias: str, normalized_query: str, query_tokens: set[str]
+        self, alias: str, normalized_query: str, query_tokens: set[str]
     ) -> bool:
         if normalized_query == alias:
             return True
+        if alias == "open" and re.search(r"\bopen\s+to\b", normalized_query):
+            return False
         if alias == "close" and re.search(r"\bclose\s+to\b", normalized_query):
             return False
         if query_tokens & {
@@ -788,6 +797,11 @@ class RestaurantKnowledge:
             "today",
             "tonight",
             "tomorrow",
+            "breakfast",
+            "brunch",
+            "lunch",
+            "dinner",
+            "bar",
             "late",
             "until",
             "monday",
@@ -799,11 +813,23 @@ class RestaurantKnowledge:
             "sunday",
             *_MONTHS,
         }
+        for exception in self.raw["hours"].get("exceptions") or []:
+            temporal_tokens.update(
+                token
+                for token in text_tokens(exception.get("exception_id") or "")
+                if token not in {"hours", "holiday", "private", "event"}
+                and not token.isdigit()
+            )
+        if re.search(r"\b20\d{2}\s+\d{1,2}\s+\d{1,2}\b", normalized_query):
+            return True
         if query_tokens & temporal_tokens:
             return True
         return bool(
             alias == "open"
-            and re.search(r"\b(?:are|will)\s+you\s+open\b", normalized_query)
+            and re.fullmatch(
+                r"(?:are\s+you|will\s+you\s+be)\s+open(?:\s+(?:now|right\s+now))?",
+                normalized_query,
+            )
         )
 
     def resolve_hours_query(

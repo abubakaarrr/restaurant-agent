@@ -22,7 +22,7 @@ from app.services.restaurant import (
 )
 from app.transfer_availability import current_staff_transfer_number
 from app.knowledge_search import search_faq_rows
-from app.tools.db import _format_order
+from app.tools.db import _format_order, check_menu_item_availability
 from app.tools.rag import search_menu
 
 
@@ -187,6 +187,13 @@ def test_unknown_topic_never_borrows_unrelated_fact() -> None:
     assert proximity.status == "unknown"
     assert proximity.records == ()
 
+    open_to = get_restaurant_knowledge().find_topic("Are you open to weddings?")
+    assert open_to.status == "unknown"
+    assert open_to.records == ()
+
+    hours = get_restaurant_knowledge().find_topic("Are you open tonight?")
+    assert [record["topic_id"] for record in hours.records] == ["topic.hours"]
+
 
 def test_operator_faq_requires_specific_question_overlap() -> None:
     rows = [
@@ -197,6 +204,7 @@ def test_operator_faq_requires_specific_question_overlap() -> None:
     ]
     assert search_faq_rows("room?", rows) == []
     assert search_faq_rows("Do you have a rooftop room?", rows) == []
+    assert search_faq_rows("Can I reserve a rooftop room?", rows) == []
     assert search_faq_rows("private room wedding", rows)[0]["kind"] == "operator_faq"
 
 
@@ -244,6 +252,13 @@ def test_menu_lookup_exact_alias_spelling_ambiguity_and_unavailable_alternatives
     assert unavailable["alternative_item_ids"] == [
         "menu.main.cedar-salmon", "menu.starter.hearth-bread"
     ]
+
+    expired = knowledge.find_menu_item(
+        "Summer Corn Ravioli", on_date=date(2026, 10, 1)
+    )
+    assert expired.status == "expired"
+    assert expired.item["item_id"] == "menu.seasonal.corn-ravioli"
+    assert expired.candidates == ()
 
 
 def test_modifier_semantics_cover_free_paid_removal_unavailable_and_clarification() -> None:
@@ -297,6 +312,12 @@ def test_modifier_semantics_cover_free_paid_removal_unavailable_and_clarificatio
     )
     assert valid_temperature["status"] == "valid"
 
+    invented_choice = knowledge.resolve_customization(
+        burger,
+        modifier_ids=["modifier.extra-cheddar:double", "modifier.side-fries"],
+    )
+    assert invented_choice["status"] == "incompatible"
+
     for duplicate in (
         {"modifier_ids": ["modifier.extra-cheddar", "modifier.extra-cheddar", "modifier.side-fries"]},
         {"removals": ["onion jam", "ONION   JAM"], "modifier_ids": ["modifier.side-fries"]},
@@ -344,14 +365,25 @@ async def test_alcohol_menu_data_cannot_enter_order_mutation(
 ) -> None:
     item = get_restaurant_knowledge().find_menu_item("Harbor House Lager").item
 
-    async def alcohol_match(item_name: str) -> dict:
+    async def alcohol_match(item_name: str, **kwargs: object) -> dict:
         return {
             "match": {**item, "id": 91, "available": True},
             "needs_confirmation": False,
             "candidates": [],
         }
 
+    class Connection:
+        async def fetchrow(self, *args: object):
+            return None
+
+        async def fetchval(self, *args: object):
+            return 0
+
+    async def execute_operation(*, operation, **kwargs):
+        return await operation(Connection()), False
+
     monkeypatch.setattr(restaurant_service, "find_menu_item", alcohol_match)
+    monkeypatch.setattr(restaurant_service, "_idempotent_write", execute_operation)
     with pytest.raises(RestaurantServiceError) as exc:
         await restaurant_service.add_order_item(
             call_id="alcohol-read-only",
@@ -459,6 +491,66 @@ def test_safe_humor_is_suppressed_for_configured_contexts(
         TurnObservation(text=f"Are the fries famous? This is about {unsafe_context}"),
     )
     assert result.directive.direct_reply is None
+
+
+@pytest.mark.parametrize(
+    "high_risk_phrase",
+    [
+        "They gave me food poisoning",
+        "I'm allergic to sesame",
+        "I'm complaining about an injury",
+    ],
+)
+def test_canonical_risk_aliases_and_inflections_precede_humor(
+    high_risk_phrase: str,
+) -> None:
+    result = reduce_behavior(
+        None,
+        TurnObservation(text=f"Are the fries famous? {high_risk_phrase}."),
+    )
+    assert "loyal following" not in (result.directive.direct_reply or "").casefold()
+
+
+@pytest.mark.asyncio
+async def test_menu_adapters_preserve_service_period_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = {
+        "name": "Market Greens",
+        "category": "salads",
+        "description": "Field greens.",
+        "price": 13.0,
+        "price_estimated": False,
+        "dietary": ["vegan"],
+        "aliases": ["house salad"],
+        "ingredients": ["field greens"],
+        "allergens": [],
+        "available": False,
+        "availability": "available",
+        "effective_status": "current",
+        "service_status": "unavailable",
+        "service_message": "The item is not available in the current service period.",
+        "cross_contact": "Shared-kitchen cross-contact is possible.",
+    }
+
+    async def fake_find(_item_name: str):
+        return {"match": item, "status": "known", "candidates": []}
+
+    async def fake_menu(*, available_only: bool = True):
+        assert available_only is False
+        return {"items": [item], "allergen_notice": item["cross_contact"]}
+
+    monkeypatch.setattr(restaurant_service, "find_menu_item", fake_find)
+    availability = await check_menu_item_availability.ainvoke(
+        {"item_name": "Market Greens"}
+    )
+    assert "current service period" in availability.casefold()
+    assert "sold out" not in availability.casefold()
+
+    monkeypatch.setattr(restaurant_service, "list_menu", fake_menu)
+    search = await search_menu.ainvoke({"query": "Market Greens"})
+    assert "current service period" in search.casefold()
+    assert "not currently effective" not in search.casefold()
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from app.call_memory import (
     set_active_booking,
     update_reservation_draft as save_reservation_draft,
 )
+from app.caller_turn import process_caller_turn
 from app.config import settings
 from app.call_analytics import record_call_event
 from app.pending_confirmation import (
@@ -49,6 +50,10 @@ ToolAuth = Security(require_voice_tool_secret)
 
 class CallRequest(BaseModel):
     call_id: str = Field(min_length=1, max_length=200)
+
+
+class CallerTurnRequest(CallRequest):
+    utterance: str = Field(min_length=1, max_length=1000)
 
 
 class AvailabilityRequest(BaseModel):
@@ -219,6 +224,12 @@ async def voice_tool_health() -> dict[str, Any]:
         "writes_enabled": settings.voice_live_writes_enabled,
         "restaurant": settings.restaurant_name,
     }
+
+
+@router.post("/caller-turn", dependencies=[ToolAuth])
+async def caller_turn(body: CallerTurnRequest) -> dict[str, Any]:
+    """Advance trusted turn state and apply any server-owned reversal."""
+    return _ok(await process_caller_turn(body.call_id, body.utterance))
 
 
 @router.post("/availability", dependencies=[ToolAuth])

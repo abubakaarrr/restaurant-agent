@@ -166,6 +166,8 @@ def preferred_location(draft: dict[str, Any] | str) -> str:
         return "patio"
     if "private" in lowered:
         return "private"
+    if "bar" in lowered or "high top" in lowered or "high-top" in lowered:
+        return "bar"
     if "indoor" in lowered or "main" in lowered:
         return "main"
     return ""
@@ -180,6 +182,8 @@ def normalize_preferred_location(value: str) -> str:
         return "patio"
     if "private" in text:
         return "private"
+    if "bar" in text or "high top" in text or "high-top" in text:
+        return "bar"
     if text in {"indoor", "inside", "main", "dining", "dining room"}:
         return "main"
     return text

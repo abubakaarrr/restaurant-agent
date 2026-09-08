@@ -61,6 +61,10 @@ async def search_menu(query: str, session_id: str = "") -> str:
             return "sold out"
         if status == "not_yet_available":
             return "not yet available"
+        if item.get("effective_status") in {"expired", "future"}:
+            return "not currently effective"
+        if item.get("service_status") != "available":
+            return str(item.get("service_message") or "unavailable").rstrip(".")
         return "not currently effective"
 
     lines = [

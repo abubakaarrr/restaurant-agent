@@ -92,8 +92,11 @@ async def test_transfer_uses_only_server_configured_number(
     monkeypatch.setattr(
         handler,
         "consume_call_control",
-        lambda call_id: CallControl("transfer", "human_requested"),
+        lambda call_id: CallControl(
+            "transfer", "human_requested", "+14155550123"
+        ),
     )
+    monkeypatch.setattr(handler, "current_staff_transfer_number", lambda: "")
     monkeypatch.setattr(settings, "staff_transfer_number", "+14155550123")
     websocket = FakeWebSocket(
         [

@@ -92,6 +92,13 @@
     },
     "tool_endpoint_placeholders": [
       {
+        "name": "process_caller_turn",
+        "method": "POST",
+        "url": "https://<PILOT_API_HOST>/api/voice-tools/caller-turn",
+        "authentication_header": "X-Voice-Tool-Secret: <SERVER_SIDE_SECRET_REFERENCE>",
+        "required_before_each_caller_turn": true
+      },
+      {
         "name": "get_menu",
         "method": "GET",
         "url": "https://<PILOT_API_HOST>/api/voice-tools/menu",

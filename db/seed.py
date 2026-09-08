@@ -54,6 +54,11 @@ TABLES = [
     (12, 6, "patio"),
     (13, 8, "patio"),
     (14, 10, "patio"),
+    # four reservable high-top tables; the two bar-counter seats are walk-in only
+    (15, 4, "bar"),
+    (16, 4, "bar"),
+    (17, 4, "bar"),
+    (18, 4, "bar"),
 ]
 
 
@@ -106,25 +111,25 @@ async def seed(conn: asyncpg.Connection, *, with_embeddings: bool = False) -> No
     print(f"  -> {len(TABLES)} tables seeded.")
 
     print("Seeding menu items...")
-    live_names = [item["name"].casefold() for item in MENU_ITEMS]
+    live_canonical_ids = [item["item_id"] for item in MENU_ITEMS]
     await conn.execute(
         """
         DELETE FROM menu_items
-        WHERE NOT (LOWER(name) = ANY($1::text[]))
+        WHERE (canonical_id IS NULL OR NOT (canonical_id = ANY($1::text[])))
           AND id NOT IN (
               SELECT DISTINCT menu_item_id FROM order_items
               WHERE menu_item_id IS NOT NULL
           )
         """,
-        live_names,
+        live_canonical_ids,
     )
     await conn.execute(
         """
         UPDATE menu_items
         SET available = FALSE
-        WHERE NOT (LOWER(name) = ANY($1::text[]))
+        WHERE (canonical_id IS NULL OR NOT (canonical_id = ANY($1::text[])))
         """,
-        live_names,
+        live_canonical_ids,
     )
     for item in MENU_ITEMS:
         metadata = {
@@ -157,7 +162,8 @@ async def seed(conn: asyncpg.Connection, *, with_embeddings: bool = False) -> No
                  source_id, data_version, effective_from, effective_to)
             VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9, $10,
                     $11, $12, $13::jsonb, $14, $15, $16::date, $17::date)
-            ON CONFLICT ((LOWER(name))) DO UPDATE SET
+            ON CONFLICT (canonical_id) WHERE canonical_id IS NOT NULL DO UPDATE SET
+                name = EXCLUDED.name,
                 category = EXCLUDED.category,
                 price = EXCLUDED.price,
                 description = EXCLUDED.description,

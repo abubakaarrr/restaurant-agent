@@ -145,7 +145,10 @@ def search_faq_rows(
                 or normalized_faq in normalized_query
             )
         )
-        if not phrase_match and len(overlap) < 2:
+        query_coverage = len(overlap) / len(query_tokens)
+        if not phrase_match and not (
+            len(overlap) >= 2 and query_coverage >= 0.75
+        ):
             continue
         points = len(overlap) + (100 if phrase_match else 0)
         scored.append(

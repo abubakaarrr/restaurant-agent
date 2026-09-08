@@ -27,6 +27,7 @@ HandoffReason = Literal[
 class CallControl:
     action: Literal["end", "transfer"]
     reason: str = ""
+    transfer_number: str = ""
 
 
 _control_flags: dict[str, CallControl] = {}
@@ -38,10 +39,19 @@ def request_end_call(session_id: str) -> None:
         _control_flags[session_id] = CallControl(action="end")
 
 
-def request_transfer(session_id: str, reason: HandoffReason) -> None:
-    """Request transfer to the server-configured number, never a model value."""
-    if session_id:
-        _control_flags[session_id] = CallControl(action="transfer", reason=reason)
+def request_transfer(
+    session_id: str,
+    reason: HandoffReason,
+    transfer_number: str,
+) -> None:
+    """Carry one already-resolved server destination to the transport boundary."""
+    destination = str(transfer_number or "").strip()
+    if session_id and destination:
+        _control_flags[session_id] = CallControl(
+            action="transfer",
+            reason=reason,
+            transfer_number=destination,
+        )
 
 
 def consume_call_control(session_id: str) -> CallControl | None:

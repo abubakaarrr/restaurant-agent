@@ -223,7 +223,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             final_content = ""
             no_interruption = False
             if control and control.action == "transfer":
-                transfer_number = current_staff_transfer_number()
+                transfer_number = control.transfer_number
                 if transfer_number:
                     no_interruption = True
                 else:

@@ -71,7 +71,7 @@
   },
   "dining_areas": [
     {"area_id": "area.main", "name": "Main dining room", "capacity": 58, "max_phone_party": 10, "features": ["accessible tables", "window-table requests", "quiet-area requests"], "preference_only": ["window", "quiet area"], "table_combination": "Tables may be combined for parties of 7-10 when inventory permits; never guaranteed."},
-    {"area_id": "area.bar", "name": "Bar seating", "capacity": 18, "max_phone_party": 4, "features": ["bar stools", "four high-top tables"], "age_rule": "Guests under 21 may dine at high-tops but not sit at the bar counter."},
+    {"area_id": "area.bar", "name": "Bar seating", "capacity": 18, "reservable_capacity": 16, "walk_in_capacity": 2, "max_phone_party": 4, "features": ["two walk-in bar stools", "four reservable high-top tables"], "age_rule": "Guests under 21 may dine at high-tops but not sit at the bar counter."},
     {"area_id": "area.patio", "name": "Patio", "capacity": 30, "max_phone_party": 10, "features": ["step-free route", "eight heated seats", "service animals"], "weather_rule": "Patio service may close for lightning, unsafe wind, wildfire smoke, or temperatures below 45 F. Patio requests are not guarantees."},
     {"area_id": "area.private", "name": "Hearth Room", "capacity": 24, "seated_capacity": 24, "standing_capacity": 32, "max_phone_party": 10, "features": ["door", "display screen", "accessible table layout"], "booking_rule": "Parties of 11-24 require the events route and a signed event agreement."}
   ],

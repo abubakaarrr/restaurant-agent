@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from app.agent.runner import _extract_reply, clear_session, run_agent
+from app.agent.runner import _extract_reply, clear_session, run_agent, stream_agent_tokens
 from app.call_flags import consume_end_call
 from app.reply_guard import is_repeated_reply
 
@@ -145,6 +145,37 @@ def test_yes_after_time_change_is_not_treated_as_harmless_ack_for_repeat_gate() 
 @pytest.mark.asyncio
 async def test_cancellation_repair_never_uses_generic_repeat_fallback() -> None:
     session_id = "cancel-repair-direct"
+    clear_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_streaming_turn_applies_cancellation_reversal_before_model() -> None:
+    session_id = "cancel-repair-stream"
+    clear_session(session_id)
+    model = AsyncMock()
+    caller_turn = AsyncMock(
+        return_value={
+            "handled": True,
+            "kind": "cancellation_reversal",
+            "message": "I stopped the pending cancellation. Your reservation remains confirmed.",
+        }
+    )
+    with (
+        patch("app.agent.runner.restaurant_agent", new=model),
+        patch("app.agent.runner.process_caller_turn", new=caller_turn),
+    ):
+        reply = "".join(
+            [
+                token
+                async for token in stream_agent_tokens(
+                    session_id,
+                    "Don't cancel it.",
+                )
+            ]
+        )
+    assert "stopped the pending cancellation" in reply.casefold()
+    caller_turn.assert_awaited_once_with(session_id, "Don't cancel it.")
+    model.astream_events.assert_not_called()
     clear_session(session_id)
     model = AsyncMock()
     with patch("app.agent.runner.restaurant_agent.ainvoke", new=model):

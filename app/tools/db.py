@@ -625,8 +625,21 @@ async def check_menu_item_availability(item_name: str) -> str:
         return _error_text(error)
     if result["match"]:
         item = result["match"]
+        if item["available"]:
+            availability = "available"
+        elif item.get("availability") == "sold_out":
+            availability = "sold out"
+        elif item.get("availability") == "not_yet_available":
+            availability = "not yet available"
+        elif item.get("effective_status") in {"expired", "future"}:
+            availability = "not currently effective"
+        elif item.get("service_status") != "available":
+            message = str(item.get("service_message") or "unavailable").rstrip(".")
+            return f"{item['name']}: {message} Price: {format_menu_price(item)}."
+        else:
+            availability = "not currently effective"
         return (
-            f"{item['name']} is {'available' if item['available'] else 'sold out'} "
+            f"{item['name']} is {availability} "
             f"at {format_menu_price(item)}."
         )
     if result["candidates"]:
@@ -941,7 +954,7 @@ async def request_handoff(session_id: str, reason: HandoffReason, topic: str = "
             "connecting them or promise a transfer. Offer to take a callback number "
             "or message with consent, and keep handling self-service requests directly."
         )
-    request_transfer(session_id, reason)
+    request_transfer(session_id, reason, str(destination["transfer_number"]))
     return "Staff transfer requested. Tell the caller you are connecting them now."
 
 

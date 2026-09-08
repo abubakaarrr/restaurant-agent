@@ -10,13 +10,12 @@ from collections.abc import AsyncIterator
 from app.agent.graph import restaurant_agent
 from app.call_memory import (
     clear_call_memory,
-    hydrate_call_memory,
     reset_current_action_scope,
     reset_current_session_id,
     set_current_action_scope,
     set_current_session_id,
 )
-from app.pending_confirmation import begin_caller_turn
+from app.caller_turn import process_caller_turn
 from app.turn_evidence import audit_assistant_speech, begin_turn, end_turn
 from app.reply_guard import is_clerk_inventory, is_repeated_reply
 from app.restaurant_settings import load_restaurant_settings
@@ -27,17 +26,6 @@ logger = logging.getLogger(__name__)
 
 _sessions: dict[str, list[dict]] = {}
 
-_CANCELLATION_INQUIRY_REVERSAL_RE = re.compile(
-    r"^\s*(?:"
-    r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
-    r"(?:please\s+)?(?:do\s+not|don't)\s+cancel"
-    r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation))?"
-    r"(?:[,;:]?\s+(?:please|i\s+was\s+just\s+(?:checking|asking)))?"
-    r"|(?:actually[,;:]?\s+)?no[.,;:]?\s+(?:do\s+not|don't)\s+cancel\s+it\s+yet[.!]?\s+"
-    r"i\s+was\s+just\s+checking\s+(?:what\s+)?the\s+cancellation\s+(?:process|policy)\s+is"
-    r")[.!?]*\s*$",
-    re.IGNORECASE,
-)
 _FAREWELL_RE = re.compile(
     r"^\s*(?:(?:thanks?|thank\s+you)(?:\s+you)?[,\s]*)?"
     r"(?:bye|goodbye|see\s+you)(?:\s+(?:now|then))?[\s.!?]*$",
@@ -161,22 +149,8 @@ def _action_scope(session_id: str, history_length: int, user_message: str) -> st
     return f"{session_id}:{history_length}:{digest}"
 
 
-async def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
-    """Handle narrow non-mutating reversals and terminal farewells locally."""
-    if _CANCELLATION_INQUIRY_REVERSAL_RE.search(user_message):
-        from app.services.restaurant import restaurant_service
-
-        try:
-            result = await restaurant_service.reverse_pending_cancellation(session_id)
-        except Exception:
-            logger.warning(
-                "Unable to verify cancellation reversal session=%s", session_id, exc_info=True
-            )
-            return (
-                "I couldn't verify the reservation or cancellation state right now. "
-                "I have not submitted a cancellation."
-            )
-        return str(result["message"])
+def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
+    """Handle terminal farewells locally."""
     if _FAREWELL_RE.fullmatch(user_message):
         request_end_call(session_id)
         return "You're welcome. Goodbye!"
@@ -185,9 +159,6 @@ async def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
 
 async def run_agent(session_id: str, user_message: str, caller_phone: str = "") -> str:
     """Run one agent turn and return the full text reply."""
-    await hydrate_call_memory(session_id)
-    # Server-owned affirmation fact — tools must not invent caller_confirmed.
-    begin_caller_turn(session_id, user_message)
     history = seed_opening_history(list(_sessions.get(session_id, [])))
     history.append({"role": "user", "content": user_message})
     previous_reply = ""
@@ -213,7 +184,12 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
         _history_digest(history),
     )
     try:
-        direct_reply = await _direct_safe_reply(session_id, user_message)
+        caller_turn = await process_caller_turn(session_id, user_message)
+        direct_reply = (
+            str(caller_turn.get("message") or "")
+            if caller_turn.get("handled")
+            else _direct_safe_reply(session_id, user_message)
+        )
         if direct_reply is not None:
             audit_assistant_speech(direct_reply)
             history.append({"role": "assistant", "content": direct_reply})
@@ -321,9 +297,6 @@ async def stream_agent_tokens(
     start generation so that a CancelledError mid-stream never erases it from
     conversation history.  The assistant reply is appended only on success.
     """
-    await hydrate_call_memory(session_id)
-    # Server-owned affirmation fact — tools must not invent caller_confirmed.
-    begin_caller_turn(session_id, user_message)
     history = seed_opening_history(list(_sessions.get(session_id, [])))
     history.append({"role": "user", "content": user_message})
     # Persist the user turn immediately — if this coroutine is cancelled
@@ -350,6 +323,16 @@ async def stream_agent_tokens(
     action_token = set_current_action_scope(scope)
     begin_turn(session_id, scope)
     try:
+        caller_turn = await process_caller_turn(session_id, user_message)
+        if caller_turn.get("handled"):
+            reply = str(caller_turn.get("message") or "")
+            audit_assistant_speech(reply)
+            current = list(_sessions.get(session_id, []))
+            current.append({"role": "assistant", "content": reply})
+            _sessions[session_id] = current[-40:]
+            end_turn()
+            yield reply
+            return
         async for event in restaurant_agent.astream_events(
             input_state,
             config=config,

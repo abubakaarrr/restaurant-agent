@@ -59,6 +59,34 @@ def test_availability_returns_typed_envelope(
     assert response.json()["result"]["available"] is True
 
 
+def test_managed_caller_turn_uses_shared_reversal_boundary(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    async def fake_process(call_id: str, utterance: str):
+        captured.update(call_id=call_id, utterance=utterance)
+        return {
+            "handled": True,
+            "kind": "cancellation_reversal",
+            "message": "Cancellation stopped.",
+        }
+
+    monkeypatch.setattr(tool_api, "process_caller_turn", fake_process)
+    response = client.post(
+        "/api/voice-tools/caller-turn",
+        headers={"X-Voice-Tool-Secret": "test-tool-secret"},
+        json={"call_id": "managed-call-1", "utterance": "Don't cancel it."},
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["kind"] == "cancellation_reversal"
+    assert captured == {
+        "call_id": "managed-call-1",
+        "utterance": "Don't cancel it.",
+    }
+
+
 def test_write_forwards_idempotency_key(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

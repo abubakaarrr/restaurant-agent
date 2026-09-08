@@ -24,6 +24,7 @@ def test_any_location_does_not_keep_patio() -> None:
     assert normalize_preferred_location("patio") == "patio"
     assert normalize_preferred_location("outdoor") == "patio"
     assert normalize_preferred_location("indoor") == "main"
+    assert normalize_preferred_location("a high-top by the bar") == "bar"
 
 
 def test_impossible_availability_is_explicit() -> None:
