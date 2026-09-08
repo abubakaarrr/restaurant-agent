@@ -785,6 +785,7 @@ async def test_pickup_items_use_one_persisted_fulfillment_time(
     assert confirmed["fulfillment_details"]["fulfillment_at"] == (
         "2026-09-08T17:15:00-07:00"
     )
+    assert confirmed["timing"] == "ready for pickup in about 20 minutes"
 
 
 async def test_existing_pickup_time_wins_over_active_booking(
@@ -945,6 +946,111 @@ async def test_confirmed_delivery_total_uses_persisted_fee(
     assert restarted["total"] == confirmed["total"]
 
 
+async def test_booking_creation_does_not_rewrite_confirmed_delivery() -> None:
+    call_id = "confirmed-delivery-before-booking"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        order_id = await connection.fetchval(
+            """
+            INSERT INTO orders
+                (session_id, customer_name, customer_phone, status, total_amount,
+                 fulfillment_type, fulfillment_details)
+            VALUES ($1, 'Morgan', '+15035550101', 'confirmed', 25,
+                    'delivery', $2::jsonb)
+            RETURNING id
+            """,
+            call_id,
+            json.dumps(
+                {
+                    "address": "101 Test Avenue, Portland, OR 97205",
+                    "delivery_fee": 5,
+                    "fulfillment_at": "2026-09-08T18:45:00-07:00",
+                    "zone_status": "eligible",
+                }
+            ),
+        )
+    finally:
+        await connection.close()
+
+    booking_date = _future_date()
+    confirmation = booking_confirmation_payload(
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+        date=booking_date,
+        time="19:00",
+        party_size=2,
+        notes="",
+    )
+    _arm(call_id, ACTION_CREATE_BOOKING, confirmation)
+    booked = await restaurant_service.create_booking(
+        call_id=call_id,
+        idempotency_key="confirmed-delivery-booking-create",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+        date=booking_date,
+        time="19:00",
+        party_size=2,
+        notes="",
+        confirmed=True,
+    )
+    assert booked["created"] is True
+    assert "order" not in booked
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        order = await connection.fetchrow(
+            """
+            SELECT booking_id, fulfillment_type, fulfillment_details
+            FROM orders WHERE id = $1
+            """,
+            order_id,
+        )
+    finally:
+        await connection.close()
+    assert order["booking_id"] is None
+    assert order["fulfillment_type"] == "delivery"
+    assert dict(order["fulfillment_details"])["delivery_fee"] == 5
+
+
+async def test_confirmed_pickup_change_requires_staff_status_check() -> None:
+    call_id = "confirmed-pickup-change"
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="confirmed-pickup-add",
+        item_name="Market Greens",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    summary = await restaurant_service.get_order_summary(call_id=call_id)
+    begin_caller_turn(call_id, "yes")
+    await restaurant_service.confirm_order(
+        call_id=call_id,
+        idempotency_key="confirmed-pickup-confirm",
+        expected_draft_version=summary["draft_version"],
+        approved=True,
+    )
+
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.update_order_item(
+            call_id=call_id,
+            idempotency_key="confirmed-pickup-update",
+            order_item_id=added["order_item_id"],
+            quantity=2,
+            caller_confirmed=True,
+        )
+    assert exc.value.code == "confirmed_fulfillment_change_requires_staff"
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        quantity = await connection.fetchval(
+            "SELECT quantity FROM order_items WHERE id = $1",
+            added["order_item_id"],
+        )
+    finally:
+        await connection.close()
+    assert quantity == 1
+
+
 async def test_dine_in_menu_period_uses_booking_time_and_rechecks_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1073,3 +1179,78 @@ async def test_booking_time_change_rejects_invalid_confirmed_dine_in_order_perio
         ) == datetime(2026, 9, 12, 19, 0)
     finally:
         await connection.close()
+
+
+async def test_booking_time_change_rejects_expired_seasonal_order() -> None:
+    call_id = "seasonal-order-booking-reschedule"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        menu_item = await connection.fetchrow(
+            "SELECT id, name, price FROM menu_items WHERE canonical_id = $1",
+            "menu.seasonal.corn-ravioli",
+        )
+        booking_id = await connection.fetchval(
+            """
+            INSERT INTO bookings
+                (customer_name, customer_phone, table_id, booked_at, party_size)
+            VALUES ('Morgan', '+15035550101', 1, '2026-09-30 19:00', 2)
+            RETURNING id
+            """
+        )
+        order_id = await connection.fetchval(
+            """
+            INSERT INTO orders
+                (session_id, booking_id, customer_name, customer_phone,
+                 status, fulfillment_type)
+            VALUES ($1, $2, 'Morgan', '+15035550101', 'confirmed', 'dine_in')
+            RETURNING id
+            """,
+            call_id,
+            booking_id,
+        )
+        await connection.execute(
+            """
+            INSERT INTO order_items
+                (order_id, menu_item_id, item_name, quantity, unit_price)
+            VALUES ($1, $2, $3, 1, $4)
+            """,
+            order_id,
+            menu_item["id"],
+            menu_item["name"],
+            menu_item["price"],
+        )
+        await connection.execute(
+            "INSERT INTO call_sessions (session_id, state) VALUES ($1, $2::jsonb)",
+            call_id,
+            json.dumps({"booking_id": booking_id}),
+        )
+    finally:
+        await connection.close()
+
+    await restaurant_service.update_confirmed_booking(
+        call_id=call_id,
+        idempotency_key="seasonal-reschedule-pending",
+        booking_id=booking_id,
+        confirmed=False,
+        date="2026-10-01",
+    )
+    begin_caller_turn(call_id, "yes")
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.update_confirmed_booking(
+            call_id=call_id,
+            idempotency_key="seasonal-reschedule-confirmed",
+            booking_id=booking_id,
+            confirmed=True,
+            date="2026-10-01",
+        )
+    assert exc.value.code == "menu_item_unavailable"
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        booked_at = await connection.fetchval(
+            "SELECT booked_at FROM bookings WHERE id = $1",
+            booking_id,
+        )
+    finally:
+        await connection.close()
+    assert booked_at == datetime(2026, 9, 30, 19, 0)

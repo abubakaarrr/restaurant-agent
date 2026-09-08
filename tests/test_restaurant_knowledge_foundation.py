@@ -486,6 +486,16 @@ def test_conversation_inputs_execute_behavior_interface(
     assert all(phrase in observable for phrase in expected_phrases)
 
 
+def test_personal_identity_reply_does_not_use_a_parallel_agent_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "ai_agent_name", "Avery Rose")
+    result = reduce_behavior(None, TurnObservation(text="Are you a real person?"))
+    reply = result.directive.direct_reply or ""
+    assert "virtual host" in reply.casefold()
+    assert "Avery" not in reply
+
+
 @pytest.mark.parametrize(
     "unsafe_context",
     [
@@ -550,13 +560,26 @@ async def test_menu_adapters_preserve_service_period_unavailability(
         "service_message": "The item is not available in the current service period.",
         "cross_contact": "Shared-kitchen cross-contact is possible.",
     }
+    future_item = {
+        **item,
+        "name": "Winter Squash Risotto",
+        "category": "seasonal",
+        "aliases": ["risotto"],
+        "effective_status": "future",
+        "effective_from": "2026-10-15",
+        "service_status": "available",
+        "service_message": "",
+    }
 
     async def fake_find(_item_name: str):
         return {"match": item, "status": "known", "candidates": []}
 
     async def fake_menu(*, available_only: bool = True):
         assert available_only is False
-        return {"items": [item], "allergen_notice": item["cross_contact"]}
+        return {
+            "items": [item, future_item],
+            "allergen_notice": item["cross_contact"],
+        }
 
     monkeypatch.setattr(restaurant_service, "find_menu_item", fake_find)
     availability = await check_menu_item_availability.ainvoke(
@@ -571,6 +594,9 @@ async def test_menu_adapters_preserve_service_period_unavailability(
     assert "not currently effective" not in search.casefold()
     full_menu = await get_full_menu.ainvoke({})
     assert "Market Greens" in full_menu
+    assert "current service period" in full_menu
+    assert "Winter Squash Risotto" in full_menu
+    assert "available from 2026-10-15" in full_menu
 
 
 @pytest.mark.asyncio

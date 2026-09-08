@@ -606,8 +606,24 @@ async def get_full_menu() -> str:
         return _error_text(error)
     grouped: dict[str, list[str]] = {}
     for item in result["items"]:
+        if item.get("effective_status") == "future":
+            availability = f"available from {item.get('effective_from')}"
+        elif item.get("effective_status") == "expired":
+            availability = f"no longer available after {item.get('effective_to')}"
+        elif item.get("availability") != "available":
+            availability = str(
+                item.get("availability_note")
+                or item.get("availability", "unavailable").replace("_", " ")
+            )
+        elif item.get("service_status") != "available":
+            availability = str(
+                item.get("service_message")
+                or "not available during the current service period"
+            )
+        else:
+            availability = "available now"
         grouped.setdefault(item["category"], []).append(
-            f"{item['name']} {format_menu_price(item)}"
+            f"{item['name']} {format_menu_price(item)} ({availability})"
         )
     sections = [
         f"{category.title()}: " + ", ".join(items)
@@ -664,7 +680,7 @@ async def add_order_item(
     customer_phone: str = "",
     caller_confirmed: bool = False,
 ) -> str:
-    """Add an exact, caller-approved menu item. For a new draft this is enough. If the order is already confirmed, set caller_confirmed=true after they name the item. Do not call this when the caller is only asking."""
+    """Add an exact, caller-approved menu item. For a new draft this is enough. A confirmed pickup or delivery requires staff to verify preparation status and cannot be changed here. Do not call this when the caller is only asking."""
     session_id = resolve_session_id(session_id)
     memory = get_call_memory(session_id)
     booking_id = booking_id or int(memory.get("booking_id") or 0)
@@ -771,7 +787,7 @@ async def set_order_notes(
     allergy_notes: str | None = None,
     caller_confirmed: bool = False,
 ) -> str:
-    """Set or clear order-level instructions/allergy notes. These are distinct from an individual item's notes and appear in every full readback."""
+    """Set or clear order-level instructions/allergy notes. These are distinct from an individual item's notes and appear in every full readback. A confirmed pickup or delivery requires staff to verify preparation status and cannot be changed here."""
     session_id = resolve_session_id(session_id)
     try:
         result = await restaurant_service.set_order_notes(
@@ -824,7 +840,7 @@ async def update_order_item(
     notes: str | None = None,
     caller_confirmed: bool = False,
 ) -> str:
-    """Correct an item quantity or notes. Omit notes to preserve them; pass an empty string to clear them. If the order is already confirmed, set caller_confirmed=true after an explicit yes."""
+    """Correct an item quantity or notes. Omit notes to preserve them; pass an empty string to clear them. A confirmed pickup or delivery requires staff to verify preparation status and cannot be changed here."""
     session_id = resolve_session_id(session_id)
     try:
         result = await restaurant_service.update_order_item(
@@ -858,7 +874,7 @@ async def remove_order_item(
     order_item_id: int,
     caller_confirmed: bool = False,
 ) -> str:
-    """Remove a caller-selected item. If the order is already confirmed, set caller_confirmed=true after an explicit yes."""
+    """Remove a caller-selected item. A confirmed pickup or delivery requires staff to verify preparation status and cannot be changed here."""
     session_id = resolve_session_id(session_id)
     try:
         result = await restaurant_service.remove_order_item(

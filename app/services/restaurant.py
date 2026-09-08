@@ -237,6 +237,43 @@ def _future_fulfillment_at(
     return service_at
 
 
+def _ensure_order_item_available_at(
+    item: Mapping[str, Any],
+    service_at: datetime,
+    *,
+    context: str,
+) -> None:
+    effective_from = item.get("effective_from")
+    effective_to = item.get("effective_to")
+    service_date = service_at.date()
+    if (
+        not item.get("inventory_available")
+        or item.get("availability_status") != "available"
+        or (
+            effective_from
+            and service_date < datetime.fromisoformat(str(effective_from)).date()
+        )
+        or (
+            effective_to
+            and service_date > datetime.fromisoformat(str(effective_to)).date()
+        )
+    ):
+        raise RestaurantServiceError(
+            f"{item['item_name']} is not available for {context}.",
+            code="menu_item_unavailable",
+            status=409,
+        )
+    service_status = get_restaurant_knowledge().menu_service_status(
+        item.get("service_periods") or [], service_at
+    )
+    if not service_status["available"]:
+        raise RestaurantServiceError(
+            f"{item['item_name']} is not available during {context}.",
+            code="service_period_unavailable",
+            status=409,
+        )
+
+
 class RestaurantService:
     """Database-backed, provider-neutral restaurant operations."""
 
@@ -1005,7 +1042,8 @@ class RestaurantService:
                     fulfillment_type = 'dine_in'
                 WHERE session_id = $2
                   AND booking_id IS NULL
-                  AND status IN ('pending', 'confirmed')
+                  AND status = 'pending'
+                  AND COALESCE(fulfillment_type, 'dine_in') = 'dine_in'
                 """,
                 row["id"],
                 call_id,
@@ -1014,11 +1052,11 @@ class RestaurantService:
             order_row = await conn.fetchrow(
                 """
                 SELECT id FROM orders
-                WHERE session_id = $1 AND status IN ('pending', 'confirmed')
+                WHERE booking_id = $1 AND status IN ('pending', 'confirmed')
                 ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
                 LIMIT 1
                 """,
-                call_id,
+                row["id"],
             )
             if order_row:
                 attached_order = await self._order_summary_with_conn(conn, order_row["id"])
@@ -1244,7 +1282,10 @@ class RestaurantService:
                 if slot_changed:
                     attached_items = await conn.fetch(
                         """
-                        SELECT oi.item_name, mi.service_periods
+                        SELECT oi.item_name, mi.service_periods,
+                               mi.available AS inventory_available,
+                               mi.availability_status,
+                               mi.effective_from, mi.effective_to
                         FROM orders o
                         JOIN order_items oi ON oi.order_id = o.id
                         LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
@@ -1255,19 +1296,12 @@ class RestaurantService:
                         """,
                         booking_id,
                     )
-                    knowledge = get_restaurant_knowledge()
                     for attached_item in attached_items:
-                        service_status = knowledge.menu_service_status(
-                            attached_item["service_periods"] or [], proposed_at
+                        _ensure_order_item_available_at(
+                            attached_item,
+                            proposed_at,
+                            context="the proposed reservation time",
                         )
-                        if not service_status["available"]:
-                            raise RestaurantServiceError(
-                                f"{attached_item['item_name']} is not available during "
-                                "the proposed reservation service period. The booking "
-                                "was not changed.",
-                                code="service_period_unavailable",
-                                status=409,
-                            )
                 tables = await self.get_available_tables(
                     new_date,
                     new_time,
@@ -2310,7 +2344,8 @@ class RestaurantService:
             order = await conn.fetchrow(
                 """
                 SELECT o.id, o.booking_id, o.customer_name, o.customer_phone,
-                       o.draft_version, o.status, TRUE AS existing
+                       o.draft_version, o.status, o.fulfillment_type,
+                       TRUE AS existing
                 FROM order_items oi
                 JOIN orders o ON o.id = oi.order_id
                 WHERE oi.id = $1
@@ -2325,7 +2360,7 @@ class RestaurantService:
             order = await conn.fetchrow(
                 """
                 SELECT id, booking_id, customer_name, customer_phone,
-                       draft_version, status, TRUE AS existing
+                       draft_version, status, fulfillment_type, TRUE AS existing
                 FROM orders
                 WHERE session_id = $1
                   AND status IN ('pending', 'confirmed')
@@ -2339,7 +2374,7 @@ class RestaurantService:
             order = await conn.fetchrow(
                 """
                 SELECT id, booking_id, customer_name, customer_phone,
-                       draft_version, status, TRUE AS existing
+                       draft_version, status, fulfillment_type, TRUE AS existing
                 FROM orders
                 WHERE booking_id = $1
                   AND status IN ('pending', 'confirmed')
@@ -2374,6 +2409,15 @@ class RestaurantService:
                 else "No order exists for this call.",
                 code="order_item_not_found" if order_item_id else "order_not_found",
                 status=404,
+            )
+        if order["status"] == "confirmed" and order["fulfillment_type"] in {
+            "pickup",
+            "delivery",
+        }:
+            raise RestaurantServiceError(
+                "Confirmed pickup and delivery changes require staff to verify preparation status. Request staff help or take a callback message; the order was not changed.",
+                code="confirmed_fulfillment_change_requires_staff",
+                status=409,
             )
         if order["status"] == "confirmed" and caller_confirmed is not True:
             raise RestaurantServiceError(
@@ -2924,36 +2968,12 @@ class RestaurantService:
                         code="booking_required",
                         status=409,
                     )
-            service_date = service_at.date()
             for item in summary["items"]:
-                effective_from = item.get("effective_from")
-                effective_to = item.get("effective_to")
-                if (
-                    not item.get("inventory_available")
-                    or item.get("availability_status") != "available"
-                    or (
-                        effective_from
-                        and service_date < datetime.fromisoformat(effective_from).date()
-                    )
-                    or (
-                        effective_to
-                        and service_date > datetime.fromisoformat(effective_to).date()
-                    )
-                ):
-                    raise RestaurantServiceError(
-                        f"{item['item_name']} is not available for that fulfillment time.",
-                        code="menu_item_unavailable",
-                        status=409,
-                    )
-                service_status = get_restaurant_knowledge().menu_service_status(
-                    item.get("service_periods") or [], service_at
+                _ensure_order_item_available_at(
+                    item,
+                    service_at,
+                    context="that fulfillment time",
                 )
-                if not service_status["available"]:
-                    raise RestaurantServiceError(
-                        f"{item['item_name']} is not available during that service period.",
-                        code="service_period_unavailable",
-                        status=409,
-                    )
             if any(
                 item.get("item_id", "").startswith("menu.alcohol.")
                 or "alcohol" in (item.get("dietary_tags") or [])
@@ -2980,6 +3000,12 @@ class RestaurantService:
             )
             clear_pending_confirmation(call_id, ACTION_CONFIRM_ORDER)
             await self._merge_session_state(conn, call_id, pending_state_patch(call_id))
+            remaining_minutes = 0
+            if summary["fulfillment"] != "dine_in":
+                remaining_minutes = max(
+                    1,
+                    int((service_at - operation_now).total_seconds() + 59) // 60,
+                )
             return {
                 **summary,
                 "confirmed": True,
@@ -2988,9 +3014,9 @@ class RestaurantService:
                     "served at the reserved table on arrival"
                     if summary["fulfillment"] == "dine_in"
                     else (
-                        "estimated for local synthetic delivery in 45 to 60 minutes; no live courier is connected"
+                        f"estimated for local synthetic delivery in about {remaining_minutes} minutes; no live courier is connected"
                         if summary["fulfillment"] == "delivery"
-                        else "ready for pickup in about 30 minutes"
+                        else f"ready for pickup in about {remaining_minutes} minutes"
                     )
                 ),
                 "alcohol_verification": "",

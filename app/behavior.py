@@ -901,7 +901,7 @@ def _direct_reply(
         return "I'm ending the call now."
     if personal_identity:
         return (
-            f"I'm {settings.ai_agent_name}, Harbor & Hearth's virtual host. "
+            "I'm Harbor & Hearth's virtual host. "
             "I can help with a reservation, an order, or restaurant questions."
         )
     if safe_humor:
