@@ -605,6 +605,7 @@ async def test_menu_adapters_preserve_service_period_unavailability(
     search = await search_menu.ainvoke({"query": "Market Greens"})
     assert "current service period" in search.casefold()
     assert "not currently effective" not in search.casefold()
+    assert "available from 2026-10-15" in search
     full_menu = await get_full_menu.ainvoke({})
     assert "Market Greens" in full_menu
     assert "current service period" in full_menu
