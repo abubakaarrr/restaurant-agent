@@ -101,11 +101,10 @@ All routes are under `/api/voice-tools` and require
 
 Capabilities include:
 
-- versioned menu, ingredients, allergens, modifiers, and conservative item matching;
-- grounded restaurant identity, hours, policies, seating, and amenities;
+- live menu and exact item matching;
+- grounded restaurant hours/location;
 - availability, booking creation, verified lookup, and cancellation;
-- dine-in, pickup, and synthetic local-delivery draft flows with no live courier integration;
-- order draft add/update/remove, order-level notes, and complete canonical summaries;
+- order draft add/update/remove and summary;
 - explicit versioned order confirmation;
 - authenticated tool health with write-flag status.
 

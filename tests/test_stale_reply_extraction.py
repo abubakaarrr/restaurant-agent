@@ -15,11 +15,31 @@ from app.call_memory import clear_call_memory
 from app.pending_confirmation import (
     ACTION_CANCEL_BOOKING,
     cancel_booking_confirmation_payload,
+    clear_pending_confirmation,
     get_pending_confirmation,
     register_pending_confirmation,
 )
 from app.reply_guard import is_repeated_reply
 from app.services.restaurant import restaurant_service
+
+
+def _register_pending_cancellation(session_id: str) -> None:
+    clear_call_memory(session_id)
+    register_pending_confirmation(
+        session_id,
+        ACTION_CANCEL_BOOKING,
+        cancel_booking_confirmation_payload(booking_id=87),
+    )
+
+
+async def _reverse_pending_cancellation(session_id: str) -> dict:
+    clear_pending_confirmation(session_id, ACTION_CANCEL_BOOKING)
+    return {
+        "reversed": True,
+        "message": (
+            "I stopped the pending cancellation. Your reservation remains confirmed."
+        ),
+    }
 
 
 def test_extract_reply_ignores_assistant_text_before_latest_human() -> None:
@@ -185,77 +205,98 @@ async def test_streaming_turn_applies_cancellation_reversal_before_model() -> No
     assert "stopped the pending cancellation" in reply.casefold()
     caller_turn.assert_awaited_once_with(session_id, "Don't cancel it.")
     model.astream_events.assert_not_called()
-    clear_session(session_id)
+    _register_pending_cancellation(session_id)
     model = AsyncMock()
-    with patch("app.agent.runner.restaurant_agent.ainvoke", new=model):
+    reversal = AsyncMock(side_effect=_reverse_pending_cancellation)
+    with (
+        patch("app.agent.runner.restaurant_agent.ainvoke", new=model),
+        patch(
+            "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
+            new=reversal,
+        ),
+    ):
         reply = await run_agent(
             session_id,
             "Actually, no. Don't cancel it yet. I was just checking what the cancellation process is.",
         )
-    assert "no cancellation action was taken" in reply.casefold()
+    assert "stopped the pending cancellation" in reply.casefold()
     assert "repeat" not in reply.casefold()
     model.assert_not_awaited()
+    assert get_pending_confirmation(session_id, ACTION_CANCEL_BOOKING) is None
     clear_session(session_id)
 
 
 @pytest.mark.asyncio
 async def test_cancellation_reversal_with_new_request_routes_remaining_intent() -> None:
     session_id = "cancel-reversal-with-change"
-    clear_session(session_id)
+    _register_pending_cancellation(session_id)
     model = AsyncMock()
+    reversal = AsyncMock(side_effect=_reverse_pending_cancellation)
     model.ainvoke.return_value = {
         "messages": [AIMessage(content="I can check whether seven is available.")]
     }
-    with patch("app.agent.runner.restaurant_agent", new=model):
+    with (
+        patch("app.agent.runner.restaurant_agent", new=model),
+        patch(
+            "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
+            new=reversal,
+        ),
+    ):
         reply = await run_agent(
             session_id,
             "Don't cancel it; I'm checking whether I can move it to seven.",
         )
     assert "seven" in reply.casefold()
     model.ainvoke.assert_awaited_once()
+    reversal.assert_awaited_once_with(session_id)
+    assert get_pending_confirmation(session_id, ACTION_CANCEL_BOOKING) is None
     clear_session(session_id)
 
 
 @pytest.mark.asyncio
 async def test_order_cancellation_is_not_a_reservation_reversal() -> None:
+    session_id = "cancel-order-only"
+    _register_pending_cancellation(session_id)
     reversal = AsyncMock()
     with (
         patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
-        patch("app.caller_turn.begin_caller_turn", return_value=False),
         patch(
             "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
             new=reversal,
         ),
     ):
         result = await process_caller_turn(
-            "cancel-order-only",
+            session_id,
             "Don't cancel my pickup order; I need to change an item.",
         )
     assert result["handled"] is False
     assert result["kind"] == "caller_turn"
     reversal.assert_not_awaited()
+    assert get_pending_confirmation(session_id, ACTION_CANCEL_BOOKING) is not None
+    clear_call_memory(session_id)
 
 
 @pytest.mark.asyncio
 async def test_compound_reversal_accepts_yet_after_reservation_pronoun() -> None:
-    reversal = AsyncMock(
-        return_value={"reversed": True, "message": "The cancellation was stopped."}
-    )
+    session_id = "cancel-yet-compound"
+    _register_pending_cancellation(session_id)
+    reversal = AsyncMock(side_effect=_reverse_pending_cancellation)
     with (
         patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
-        patch("app.caller_turn.begin_caller_turn", return_value="negative"),
         patch(
             "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
             new=reversal,
         ),
     ):
         result = await process_caller_turn(
-            "cancel-yet-compound",
+            session_id,
             "Don't cancel it yet; I want to move it to seven.",
         )
     assert result["kind"] == "cancellation_reversal_with_remaining_intent"
     assert result["handled"] is False
-    reversal.assert_awaited_once_with("cancel-yet-compound")
+    reversal.assert_awaited_once_with(session_id)
+    assert get_pending_confirmation(session_id, ACTION_CANCEL_BOOKING) is None
+    clear_call_memory(session_id)
 
 
 @pytest.mark.asyncio
@@ -264,49 +305,53 @@ async def test_compound_reversal_accepts_yet_after_reservation_pronoun() -> None
     [
         "Actually, don't cancel it; move it to seven.",
         "No, don't cancel my booking; move it to seven.",
+        "Wait, don't cancel my booking; move it to seven.",
+        "Wait, move my booking to seven.",
     ],
 )
 async def test_compound_reversal_accepts_leading_correction(utterance: str) -> None:
-    reversal = AsyncMock(
-        return_value={"reversed": True, "message": "The cancellation was stopped."}
-    )
+    session_id = "cancel-leading-compound"
+    _register_pending_cancellation(session_id)
+    reversal = AsyncMock(side_effect=_reverse_pending_cancellation)
     with (
         patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
-        patch("app.caller_turn.begin_caller_turn", return_value="negative"),
         patch(
             "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
             new=reversal,
         ),
     ):
         result = await process_caller_turn(
-            "cancel-actually-compound",
+            session_id,
             utterance,
         )
     assert result["kind"] == "cancellation_reversal_with_remaining_intent"
     assert result["handled"] is False
-    reversal.assert_awaited_once_with("cancel-actually-compound")
+    reversal.assert_awaited_once_with(session_id)
+    assert get_pending_confirmation(session_id, ACTION_CANCEL_BOOKING) is None
+    clear_call_memory(session_id)
 
 
 @pytest.mark.asyncio
 async def test_compound_reversal_accepts_booking_object() -> None:
-    reversal = AsyncMock(
-        return_value={"reversed": True, "message": "The cancellation was stopped."}
-    )
+    session_id = "cancel-booking-compound"
+    _register_pending_cancellation(session_id)
+    reversal = AsyncMock(side_effect=_reverse_pending_cancellation)
     with (
         patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
-        patch("app.caller_turn.begin_caller_turn", return_value="negative"),
         patch(
             "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
             new=reversal,
         ),
     ):
         result = await process_caller_turn(
-            "cancel-booking-compound",
+            session_id,
             "Don't cancel my booking; move it to seven.",
         )
     assert result["kind"] == "cancellation_reversal_with_remaining_intent"
     assert result["handled"] is False
-    reversal.assert_awaited_once_with("cancel-booking-compound")
+    reversal.assert_awaited_once_with(session_id)
+    assert get_pending_confirmation(session_id, ACTION_CANCEL_BOOKING) is None
+    clear_call_memory(session_id)
 
 
 @pytest.mark.asyncio
@@ -340,11 +385,12 @@ async def test_reversal_persists_invalidation_before_booking_readback() -> None:
 
 @pytest.mark.asyncio
 async def test_failed_compound_reversal_does_not_continue_to_model() -> None:
+    session_id = "failed-reversal"
+    _register_pending_cancellation(session_id)
     reversal = AsyncMock(side_effect=RuntimeError("state unavailable"))
     invalidation = AsyncMock()
     with (
         patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
-        patch("app.caller_turn.begin_caller_turn", return_value=False),
         patch(
             "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
             new=reversal,
@@ -355,13 +401,14 @@ async def test_failed_compound_reversal_does_not_continue_to_model() -> None:
         ),
     ):
         result = await process_caller_turn(
-            "failed-reversal",
+            session_id,
             "Don't cancel it; I need to change the reservation.",
         )
     assert result["handled"] is True
     assert result["kind"] == "cancellation_reversal_unavailable"
     assert "couldn't verify" in result["message"].casefold()
-    invalidation.assert_awaited_once_with("failed-reversal")
+    invalidation.assert_awaited_once_with(session_id)
+    clear_call_memory(session_id)
 
 
 @pytest.mark.asyncio

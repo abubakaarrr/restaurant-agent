@@ -7,18 +7,30 @@ import re
 from typing import Any
 
 from app.call_memory import hydrate_call_memory, resolve_session_id
-from app.pending_confirmation import begin_caller_turn
+from app.pending_confirmation import (
+    ACTION_CANCEL_BOOKING,
+    begin_caller_turn,
+    get_pending_confirmation,
+)
 
 
 logger = logging.getLogger(__name__)
 
 _CANCELLATION_REVERSAL_RE = re.compile(
-    r"^\s*(?:(?:actually|no)[.,;:]?\s+)*"
-    r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
-    r"(?:please\s+)?(?:do\s+not|don't)\s+cancel"
-    r"(?:\s+(?:it|that|(?:the|my)\s+(?:reservation|booking))(?:\s+yet)?|(?=\s*(?:[,;:.!?]|$)))"
-    r"(?:[,;:]?\s+(?:please|i\s+was\s+just\s+(?:checking|asking)))?"
-    r"[.!?]*\s*",
+    r"\b(?:do\s+not|don't)\s+cancel"
+    r"(?:\s+(?:it|that|(?:the|my)\s+(?:reservation|booking))(?:\s+yet)?|(?=\s*(?:[,;:.!?]|$)))",
+    re.IGNORECASE,
+)
+_ORDER_CANCELLATION_RE = re.compile(
+    r"\b(?:do\s+not|don't)\s+cancel\s+"
+    r"(?:(?:the|my)\s+)?(?:pickup|delivery)(?:\s+order)?\b|"
+    r"\b(?:do\s+not|don't)\s+cancel\s+(?:(?:the|my)\s+)?order\b",
+    re.IGNORECASE,
+)
+_CANCELLATION_ONLY_TAIL_RE = re.compile(
+    r"^\s*[,;:.!?]*\s*(?:please|i\s+was\s+just\s+(?:checking|asking)"
+    r"(?:\s+(?:what\s+)?the\s+cancellation\s+(?:process|policy)\s+is)?)?"
+    r"[.!?]*\s*$",
     re.IGNORECASE,
 )
 
@@ -32,8 +44,15 @@ async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]
     sid = resolve_session_id(session_id)
     await hydrate_call_memory(sid)
     affirmation = begin_caller_turn(sid, utterance)
-    reversal_match = _CANCELLATION_REVERSAL_RE.match(utterance or "")
-    if not reversal_match:
+    text = utterance or ""
+    reversal_match = _CANCELLATION_REVERSAL_RE.search(text)
+    order_cancellation = _ORDER_CANCELLATION_RE.search(text)
+    pending_cancellation = get_pending_confirmation(sid, ACTION_CANCEL_BOOKING)
+    if (
+        affirmation != "negative"
+        or not pending_cancellation
+        or (order_cancellation and not reversal_match)
+    ):
         return {
             "handled": False,
             "kind": "caller_turn",
@@ -42,9 +61,8 @@ async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]
 
     from app.services.restaurant import restaurant_service
 
-    remaining_intent = bool(
-        re.search(r"[a-z0-9]", (utterance or "")[reversal_match.end() :], re.IGNORECASE)
-    )
+    remaining_text = text[reversal_match.end() :] if reversal_match else text
+    remaining_intent = not bool(_CANCELLATION_ONLY_TAIL_RE.fullmatch(remaining_text))
     try:
         result = await restaurant_service.reverse_pending_cancellation(sid)
     except Exception:
