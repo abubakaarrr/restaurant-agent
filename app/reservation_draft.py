@@ -110,8 +110,8 @@ def patch_draft(
                 draft[key] = int(value)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{key} must be an integer.") from exc
-            if key == "party_size" and draft[key] and not 1 <= draft[key] <= 12:
-                raise ValueError("Party size must be between 1 and 12.")
+            if key == "party_size" and draft[key] and not 1 <= draft[key] <= 24:
+                raise ValueError("Party size must be between 1 and 24.")
             if draft[key] < 0:
                 draft[key] = 0
         elif key in BOOL_FIELDS:

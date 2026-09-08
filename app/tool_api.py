@@ -54,7 +54,7 @@ class CallRequest(BaseModel):
 class AvailabilityRequest(BaseModel):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     time: str = Field(pattern=r"^\d{2}:\d{2}$")
-    party_size: int = Field(ge=1, le=12)
+    party_size: int = Field(ge=1, le=24)
     preferred_location: str = Field(default="", max_length=40)
     call_id: str = Field(default="", max_length=200)
 
@@ -148,7 +148,7 @@ class UpdateReservationDraftRequest(CallRequest):
     customer_phone: str | None = Field(default=None, max_length=200)
     date: str | None = Field(default=None, max_length=10)
     time: str | None = Field(default=None, max_length=5)
-    party_size: int | None = Field(default=None, ge=0, le=12)
+    party_size: int | None = Field(default=None, ge=0, le=24)
     seating_preference: str | None = Field(default=None, max_length=80)
     seating_backup: str | None = Field(default=None, max_length=80)
     seating_avoid: str | None = Field(default=None, max_length=80)
@@ -162,7 +162,7 @@ class UpdateConfirmedBookingRequest(CallRequest):
     booking_id: int = Field(default=0, ge=0)
     date: str = Field(default="", max_length=10)
     time: str = Field(default="", max_length=5)
-    party_size: int = Field(default=0, ge=0, le=12)
+    party_size: int = Field(default=0, ge=0, le=24)
     seating_preference: str | None = Field(default=None, max_length=80)
     seating_backup: str | None = Field(default=None, max_length=80)
     seating_avoid: str | None = Field(default=None, max_length=80)

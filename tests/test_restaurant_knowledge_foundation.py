@@ -21,6 +21,7 @@ from app.services.restaurant import (
     restaurant_service,
 )
 from app.transfer_availability import current_staff_transfer_number
+from app.knowledge_search import search_faq_rows
 from app.tools.db import _format_order
 from app.tools.rag import search_menu
 
@@ -158,6 +159,7 @@ def test_hours_and_required_policy_topics_are_structured() -> None:
         ("what is your address", "topic.address"),
         ("is parking available", "topic.parking"),
         ("is a table available", "topic.seating"),
+        ("are there open tables", "topic.seating"),
         ("do you have wi fi", "topic.wifi"),
         ("can I get takeaway", "topic.pickup-delivery"),
         ("are you closed on Labor Day", "topic.hours"),
@@ -178,6 +180,27 @@ def test_unknown_topic_never_borrows_unrelated_fact() -> None:
     match = get_restaurant_knowledge().find_topic("rooftop telescope policy")
     assert match.status == "unknown"
     assert match.records == ()
+
+
+def test_operator_faq_requires_specific_question_overlap() -> None:
+    rows = [
+        {
+            "question": "Can I reserve the private room for a wedding?",
+            "answer": "Private events require an events callback.",
+        }
+    ]
+    assert search_faq_rows("Do you have a rooftop room?", rows) == []
+    assert search_faq_rows("private room wedding", rows)[0]["kind"] == "operator_faq"
+
+
+def test_fixture_rejects_dangling_escalation_owner() -> None:
+    base = get_restaurant_knowledge()
+    raw = deepcopy(base.raw)
+    raw["escalation_routes"] = [
+        route for route in raw["escalation_routes"] if route["owner"] != "reservations"
+    ]
+    with pytest.raises(KnowledgeFixtureError, match="Unknown escalation owner"):
+        RestaurantKnowledge(raw, path=base.path)
 
 
 def test_effective_dates_make_future_and_expired_records_explicit() -> None:
@@ -227,6 +250,18 @@ def test_modifier_semantics_cover_free_paid_removal_unavailable_and_clarificatio
     assert valid["status"] == "valid"
     assert valid["price_delta"] == 2.0
     assert valid["removals"] == ["onion jam"]
+
+    canonical_removal = knowledge.resolve_customization(
+        burger,
+        modifier_ids=["modifier.remove-onion", "modifier.side-fries"],
+        removals=["onion jam"],
+    )
+    assert canonical_removal["status"] == "valid"
+    assert canonical_removal["removals"] == ["onion jam"]
+    assert all(
+        option["option_id"] != "modifier.remove-onion"
+        for option in canonical_removal["modifiers"]
+    )
 
     unavailable = knowledge.resolve_customization(
         burger,
@@ -540,6 +575,64 @@ async def test_table_availability_rejects_canonical_closures_before_database_que
 
 
 @pytest.mark.asyncio
+async def test_reservation_policy_and_patio_schedule_gate_database_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 12, 0, tzinfo=timezone_info),
+    )
+
+    with pytest.raises(RestaurantServiceError) as large_party:
+        await restaurant_service.check_availability("2026-09-12", "19:00", 11)
+    assert large_party.value.code == "large_party_route_required"
+
+    with pytest.raises(RestaurantServiceError) as too_far:
+        await restaurant_service.check_availability("2026-10-09", "19:00", 2)
+    assert too_far.value.code == "booking_too_far_ahead"
+
+    called = False
+
+    class Connection:
+        async def fetch(self, *args: object) -> list[dict]:
+            nonlocal called
+            called = True
+            return [{"id": 1, "table_number": 8, "capacity": 4, "location": "patio"}]
+
+    tables = await restaurant_service.get_available_tables(
+        "2026-09-12",
+        "21:30",
+        2,
+        preferred_location="patio",
+        conn=Connection(),
+    )
+    assert tables == []
+    assert called is False
+
+
+def test_fulfillment_and_menu_service_periods_are_time_bounded() -> None:
+    knowledge = get_restaurant_knowledge()
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monday_noon = datetime(2026, 9, 14, 12, 0, tzinfo=timezone_info)
+    sunday_cutoff = datetime(2026, 9, 13, 19, 5, tzinfo=timezone_info)
+    saturday_brunch = datetime(2026, 9, 12, 10, 0, tzinfo=timezone_info)
+
+    assert not knowledge.schedule_status("pickup", monday_noon, apply_cutoff=True)[
+        "available"
+    ]
+    assert not knowledge.schedule_status(
+        "delivery", sunday_cutoff, apply_cutoff=True
+    )["available"]
+    assert not knowledge.menu_service_status(
+        ["service.lunch", "service.dinner"], saturday_brunch
+    )["available"]
+    assert knowledge.menu_service_status(["service.brunch"], saturday_brunch)[
+        "available"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_blank_restaurant_topic_is_explicitly_missing() -> None:
     result = await restaurant_service.restaurant_info("  ")
     assert result["matched"] is False
@@ -613,6 +706,15 @@ async def test_menu_read_boundary_excludes_stale_restaurant_rows(
     menu = await restaurant_service.list_menu(available_only=False)
     assert [entry["name"] for entry in menu["items"]] == ["Market Greens"]
 
+    rows[0]["service_periods"] = ["service.lunch", "service.dinner"]
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 12, 10, 0, tzinfo=timezone_info),
+    )
+    unavailable = await restaurant_service.list_menu()
+    assert unavailable["items"] == []
+
 
 def test_human_handoff_copy_depends_on_configured_destination(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
@@ -621,15 +723,29 @@ def test_human_handoff_copy_depends_on_configured_destination(monkeypatch: pytes
     )
     monkeypatch.setattr(settings, "staff_transfer_number", "")
     unavailable = reduce_behavior(None, TurnObservation(text="Connect me to a person"))
-    assert unavailable.directive.control is BehaviorControl.HANDOFF
+    assert unavailable.directive.control is BehaviorControl.CONTINUE
+    assert unavailable.state.terminal_control is None
     assert "can't transfer" in unavailable.directive.direct_reply.casefold()
     assert "callback" in unavailable.directive.direct_reply.casefold()
     assert "connect you" not in unavailable.directive.direct_reply.casefold()
+    follow_up = reduce_behavior(
+        unavailable.state,
+        TurnObservation(text="My callback number is 503-555-0102"),
+    )
+    assert follow_up.directive.control is BehaviorControl.CONTINUE
+    assert follow_up.directive.direct_reply is None
 
     monkeypatch.setattr(settings, "staff_transfer_number", "+15035550149")
     configured = reduce_behavior(None, TurnObservation(text="Connect me to a person"))
     assert configured.directive.control is BehaviorControl.HANDOFF
     assert "connect you" in configured.directive.direct_reply.casefold()
+
+    manager = reduce_behavior(
+        None, TurnObservation(text="Could you connect me to a manager?")
+    )
+    assert manager.directive.control is BehaviorControl.CONTINUE
+    assert "callback" in manager.directive.direct_reply.casefold()
+    assert "connect you" not in manager.directive.direct_reply.casefold()
 
 
 @pytest.mark.asyncio

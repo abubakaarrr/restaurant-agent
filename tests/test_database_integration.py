@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 import json
 import os
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import pytest
@@ -17,11 +18,13 @@ from app.behavior_store import load_behavior_state, save_behavior_state
 from app.call_memory import clear_call_memory, hydrate_call_memory
 from app.db_pool import close_pool
 from app.pending_confirmation import (
+    ACTION_CANCEL_BOOKING,
     ACTION_CONFIRM_ORDER,
     ACTION_CREATE_BOOKING,
     begin_caller_turn,
     booking_confirmation_payload,
     order_confirmation_payload,
+    get_pending_confirmation,
     register_pending_confirmation,
 )
 from app.services.restaurant import RestaurantServiceError, restaurant_service
@@ -50,6 +53,11 @@ async def isolated_database(monkeypatch: pytest.MonkeyPatch):
     await close_pool()
     monkeypatch.setattr(settings, "database_url", database_url)
     monkeypatch.setattr(settings, "voice_live_writes_enabled", True)
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 18, 0, tzinfo=timezone_info),
+    )
     connection = await asyncpg.connect(database_url)
     await connection.execute(
         """
@@ -166,8 +174,22 @@ async def test_public_agent_cancellation_reversal_preserves_booking() -> None:
     finally:
         await connection.close()
 
+    pending = await restaurant_service.cancel_booking(
+        call_id=call_id,
+        idempotency_key="pending-cancel-reversal",
+        booking_id=booking_id,
+        customer_name="Taylor",
+        customer_phone="+14155550123",
+        confirmed=False,
+    )
+    assert pending["pending"] is True
+    assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is not None
+    clear_call_memory(call_id)
+    assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is None
+
     reply = await run_agent(call_id, "Don't cancel it.")
-    assert "unchanged" in reply.casefold()
+    assert "stopped the pending cancellation" in reply.casefold()
+    assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is None
 
     connection = await asyncpg.connect(settings.database_url)
     try:
@@ -175,6 +197,12 @@ async def test_public_agent_cancellation_reversal_preserves_booking() -> None:
             "SELECT status FROM bookings WHERE id = $1", booking_id
         )
         assert status == "confirmed"
+        persisted = await connection.fetchval(
+            "SELECT state FROM call_sessions WHERE session_id = $1", call_id
+        )
+        if isinstance(persisted, str):
+            persisted = json.loads(persisted)
+        assert persisted.get("pending_confirmations") == {}
     finally:
         await connection.close()
         clear_session(call_id)
@@ -197,7 +225,6 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
         assert await connection.fetchval("SELECT COUNT(*) FROM orders") == 0
     finally:
         await connection.close()
-
     first = await restaurant_service.add_order_item(
         call_id="order-call",
         idempotency_key="add-greens-1",
@@ -273,6 +300,45 @@ async def test_order_corrections_confirmation_and_duplicate_delivery() -> None:
     assert confirmed_replay["order_id"] == confirmed["order_id"]
     assert confirmed_replay["idempotent_replay"] is True
     assert summary["draft_version"] == version
+
+
+async def test_order_confirmation_rejects_closed_fulfillment_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_id = "closed-pickup-confirmation"
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="closed-pickup-add",
+        item_name="Market Greens",
+        quantity=1,
+        customer_name="Jordan",
+        customer_phone="+14155550124",
+    )
+    summary = await restaurant_service.get_order_summary(call_id)
+    begin_caller_turn(call_id, "yes")
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 14, 12, 0, tzinfo=timezone_info),
+    )
+
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.confirm_order(
+            call_id=call_id,
+            idempotency_key="closed-pickup-confirm",
+            expected_draft_version=summary["draft_version"],
+            approved=True,
+        )
+    assert exc.value.code == "fulfillment_unavailable"
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        status = await connection.fetchval(
+            "SELECT status FROM orders WHERE id = $1", added["order_id"]
+        )
+        assert status == "pending"
+    finally:
+        await connection.close()
 
 
 async def test_webhook_deduplication_and_behavior_reconnect_state() -> None:

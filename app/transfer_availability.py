@@ -37,3 +37,36 @@ def current_staff_transfer_number(at: datetime | None = None) -> str:
     ):
         return ""
     return number
+
+
+def resolve_handoff_destination(reason: str, at: datetime | None = None) -> dict[str, str | bool]:
+    owner = {
+        "manager_requested": "manager_callback",
+        "manager_or_complaint": "manager_callback",
+        "payment_or_refund": "payment_support",
+        "severe_allergy": "kitchen",
+        "safety": "manager_callback",
+    }.get(reason, "staff")
+    try:
+        route = get_restaurant_knowledge().escalation_route(owner)
+    except (KnowledgeFixtureError, KeyError, TypeError, ValueError):
+        route = None
+    if not route:
+        return {
+            "owner": owner,
+            "channel": "unavailable",
+            "transfer_number": "",
+            "can_transfer": False,
+        }
+    channel = str(route.get("channel") or "")
+    transfer_number = (
+        current_staff_transfer_number(at)
+        if channel in {"voice_transfer", "conditional"}
+        else ""
+    )
+    return {
+        "owner": owner,
+        "channel": "voice_transfer" if transfer_number else channel,
+        "transfer_number": transfer_number,
+        "can_transfer": bool(transfer_number),
+    }

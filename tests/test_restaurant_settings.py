@@ -1,6 +1,13 @@
+import json
+
 import pytest
 
-from app.restaurant_settings import validate_restaurant_settings_update
+import app.restaurant_settings as restaurant_settings
+from app.restaurant_settings import (
+    DEFAULT_SETTINGS,
+    load_restaurant_settings,
+    validate_restaurant_settings_update,
+)
 
 
 def test_valid_operator_settings_are_normalized() -> None:
@@ -35,3 +42,26 @@ def test_valid_operator_settings_are_normalized() -> None:
 def test_invalid_operator_settings_are_rejected(payload: dict) -> None:
     with pytest.raises((TypeError, ValueError)):
         validate_restaurant_settings_update(payload)
+
+
+def test_stale_restaurant_settings_cannot_override_canonical_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "restaurant-settings.json"
+    settings_file.write_text(
+        json.dumps(
+            {
+                "restaurant_name": "The Lamplighter",
+                "street_address": "99 Legacy Avenue",
+                "opening_hours": {"mon": {"open": "09:00", "close": "23:00"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(restaurant_settings, "SETTINGS_FILE", settings_file)
+    monkeypatch.setattr(restaurant_settings, "_settings_cache", None)
+    loaded = load_restaurant_settings()
+    assert loaded["restaurant_id"] == "restaurant.harbor-and-hearth.portland"
+    assert loaded["data_version"] == "2026.09.07-phase1"
+    assert loaded["restaurant_name"] == DEFAULT_SETTINGS["restaurant_name"]
+    assert "mon" not in loaded["opening_hours"]

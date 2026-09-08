@@ -51,6 +51,7 @@ from app.pending_confirmation import (
     booking_confirmation_payload,
     cancel_booking_confirmation_payload,
     clear_pending_confirmation,
+    get_pending_confirmation,
     order_confirmation_payload,
     pending_state_patch,
     register_pending_confirmation,
@@ -68,6 +69,22 @@ from app.transfer_availability import current_staff_transfer_number
 JsonDict = dict[str, Any]
 T = TypeVar("T", bound=JsonDict)
 RESERVATION_DURATION_MINUTES = 90
+
+
+def _restaurant_now() -> datetime:
+    try:
+        timezone_info = ZoneInfo(get_restaurant_knowledge().identity["timezone"])
+    except (KnowledgeFixtureError, KeyError, ZoneInfoNotFoundError):
+        timezone_info = timezone.utc
+    return datetime.now(timezone_info)
+
+
+def _topic_rule(topic_id: str) -> JsonDict:
+    knowledge = get_restaurant_knowledge()
+    for topic in knowledge.topics:
+        if topic.get("topic_id") == topic_id:
+            return deepcopy(topic.get("rule") or {})
+    return {}
 
 
 class RestaurantServiceError(Exception):
@@ -232,9 +249,18 @@ class RestaurantService:
 
     @staticmethod
     def _validate_party_size(value: int) -> int:
-        if not 1 <= value <= 12:
+        rule = _topic_rule("topic.reservations")
+        maximum = int(rule.get("max_phone_party") or 10)
+        large_party_min = int(rule.get("large_party_min") or maximum + 1)
+        if large_party_min <= value <= 24:
             raise RestaurantServiceError(
-                "Party size must be between 1 and 12.",
+                "Parties of 11 to 24 require the private-dining reservations route; phone table inventory was not checked or booked.",
+                code="large_party_route_required",
+                status=409,
+            )
+        if not 1 <= value <= maximum:
+            raise RestaurantServiceError(
+                f"Phone table reservations support parties of 1 to {maximum}.",
                 code="invalid_party_size",
             )
         return value
@@ -252,15 +278,17 @@ class RestaurantService:
             timezone_info = ZoneInfo(settings.restaurant_timezone)
         except ZoneInfoNotFoundError:
             timezone_info = timezone.utc
-        now_local = datetime.now(timezone_info).replace(tzinfo=None)
+        now_local = _restaurant_now().astimezone(timezone_info).replace(tzinfo=None)
         if value < now_local:
             raise RestaurantServiceError(
                 "The requested reservation time is in the past.",
                 code="past_booking",
             )
-        if value > now_local + timedelta(days=366):
+        window_days = int(_topic_rule("topic.reservations").get("window_days") or 30)
+        released_days = window_days if now_local.hour >= 9 else window_days - 1
+        if value.date() > now_local.date() + timedelta(days=released_days):
             raise RestaurantServiceError(
-                "Reservations can only be made up to one year ahead.",
+                f"Reservations open {window_days} days ahead at 9:00 AM Pacific.",
                 code="booking_too_far_ahead",
             )
         return value
@@ -358,6 +386,7 @@ class RestaurantService:
             WHERE t.capacity >= $1
               {location_filter}
               AND ($7::int = 0 OR t.table_number = $7)
+              AND NOT (LOWER(t.location) = ANY($8::text[]))
               AND NOT EXISTS (
                 SELECT 1
                 FROM bookings b
@@ -481,6 +510,19 @@ class RestaurantService:
         window_start = dt - timedelta(minutes=30)
         window_end = dt + timedelta(minutes=RESERVATION_DURATION_MINUTES)
         location = (preferred_location or "").strip().casefold()
+        knowledge = get_restaurant_knowledge()
+        closed_locations: list[str] = []
+        for area in knowledge.raw["dining_areas"]:
+            area_location = str(area["area_id"]).removeprefix("area.").casefold()
+            if party_size > int(area.get("max_phone_party") or 10):
+                closed_locations.append(area_location)
+                continue
+            if area_location == "patio" and not knowledge.schedule_status(
+                "patio", dt, duration_minutes=RESERVATION_DURATION_MINUTES
+            )["available"]:
+                closed_locations.append(area_location)
+        if location and location in closed_locations:
+            return []
         if require_location_match is None:
             require_location_match = bool(location)
         sql = self._table_select_sql(
@@ -495,6 +537,7 @@ class RestaurantService:
             location,
             limit,
             int(table_number or 0),
+            closed_locations,
         )
         if conn is not None:
             rows = await conn.fetch(sql, *args)
@@ -524,7 +567,9 @@ class RestaurantService:
             if row["location"]
         }
         payload = {
-            "max_party_phone": 12,
+            "max_party_phone": int(
+                _topic_rule("topic.reservations").get("max_phone_party") or 10
+            ),
             "max_seats_by_location": by_location,
             "largest_table": max(by_location.values()) if by_location else 0,
         }
@@ -1519,6 +1564,55 @@ class RestaurantService:
             pass
         return draft
 
+    async def reverse_pending_cancellation(self, call_id: str) -> JsonDict:
+        from app.call_memory import get_call_memory
+
+        call_id = self._require_call_id(call_id)
+        pending = get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
+        pending_payload = dict((pending or {}).get("payload") or {})
+        memory = get_call_memory(call_id)
+        try:
+            booking_id = int(
+                pending_payload.get("booking_id") or memory.get("booking_id") or 0
+            )
+        except (TypeError, ValueError):
+            booking_id = 0
+        if booking_id <= 0:
+            return {
+                "reversed": False,
+                "status": "unknown",
+                "message": (
+                    "I don't have a verified reservation or pending cancellation to change. "
+                    "No cancellation action was taken."
+                ),
+            }
+        booking = await self.lookup_booking(booking_id=booking_id)
+        if pending:
+            state_patch = pending_state_patch(call_id)
+            remaining = dict(state_patch.get("pending_confirmations") or {})
+            remaining.pop(ACTION_CANCEL_BOOKING, None)
+            state_patch["pending_confirmations"] = remaining
+            await self.persist_call_state(call_id, state_patch)
+            clear_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
+        if booking["status"] == "cancelled":
+            message = (
+                "That reservation is already cancelled, so I can't say it is unchanged. "
+                "No further cancellation action was taken."
+            )
+        elif pending:
+            message = (
+                "I stopped the pending cancellation. Your reservation remains "
+                f"{booking['status']}."
+            )
+        else:
+            message = f"Your reservation is {booking['status']} and no cancellation is pending."
+        return {
+            "reversed": bool(pending),
+            "booking_id": booking_id,
+            "status": booking["status"],
+            "message": message,
+        }
+
     async def cancel_booking(
         self,
         *,
@@ -1708,10 +1802,16 @@ class RestaurantService:
                 status=503,
             ) from exc
 
+        now = _restaurant_now()
+
         def _menu_payload(row: Any) -> JsonDict:
             metadata = _json_value(row["knowledge_metadata"] or {})
             if not isinstance(metadata, dict):
                 metadata = {}
+            service_status = knowledge.menu_service_status(
+                row["service_periods"] or [], now
+            )
+            available = bool(row["available"]) and bool(service_status["available"])
             return {
                 **metadata,
                 "id": row["id"],
@@ -1729,7 +1829,9 @@ class RestaurantService:
                 "allergens": list(row["allergens"] or []),
                 "service_periods": list(row["service_periods"] or []),
                 "availability": row["availability_status"],
-                "available": bool(row["available"]),
+                "available": available,
+                "service_status": service_status["status"],
+                "service_message": service_status["customer_message"],
                 "source_id": row["source_id"] or "",
                 "data_version": row["data_version"] or "",
                 "effective_from": str(row["effective_from"] or ""),
@@ -1741,10 +1843,13 @@ class RestaurantService:
             if row["source_id"] == canonical_source_id
             and row["canonical_id"] in canonical_item_ids
         ]
+        items = [_menu_payload(row) for row in canonical_rows]
+        if available_only:
+            items = [item for item in items if item["available"]]
         return {
             "restaurant_name": knowledge.identity["name"],
             "status": "current",
-            "items": [_menu_payload(row) for row in canonical_rows],
+            "items": items,
             "allergen_notice": (
                 "Harbor & Hearth uses shared equipment and preparation areas. No item is "
                 "guaranteed allergen-free or free from cross-contact. For a severe allergy, "
@@ -2645,6 +2750,18 @@ class RestaurantService:
                     raise RestaurantServiceError(
                         f"Delivery requires a ${delivery_minimum:.2f} food-and-beverage minimum before the delivery fee.",
                         code="delivery_minimum_not_met",
+                        status=409,
+                    )
+            if summary.get("fulfillment") in {"pickup", "delivery"}:
+                fulfillment_status = get_restaurant_knowledge().schedule_status(
+                    str(summary["fulfillment"]),
+                    _restaurant_now(),
+                    apply_cutoff=True,
+                )
+                if not fulfillment_status["available"]:
+                    raise RestaurantServiceError(
+                        fulfillment_status["customer_message"],
+                        code="fulfillment_unavailable",
                         status=409,
                     )
             if not summary["items"]:

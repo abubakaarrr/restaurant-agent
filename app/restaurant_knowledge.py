@@ -11,7 +11,7 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
@@ -80,6 +80,13 @@ def _merged(defaults: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     value = deepcopy(defaults)
     value.update(deepcopy(record))
     return value
+
+
+def _removal_target(option: dict[str, Any], item_id: str) -> str:
+    targets = option.get("removes")
+    if isinstance(targets, dict):
+        return str(targets.get(item_id) or "")
+    return str(targets or "")
 
 
 @dataclass(frozen=True)
@@ -189,7 +196,14 @@ class RestaurantKnowledge:
         if len(self.raw["menu_items"]) < 25:
             raise KnowledgeFixtureError("At least 25 canonical menu items are required")
 
+        route_owners = {
+            str(route.get("owner") or "") for route in self.raw["escalation_routes"]
+        }
+
         option_ids = {option["option_id"] for option in self.raw["modifier_options"]}
+        options_by_id = {
+            option["option_id"]: option for option in self.raw["modifier_options"]
+        }
         for option in self.raw["modifier_options"]:
             if not option["option_id"].startswith("modifier."):
                 raise KnowledgeFixtureError("Modifier identifiers must start with modifier.")
@@ -210,6 +224,10 @@ class RestaurantKnowledge:
             if option.get("requires_clarification") and not option.get("choices"):
                 raise KnowledgeFixtureError(
                     f"Clarification choices are required for {option['option_id']}"
+                )
+            if option.get("kind") == "removal" and not option.get("removes"):
+                raise KnowledgeFixtureError(
+                    f"Removal target is required for {option['option_id']}"
                 )
 
         item_ids = {item["item_id"] for item in self.raw["menu_items"]}
@@ -275,6 +293,14 @@ class RestaurantKnowledge:
                 raise KnowledgeFixtureError(
                     f"Unknown alternatives for {item_id}: {', '.join(unknown_alternatives)}"
                 )
+            removable = {normalize_text(value) for value in item["removable_ingredients"]}
+            for option_id in item["modifier_options"]:
+                option = options_by_id[option_id]
+                target = _removal_target(option, item_id)
+                if option.get("kind") == "removal" and normalize_text(target) not in removable:
+                    raise KnowledgeFixtureError(
+                        f"Removal target for {option_id} is not removable from {item_id}"
+                    )
 
         for raw_topic in self.raw["topics"]:
             topic = _merged(self.raw["policy_defaults"], raw_topic)
@@ -289,6 +315,10 @@ class RestaurantKnowledge:
                 raise KnowledgeFixtureError(f"Answer and structured rule are required for {topic_id}")
             if not str(topic.get("version") or "") or not str(topic.get("escalation_owner") or ""):
                 raise KnowledgeFixtureError(f"Version and escalation owner are required for {topic_id}")
+            if topic["escalation_owner"] not in route_owners:
+                raise KnowledgeFixtureError(
+                    f"Unknown escalation owner for {topic_id}: {topic['escalation_owner']}"
+                )
             topic_start = _as_date(topic.get("effective_from"))
             topic_end = _as_date(topic.get("effective_to"))
             if topic_start is None or (topic_end and topic_end < topic_start):
@@ -377,6 +407,15 @@ class RestaurantKnowledge:
         if not query_tokens:
             return TopicMatch("missing")
         today = on_date or date.today()
+        if "open" in query_tokens and query_tokens & {"table", "tables"}:
+            seating = next(
+                topic for topic in self.topics if topic["topic_id"] == "topic.seating"
+            )
+            status = _effective_status(seating, today)
+            return TopicMatch(
+                "known" if status == "current" else status,
+                (deepcopy(seating),),
+            )
         ranked: list[tuple[int, int, dict[str, Any]]] = []
         stale: list[dict[str, Any]] = []
         for topic in self.topics:
@@ -388,6 +427,15 @@ class RestaurantKnowledge:
                 alias = normalize_text(phrase)
                 alias_tokens = text_tokens(alias)
                 if not alias_tokens or not alias_tokens <= query_tokens:
+                    continue
+                if alias_tokens == {"open"} and query_tokens & {
+                    "table",
+                    "tables",
+                    "reservation",
+                    "reservations",
+                    "booking",
+                    "book",
+                }:
                     continue
                 score = len(alias_tokens) * 10
                 if normalized == alias:
@@ -433,6 +481,7 @@ class RestaurantKnowledge:
         selected: list[dict[str, Any]] = []
         selected_substitutions: list[dict[str, Any]] = []
         selected_ids: set[str] = set()
+        option_removals: list[str] = []
         for raw in modifier_ids:
             option_id, separator, choice = str(raw).partition(":")
             if option_id in selected_ids:
@@ -458,16 +507,25 @@ class RestaurantKnowledge:
             canonical = deepcopy(option)
             if choice:
                 canonical["selection"] = choice
-            selected.append(canonical)
+            if option.get("kind") == "removal":
+                option_removals.append(_removal_target(option, str(item["item_id"])))
+            else:
+                selected.append(canonical)
             selected_ids.add(option_id)
 
-        normalized_removals = [" ".join(str(value).split()) for value in removals if str(value).strip()]
-        normalized_removal_ids = [normalize_text(value) for value in normalized_removals]
-        if len(normalized_removal_ids) != len(set(normalized_removal_ids)):
+        explicit_removals = [
+            " ".join(str(value).split())
+            for value in removals
+            if str(value).strip()
+        ]
+        explicit_removal_ids = [normalize_text(value) for value in explicit_removals]
+        if len(explicit_removal_ids) != len(set(explicit_removal_ids)):
             return {
                 "status": "clarification_required",
                 "message": "Choose each removal only once.",
             }
+        normalized_removals = [*explicit_removals, *option_removals]
+        normalized_removal_ids = [normalize_text(value) for value in normalized_removals]
         removable = {normalize_text(value): value for value in item.get("removable_ingredients") or []}
         for removal in normalized_removals:
             if normalize_text(removal) not in removable:
@@ -525,7 +583,9 @@ class RestaurantKnowledge:
         return {
             "status": "valid",
             "modifiers": selected,
-            "removals": [removable[normalize_text(value)] for value in normalized_removals],
+            "removals": [
+                removable[value] for value in dict.fromkeys(normalized_removal_ids)
+            ],
             "substitutions": selected_substitutions,
             "price_delta": round(
                 sum(
@@ -604,6 +664,102 @@ class RestaurantKnowledge:
                     f"{regular['open']} to {regular['close']}."
                 )
             ),
+        }
+
+    def schedule_status(
+        self,
+        schedule_name: str,
+        at: datetime,
+        *,
+        duration_minutes: int = 0,
+        apply_cutoff: bool = False,
+    ) -> dict[str, Any]:
+        timezone_info = ZoneInfo(self.identity["timezone"])
+        local = at.astimezone(timezone_info) if at.tzinfo else at.replace(tzinfo=timezone_info)
+        operating = self.operating_status(local)
+        if not operating["available"]:
+            return operating
+        schedule = (self.raw["hours"].get("fulfillment") or {}).get(schedule_name)
+        if not isinstance(schedule, dict):
+            return {
+                "available": False,
+                "status": "unavailable",
+                "kind": "schedule_missing",
+                "customer_message": f"Current {schedule_name} hours are unavailable.",
+            }
+        weekday = local.strftime("%a").casefold()
+        close_value = schedule.get("sunday_close") if weekday == "sun" else None
+        close_value = str(close_value or schedule.get("close") or "")
+        open_value = str(schedule.get("open") or "")
+        available = weekday in set(schedule.get("days") or [])
+        if available:
+            opening = datetime.combine(
+                local.date(), datetime.strptime(open_value, "%H:%M").time(), timezone_info
+            )
+            closing = datetime.combine(
+                local.date(), datetime.strptime(close_value, "%H:%M").time(), timezone_info
+            )
+            if apply_cutoff:
+                closing -= timedelta(minutes=int(schedule.get("cutoff_minutes_before_close") or 0))
+            available = (
+                opening <= local < closing
+                and local + timedelta(minutes=duration_minutes) <= closing
+            )
+        return {
+            "available": available,
+            "status": "open" if available else "closed",
+            "kind": f"{schedule_name}_hours",
+            "customer_message": (
+                f"{schedule_name.replace('_', ' ').title()} is available now."
+                if available
+                else (
+                    f"{schedule_name.replace('_', ' ').title()} is unavailable at "
+                    f"{local.strftime('%I:%M %p').lstrip('0')} on {local.strftime('%A')}; "
+                    f"scheduled hours are {open_value} to {close_value}."
+                )
+            ),
+        }
+
+    def menu_service_status(
+        self, service_period_ids: Iterable[str], at: datetime
+    ) -> dict[str, Any]:
+        period_ids = set(service_period_ids)
+        operating = self.operating_status(at)
+        if not operating["available"] or not period_ids:
+            return operating if not operating["available"] else {
+                "available": True,
+                "status": "available",
+                "kind": "all_service_periods",
+                "customer_message": "Available during all open service periods.",
+            }
+        timezone_info = ZoneInfo(self.identity["timezone"])
+        local = at.astimezone(timezone_info) if at.tzinfo else at.replace(tzinfo=timezone_info)
+        regular = next(
+            row
+            for row in self.raw["hours"]["regular"]
+            if row["day"] == local.strftime("%a").casefold()
+        )
+        for period in regular.get("service_periods") or []:
+            if period.get("id") not in period_ids:
+                continue
+            opening = datetime.combine(
+                local.date(), datetime.strptime(period["open"], "%H:%M").time(), timezone_info
+            )
+            closing = datetime.combine(
+                local.date(), datetime.strptime(period["close"], "%H:%M").time(), timezone_info
+            )
+            if opening <= local < closing:
+                return {
+                    "available": True,
+                    "status": "available",
+                    "kind": str(period["id"]),
+                    "customer_message": "The item is available in the current service period.",
+                }
+        return {
+            "available": False,
+            "status": "unavailable",
+            "kind": "outside_service_period",
+            "customer_message": "The item is not available in the current service period.",
         }
 
     def resolve_hours_query(self, query: str) -> dict[str, Any] | None:

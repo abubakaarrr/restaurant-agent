@@ -17,6 +17,8 @@ SETTINGS_FILE = Path(settings.restaurant_settings_file)
 HOURS_UNCONFIRMED_NOTE = "Opening hours are unavailable from the canonical local fixture."
 
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "restaurant_id": "restaurant.harbor-and-hearth.portland",
+    "data_version": "2026.09.07-phase1",
     "restaurant_name": settings.restaurant_name,
     "tagline": "A neighborhood table with a Pacific Northwest hearth",
     "phone_number": "+15035550148",
@@ -49,6 +51,13 @@ def load_restaurant_settings() -> dict[str, Any]:
     if _settings_cache and _settings_cache[0] == mtime:
         return dict(_settings_cache[1])
     saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(saved, dict) or any(
+        saved.get(key) != DEFAULT_SETTINGS[key]
+        for key in ("restaurant_id", "data_version")
+    ):
+        merged = dict(DEFAULT_SETTINGS)
+        _settings_cache = (mtime, merged)
+        return dict(merged)
     merged = {**DEFAULT_SETTINGS, **saved}
     _settings_cache = (mtime, merged)
     return dict(merged)
@@ -59,7 +68,7 @@ def save_restaurant_settings(data: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         key: data[key]
         for key in DEFAULT_SETTINGS
-        if key in data
+        if key in data and key not in {"restaurant_id", "data_version"}
     }
     merged = {**load_restaurant_settings(), **allowed}
     SETTINGS_FILE.write_text(

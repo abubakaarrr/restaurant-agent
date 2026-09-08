@@ -161,10 +161,22 @@ def _action_scope(session_id: str, history_length: int, user_message: str) -> st
     return f"{session_id}:{history_length}:{digest}"
 
 
-def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
+async def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
     """Handle narrow non-mutating reversals and terminal farewells locally."""
     if _CANCELLATION_INQUIRY_REVERSAL_RE.search(user_message):
-        return "Nothing has been cancelled. Your reservation is unchanged."
+        from app.services.restaurant import restaurant_service
+
+        try:
+            result = await restaurant_service.reverse_pending_cancellation(session_id)
+        except Exception:
+            logger.warning(
+                "Unable to verify cancellation reversal session=%s", session_id, exc_info=True
+            )
+            return (
+                "I couldn't verify the reservation or cancellation state right now. "
+                "I have not submitted a cancellation."
+            )
+        return str(result["message"])
     if _FAREWELL_RE.fullmatch(user_message):
         request_end_call(session_id)
         return "You're welcome. Goodbye!"
@@ -201,7 +213,7 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
         _history_digest(history),
     )
     try:
-        direct_reply = _direct_safe_reply(session_id, user_message)
+        direct_reply = await _direct_safe_reply(session_id, user_message)
         if direct_reply is not None:
             audit_assistant_speech(direct_reply)
             history.append({"role": "assistant", "content": direct_reply})

@@ -33,7 +33,7 @@ from app.restaurant_knowledge import (
     get_restaurant_knowledge,
     text_tokens,
 )
-from app.transfer_availability import current_staff_transfer_number
+from app.transfer_availability import resolve_handoff_destination
 
 
 class BehaviorMode(str, Enum):
@@ -838,15 +838,19 @@ def _direct_reply(
     personal_identity: bool,
     safe_humor: bool,
 ) -> str | None:
-    if control is BehaviorControl.HANDOFF:
-        if not current_staff_transfer_number():
+    if handoff_reason is not None:
+        destination = resolve_handoff_destination(handoff_reason)
+        if destination["can_transfer"]:
+            return "Of course. I'll connect you with a staff member now."
+        if destination["owner"] == "manager_callback":
             return (
-                "I can't transfer the call right now, but I can take a message and "
-                "callback details for the restaurant team."
+                "I can't connect you to a manager now, but I can take a message and "
+                "callback details for the manager."
             )
-        if handoff_reason == "manager_requested":
-            return "Of course. I'll connect you with a manager now."
-        return "Of course. I'll connect you with a staff member now."
+        return (
+            "I can't transfer the call right now, but I can take a message and "
+            "callback details for the restaurant team."
+        )
     if control is BehaviorControl.END_CALL:
         if terminal_reason == "silence":
             return "I haven't heard you, so I'll end the call for now. Please call back anytime."
@@ -1165,10 +1169,27 @@ def reduce_behavior(
     elif boundary_strikes == 0:
         boundary_clean_turns = 0
 
-    handoff_reason = handoff_request or state.explicit_handoff_reason
+    handoff_reason = handoff_request or (
+        state.explicit_handoff_reason
+        if state.terminal_control is BehaviorControl.HANDOFF
+        else None
+    )
     terminal_control = state.terminal_control
     terminal_reason = state.terminal_reason
-    if terminal_control is None and handoff_reason is not None:
+    destination = (
+        resolve_handoff_destination(handoff_reason) if handoff_reason is not None else None
+    )
+    if terminal_control is BehaviorControl.HANDOFF and not (
+        destination and destination["can_transfer"]
+    ):
+        terminal_control = None
+        terminal_reason = None
+    if (
+        terminal_control is None
+        and handoff_request is not None
+        and destination
+        and destination["can_transfer"]
+    ):
         terminal_control = BehaviorControl.HANDOFF
         terminal_reason = "handoff"
     elif (
@@ -1204,7 +1225,9 @@ def reduce_behavior(
         interruption_timestamps=interruption_timestamps,
         interruption_count=interruption_count,
         boundary_strikes=boundary_strikes,
-        explicit_handoff_reason=handoff_reason,
+        explicit_handoff_reason=(
+            handoff_reason if terminal_control is BehaviorControl.HANDOFF else None
+        ),
         speech_rate_samples=rate_samples,
         inferred_pace=inferred_pace,
         turn_index=turn_index,
