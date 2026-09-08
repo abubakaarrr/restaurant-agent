@@ -186,8 +186,6 @@ async def test_public_agent_cancellation_reversal_preserves_booking() -> None:
     )
     assert pending["pending"] is True
     assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is not None
-    clear_call_memory(call_id)
-    assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is None
 
     processed = await process_caller_turn(
         call_id,

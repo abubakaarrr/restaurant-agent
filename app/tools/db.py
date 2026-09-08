@@ -570,7 +570,7 @@ async def add_guest_note(
     session_id: str = "",
     booking_id: int = 0,
 ) -> str:
-    """Save a guest instruction on the booking notes field, such as window table, high chair, birthday, or kitchen requests. Use this instead of transferring for ordinary special requests."""
+    """Save a guest instruction on its current reservation or order owner."""
     session_id = resolve_session_id(session_id)
     memory = get_call_memory(session_id)
     if booking_id <= 0:
@@ -590,9 +590,12 @@ async def add_guest_note(
         )
     except RestaurantServiceError as error:
         return _error_text(error)
-    update_call_memory(session_id, guest_notes=result.get("guest_notes") or note)
+    note_owner = str(result.get("note_owner") or "")
+    if result.get("saved_on_booking") or note_owner != "order":
+        update_call_memory(session_id, guest_notes=result.get("guest_notes") or note)
+    owner = "order" if note_owner == "order" else "reservation"
     return (
-        "Note is on the reservation. Say it like a host, not 'the note is saved': "
+        f"Note is on the {owner}. Say it like a host, not 'the note is saved': "
         + str(result.get("notes") or note)
     )
 

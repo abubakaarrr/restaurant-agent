@@ -286,6 +286,8 @@ async def stream_agent_tokens(
     user_message: str,
     caller_phone: str = "",
     behavior_directive: str = "",
+    *,
+    prepared_caller_turn: dict[str, object] | None = None,
 ) -> AsyncIterator[str]:
     """Stream speakable tokens from the agent for Vapi / Retell.
 
@@ -323,7 +325,9 @@ async def stream_agent_tokens(
     action_token = set_current_action_scope(scope)
     begin_turn(session_id, scope)
     try:
-        caller_turn = await process_caller_turn(session_id, user_message)
+        caller_turn = prepared_caller_turn
+        if caller_turn is None:
+            caller_turn = await process_caller_turn(session_id, user_message)
         if caller_turn.get("handled"):
             reply = str(caller_turn.get("message") or "")
             audit_assistant_speech(reply)

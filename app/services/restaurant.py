@@ -1500,6 +1500,7 @@ class RestaurantService:
                     target_booking = 0
 
             saved_on_booking = False
+            note_owner = "reservation_draft"
             combined = note
             guest_notes = str(session_state.get("guest_notes") or "")
             state_patch: JsonDict = {}
@@ -1525,6 +1526,7 @@ class RestaurantService:
                     row["id"],
                 )
                 saved_on_booking = True
+                note_owner = "booking"
                 target_booking = int(row["id"])
                 guest_notes = merge_note_text(guest_notes, note)
                 state_patch = {
@@ -1555,6 +1557,7 @@ class RestaurantService:
                         order_notes=combined,
                         order_id=order["id"],
                     )
+                    note_owner = "order"
                 else:
                     combined = _combine_notes(str(session_state.get("notes") or ""), note)
                     guest_notes = merge_note_text(guest_notes, note)
@@ -1576,6 +1579,7 @@ class RestaurantService:
                 "saved": True,
                 "booking_id": target_booking or 0,
                 "saved_on_booking": saved_on_booking,
+                "note_owner": note_owner,
                 "notes": combined,
                 "guest_notes": guest_notes,
             }

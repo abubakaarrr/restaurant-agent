@@ -16,7 +16,7 @@ _CANCELLATION_REVERSAL_RE = re.compile(
     r"^\s*(?:"
     r"(?:actually[,;:]?\s+)?(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
     r"(?:please\s+)?(?:do\s+not|don't)\s+cancel"
-    r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation)(?:\s+yet)?|(?=\s*(?:[,;:.!?]|$)))"
+    r"(?:\s+(?:it|that|(?:the|my)\s+(?:reservation|booking))(?:\s+yet)?|(?=\s*(?:[,;:.!?]|$)))"
     r"(?:[,;:]?\s+(?:please|i\s+was\s+just\s+(?:checking|asking)))?"
     r"|(?:actually[,;:]?\s+)?no[.,;:]?\s+(?:do\s+not|don't)\s+cancel\s+it\s+yet[.!]?\s+"
     r"i\s+was\s+just\s+checking\s+(?:what\s+)?the\s+cancellation\s+(?:process|policy)\s+is"

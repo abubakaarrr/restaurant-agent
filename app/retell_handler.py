@@ -26,6 +26,7 @@ from app.behavior import (
 from app.behavior_store import load_behavior_state, save_behavior_state
 from app.call_analytics import record_call_event
 from app.call_flags import consume_call_control
+from app.caller_turn import process_caller_turn
 from app.config import settings
 from app.restaurant_settings import load_restaurant_settings
 from app.transfer_availability import current_staff_transfer_number
@@ -188,6 +189,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
         response_id: int,
         user_text: str,
         behavior_directive: str = "",
+        caller_turn: dict[str, Any] | None = None,
     ) -> None:
         nonlocal current_task
         started = time.monotonic()
@@ -199,6 +201,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 user_text,
                 caller_number,
                 behavior_directive,
+                prepared_caller_turn=caller_turn,
             ):
                 if response_id != active_response_id:
                     return
@@ -380,6 +383,17 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 )
                 continue
 
+            caller_turn = await process_caller_turn(call_id, user_text)
+            if caller_turn.get("handled"):
+                await send(
+                    _response_event(
+                        active_response_id,
+                        str(caller_turn.get("message") or ""),
+                        complete=True,
+                    )
+                )
+                continue
+
             directive = await apply_behavior(
                 user_turn,
                 interrupted=was_interrupted,
@@ -429,6 +443,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     active_response_id,
                     user_text,
                     directive.prompt_instruction,
+                    caller_turn,
                 )
             )
     except WebSocketDisconnect:

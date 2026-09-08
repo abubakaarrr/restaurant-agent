@@ -10,7 +10,16 @@ from fastapi import WebSocketDisconnect
 import app.retell_handler as handler
 from app.behavior import BehaviorState
 from app.call_flags import CallControl
+from app.call_memory import clear_call_memory
 from app.config import settings
+from app.pending_confirmation import (
+    ACTION_CANCEL_BOOKING,
+    cancel_booking_confirmation_payload,
+    clear_pending_confirmation,
+    get_pending_confirmation,
+    register_pending_confirmation,
+)
+from app.services.restaurant import restaurant_service
 
 
 class FakeWebSocket:
@@ -188,6 +197,69 @@ async def test_unintelligible_audio_is_repaired_without_llm(
     payloads = [json.loads(item) for item in websocket.sent]
     assert called is False
     assert any("say it one more time" in item.get("content", "") for item in payloads)
+
+
+@pytest.mark.asyncio
+async def test_direct_reply_reverses_pending_cancellation_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_id = "call-direct-cancellation-reversal"
+    clear_call_memory(call_id)
+    register_pending_confirmation(
+        call_id,
+        ACTION_CANCEL_BOOKING,
+        cancel_booking_confirmation_payload(booking_id=41),
+    )
+    streamed = False
+
+    async def reverse_pending_cancellation(session_id: str):
+        clear_pending_confirmation(session_id, ACTION_CANCEL_BOOKING)
+        return {
+            "reversed": True,
+            "booking_id": 41,
+            "status": "confirmed",
+            "message": "The cancellation was stopped.",
+        }
+
+    async def forbidden_stream(*args, **kwargs):
+        nonlocal streamed
+        streamed = True
+        if False:
+            yield ""
+
+    monkeypatch.setattr(
+        restaurant_service,
+        "reverse_pending_cancellation",
+        reverse_pending_cancellation,
+    )
+    monkeypatch.setattr(handler, "stream_agent_tokens", forbidden_stream)
+    monkeypatch.setattr(handler, "_record_background", lambda *args, **kwargs: None)
+    websocket = FakeWebSocket(
+        [
+            {
+                "interaction_type": "response_required",
+                "response_id": 91,
+                "transcript": [
+                    {
+                        "role": "user",
+                        "content": "Don't cancel it; are you a real person?",
+                    }
+                ],
+            }
+        ]
+    )
+    try:
+        await handler.handle_retell_connection(websocket, call_id)
+        assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is None
+        assert streamed is False
+        responses = [
+            json.loads(item)
+            for item in websocket.sent
+            if json.loads(item).get("response_type") == "response"
+        ]
+        assert "virtual host" in responses[-1]["content"].casefold()
+    finally:
+        clear_call_memory(call_id)
 
 
 @pytest.mark.asyncio

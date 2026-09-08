@@ -281,6 +281,28 @@ async def test_compound_reversal_accepts_leading_actually() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compound_reversal_accepts_booking_object() -> None:
+    reversal = AsyncMock(
+        return_value={"reversed": True, "message": "The cancellation was stopped."}
+    )
+    with (
+        patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
+        patch("app.caller_turn.begin_caller_turn", return_value="negative"),
+        patch(
+            "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
+            new=reversal,
+        ),
+    ):
+        result = await process_caller_turn(
+            "cancel-booking-compound",
+            "Don't cancel my booking; move it to seven.",
+        )
+    assert result["kind"] == "cancellation_reversal_with_remaining_intent"
+    assert result["handled"] is False
+    reversal.assert_awaited_once_with("cancel-booking-compound")
+
+
+@pytest.mark.asyncio
 async def test_reversal_persists_invalidation_before_booking_readback() -> None:
     session_id = "cancel-invalidation-before-readback"
     clear_call_memory(session_id)
