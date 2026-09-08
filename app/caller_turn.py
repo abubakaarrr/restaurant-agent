@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 _CANCELLATION_REVERSAL_RE = re.compile(
     r"^\s*(?:"
-    r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
+    r"(?:actually[,;:]?\s+)?(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
     r"(?:please\s+)?(?:do\s+not|don't)\s+cancel"
     r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation)(?:\s+yet)?|(?=\s*(?:[,;:.!?]|$)))"
     r"(?:[,;:]?\s+(?:please|i\s+was\s+just\s+(?:checking|asking)))?"

@@ -1004,6 +1004,26 @@ class RestaurantService:
                     code="readback_required",
                     status=409,
                 )
+            attachable_order = await conn.fetchrow(
+                """
+                SELECT id FROM orders
+                WHERE session_id = $1
+                  AND booking_id IS NULL
+                  AND status = 'pending'
+                  AND COALESCE(fulfillment_type, 'dine_in') = 'dine_in'
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                call_id,
+            )
+            if attachable_order:
+                await self._ensure_order_items_valid_at(
+                    conn,
+                    int(attachable_order["id"]),
+                    dt,
+                    context="the reservation time",
+                )
             row = await conn.fetchrow(
                 """
                 INSERT INTO bookings
@@ -1041,20 +1061,18 @@ class RestaurantService:
             clear_pending_confirmation(call_id, ACTION_CREATE_BOOKING)
             state.update(pending_state_patch(call_id))
             await self._merge_session_state(conn, call_id, state, caller_phone=phone)
-            await conn.execute(
-                """
-                UPDATE orders
-                SET booking_id = $1,
-                    fulfillment_type = 'dine_in',
-                    fulfillment_details = '{}'::jsonb
-                WHERE session_id = $2
-                  AND booking_id IS NULL
-                  AND status = 'pending'
-                  AND COALESCE(fulfillment_type, 'dine_in') = 'dine_in'
-                """,
-                row["id"],
-                call_id,
-            )
+            if attachable_order:
+                await conn.execute(
+                    """
+                    UPDATE orders
+                    SET booking_id = $1,
+                        fulfillment_type = 'dine_in',
+                        fulfillment_details = '{}'::jsonb
+                    WHERE id = $2
+                    """,
+                    row["id"],
+                    attachable_order["id"],
+                )
             attached_order = None
             order_row = await conn.fetchrow(
                 """
@@ -1445,7 +1463,7 @@ class RestaurantService:
         note: str,
         booking_id: int = 0,
     ) -> JsonDict:
-        """Save a caller instruction on its booking or order owner and call session."""
+        """Save a caller instruction on its booking or order owner."""
         call_id = self._require_call_id(call_id)
         note = " ".join(note.split())
         if not 2 <= len(note) <= 500:
@@ -1483,6 +1501,8 @@ class RestaurantService:
 
             saved_on_booking = False
             combined = note
+            guest_notes = str(session_state.get("guest_notes") or "")
+            state_patch: JsonDict = {}
             if target_booking:
                 row = await conn.fetchrow(
                     """
@@ -1506,10 +1526,17 @@ class RestaurantService:
                 )
                 saved_on_booking = True
                 target_booking = int(row["id"])
+                guest_notes = merge_note_text(guest_notes, note)
+                state_patch = {
+                    "notes": combined,
+                    "guest_notes": guest_notes,
+                    "booking_id": target_booking,
+                }
             else:
                 order = await conn.fetchrow(
                     """
-                    SELECT id, notes FROM orders
+                    SELECT id, booking_id, notes, status, fulfillment_type
+                    FROM orders
                     WHERE session_id = $1 AND status IN ('pending', 'confirmed')
                     ORDER BY id DESC
                     LIMIT 1
@@ -1518,6 +1545,10 @@ class RestaurantService:
                     call_id,
                 )
                 if order:
+                    self._ensure_order_mutation_allowed(
+                        order,
+                        caller_confirmed=False,
+                    )
                     combined = _combine_notes(order["notes"] or "", note)
                     await self._update_order_notes_with_conn(
                         conn,
@@ -1526,26 +1557,21 @@ class RestaurantService:
                     )
                 else:
                     combined = _combine_notes(str(session_state.get("notes") or ""), note)
+                    guest_notes = merge_note_text(guest_notes, note)
+                    state_patch = {"notes": combined, "guest_notes": guest_notes}
 
-            session_state["notes"] = combined
-            guest_notes = merge_note_text(str(session_state.get("guest_notes") or ""), note)
-            session_state["guest_notes"] = guest_notes
-            if target_booking:
-                session_state["booking_id"] = target_booking
-            state_patch = {"notes": combined, "guest_notes": guest_notes}
-            if target_booking:
-                state_patch["booking_id"] = target_booking
-            await conn.execute(
-                """
-                INSERT INTO call_sessions (session_id, state)
-                VALUES ($1, $2::jsonb)
-                ON CONFLICT (session_id) DO UPDATE
-                SET state = call_sessions.state || EXCLUDED.state,
-                    updated_at = NOW()
-                """,
-                call_id,
-                json.dumps(state_patch),
-            )
+            if state_patch:
+                await conn.execute(
+                    """
+                    INSERT INTO call_sessions (session_id, state)
+                    VALUES ($1, $2::jsonb)
+                    ON CONFLICT (session_id) DO UPDATE
+                    SET state = call_sessions.state || EXCLUDED.state,
+                        updated_at = NOW()
+                    """,
+                    call_id,
+                    json.dumps(state_patch),
+                )
             return {
                 "saved": True,
                 "booking_id": target_booking or 0,
@@ -2335,6 +2361,31 @@ class RestaurantService:
         )
         return {**result, "idempotent_replay": replayed}
 
+    @staticmethod
+    def _ensure_order_mutation_allowed(
+        order: Mapping[str, Any],
+        *,
+        caller_confirmed: bool,
+    ) -> None:
+        fulfillment = order["fulfillment_type"] or (
+            "dine_in" if order["booking_id"] else "pickup"
+        )
+        if order["status"] == "confirmed" and fulfillment in {
+            "pickup",
+            "delivery",
+        }:
+            raise RestaurantServiceError(
+                "Confirmed pickup and delivery changes require staff to verify preparation status. Request staff help or take a callback message; the order was not changed.",
+                code="confirmed_fulfillment_change_requires_staff",
+                status=409,
+            )
+        if order["status"] == "confirmed" and caller_confirmed is not True:
+            raise RestaurantServiceError(
+                "The caller must explicitly confirm changing the existing order.",
+                code="confirmation_required",
+                status=409,
+            )
+
     async def _lock_order_for_mutation(
         self,
         conn: Any,
@@ -2418,25 +2469,38 @@ class RestaurantService:
                 code="order_item_not_found" if order_item_id else "order_not_found",
                 status=404,
             )
-        fulfillment = order["fulfillment_type"] or (
-            "dine_in" if order["booking_id"] else "pickup"
+        self._ensure_order_mutation_allowed(
+            order,
+            caller_confirmed=caller_confirmed,
         )
-        if order["status"] == "confirmed" and fulfillment in {
-            "pickup",
-            "delivery",
-        }:
-            raise RestaurantServiceError(
-                "Confirmed pickup and delivery changes require staff to verify preparation status. Request staff help or take a callback message; the order was not changed.",
-                code="confirmed_fulfillment_change_requires_staff",
-                status=409,
-            )
-        if order["status"] == "confirmed" and caller_confirmed is not True:
-            raise RestaurantServiceError(
-                "The caller must explicitly confirm changing the existing order.",
-                code="confirmation_required",
-                status=409,
-            )
         return dict(order)
+
+    async def _ensure_order_items_valid_at(
+        self,
+        conn: Any,
+        order_id: int,
+        service_at: datetime,
+        *,
+        context: str,
+    ) -> None:
+        items = await conn.fetch(
+            """
+            SELECT oi.item_name, mi.service_periods,
+                   mi.effective_from, mi.effective_to
+            FROM order_items oi
+            LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
+            WHERE oi.order_id = $1
+              AND COALESCE(oi.proposed, FALSE) IS FALSE
+            """,
+            order_id,
+        )
+        for item in items:
+            _ensure_order_item_available_at(
+                item,
+                service_at,
+                context=context,
+                require_current_inventory=False,
+            )
 
     async def _order_summary_with_conn(self, conn: Any, order_id: int) -> JsonDict:
         order = await conn.fetchrow(
@@ -2674,10 +2738,11 @@ class RestaurantService:
                     code="order_already_confirmed",
                     status=409,
                 )
+            service_at: datetime
             if fulfillment == "dine_in" and resolved_booking:
                 booking = await conn.fetchrow(
                     """
-                    SELECT id FROM bookings
+                    SELECT id, booked_at FROM bookings
                     WHERE id = $1 AND status = 'confirmed'
                     """,
                     resolved_booking,
@@ -2688,14 +2753,21 @@ class RestaurantService:
                         code="booking_not_found",
                         status=404,
                     )
+                service_at = booking["booked_at"]
             fulfillment_details = dict(fulfillment_details_base)
             if fulfillment in {"pickup", "delivery"}:
-                fulfillment_at = _fulfillment_at(
+                service_at = _fulfillment_at(
                     fulfillment,
                     {},
                     now=_restaurant_now(),
                 )
-                fulfillment_details["fulfillment_at"] = fulfillment_at.isoformat()
+                fulfillment_details["fulfillment_at"] = service_at.isoformat()
+            await self._ensure_order_items_valid_at(
+                conn,
+                int(order["id"]),
+                service_at,
+                context="that fulfillment time",
+            )
             await conn.execute(
                 """
                 UPDATE orders

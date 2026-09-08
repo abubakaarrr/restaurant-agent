@@ -276,6 +276,19 @@ def test_menu_lookup_exact_alias_spelling_ambiguity_and_unavailable_alternatives
     assert expired.item["item_id"] == "menu.seasonal.corn-ravioli"
     assert expired.candidates == ()
 
+    future_risotto = knowledge.find_menu_item(
+        "Winter Squash Risotto", on_date=date(2026, 10, 14)
+    )
+    assert future_risotto.status == "future"
+    current_risotto = knowledge.find_menu_item(
+        "Winter Squash Risotto", on_date=date(2026, 10, 15)
+    )
+    assert current_risotto.status == "known"
+    assert current_risotto.item["availability"] == "available"
+    assert "not available until" not in current_risotto.item[
+        "customer_safe_answer"
+    ].casefold()
+
 
 def test_modifier_semantics_cover_free_paid_removal_unavailable_and_clarification() -> None:
     knowledge = get_restaurant_knowledge()

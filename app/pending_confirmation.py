@@ -283,8 +283,10 @@ def get_pending_confirmation(
 def pending_state_patch(session_id: str) -> dict[str, Any]:
     """Fields to merge into call_sessions.state for cross-request durability."""
     mem = get_call_memory(session_id)
+    pending = _pending_map(session_id)
+    pending.pop(ACTION_CANCEL_BOOKING, None)
     return {
-        "pending_confirmations": mem.get("pending_confirmations") or {},
+        "pending_confirmations": pending,
         "confirmation_turn": int(mem.get("confirmation_turn") or 0),
         "last_turn_affirmation": str(mem.get("last_turn_affirmation") or "unclear"),
     }

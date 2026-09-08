@@ -176,6 +176,11 @@ async def hydrate_call_memory(session_id: str) -> dict[str, Any]:
                 state = {}
         if isinstance(state, dict):
             restored.update(state)
+            pending = restored.get("pending_confirmations")
+            if isinstance(pending, dict):
+                pending = dict(pending)
+                pending.pop("cancel_booking", None)
+                restored["pending_confirmations"] = pending
         if session["caller_phone"]:
             restored.setdefault("customer_phone", session["caller_phone"])
     if order:
