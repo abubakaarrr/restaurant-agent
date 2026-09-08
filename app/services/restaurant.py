@@ -219,6 +219,24 @@ def _fulfillment_at(
     )
 
 
+def _future_fulfillment_at(
+    fulfillment: str,
+    details: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> datetime:
+    service_at = _fulfillment_at(fulfillment, details, now=now)
+    if service_at.tzinfo is None and now.tzinfo is not None:
+        service_at = service_at.replace(tzinfo=now.tzinfo)
+    if service_at <= now:
+        raise RestaurantServiceError(
+            "The saved fulfillment time has passed. Set pickup or delivery again before reviewing or confirming this order.",
+            code="fulfillment_time_expired",
+            status=409,
+        )
+    return service_at
+
+
 class RestaurantService:
     """Database-backed, provider-neutral restaurant operations."""
 
@@ -296,8 +314,8 @@ class RestaurantService:
                 code="invalid_datetime",
             ) from exc
         try:
-            timezone_info = ZoneInfo(settings.restaurant_timezone)
-        except ZoneInfoNotFoundError:
+            timezone_info = ZoneInfo(get_restaurant_knowledge().identity["timezone"])
+        except (KnowledgeFixtureError, KeyError, ZoneInfoNotFoundError):
             timezone_info = timezone.utc
         now_local = _restaurant_now().astimezone(timezone_info).replace(tzinfo=None)
         if value < now_local:
@@ -2033,25 +2051,40 @@ class RestaurantService:
         }
 
         async def operation(conn: Any) -> JsonDict:
-            resolved_booking = booking_id or await self._booking_id_from_session(
-                conn, call_id
+            existing_order = await conn.fetchrow(
+                """
+                SELECT booking_id, fulfillment_type, fulfillment_details
+                FROM orders
+                WHERE session_id = $1 AND status IN ('pending', 'confirmed')
+                ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
+                LIMIT 1
+                """,
+                call_id,
             )
-            if not resolved_booking:
-                resolved_booking = int(
-                    await conn.fetchval(
-                        """
-                        SELECT COALESCE(booking_id, 0) FROM orders
-                        WHERE session_id = $1 AND status IN ('pending', 'confirmed')
-                        ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
-                        LIMIT 1
-                        """,
-                        call_id,
-                    )
-                    or 0
+            if existing_order:
+                stored_booking = int(existing_order["booking_id"] or 0)
+                fulfillment = str(
+                    existing_order["fulfillment_type"]
+                    or ("dine_in" if stored_booking else "pickup")
                 )
+                resolved_booking = 0
+                if fulfillment == "dine_in":
+                    resolved_booking = (
+                        stored_booking
+                        or booking_id
+                        or await self._booking_id_from_session(conn, call_id)
+                    )
+                fulfillment_details = dict(
+                    _json_value(existing_order["fulfillment_details"] or {})
+                )
+            else:
+                resolved_booking = booking_id or await self._booking_id_from_session(
+                    conn, call_id
+                )
+                fulfillment = "dine_in" if resolved_booking else "pickup"
+                fulfillment_details = {}
             operation_now = _restaurant_now()
             service_at = operation_now
-            fulfillment_details: JsonDict = {}
             if resolved_booking:
                 booked_at = await conn.fetchval(
                     "SELECT booked_at FROM bookings WHERE id = $1 AND status = 'confirmed'",
@@ -2060,27 +2093,7 @@ class RestaurantService:
                 if booked_at is not None:
                     service_at = booked_at
             else:
-                existing_fulfillment = await conn.fetchrow(
-                    """
-                    SELECT fulfillment_type, fulfillment_details
-                    FROM orders
-                    WHERE session_id = $1 AND status IN ('pending', 'confirmed')
-                    ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
-                    LIMIT 1
-                    """,
-                    call_id,
-                )
-                fulfillment = (
-                    str(existing_fulfillment["fulfillment_type"] or "pickup")
-                    if existing_fulfillment
-                    else "pickup"
-                )
-                fulfillment_details = dict(
-                    _json_value(existing_fulfillment["fulfillment_details"] or {})
-                    if existing_fulfillment
-                    else {}
-                )
-                service_at = _fulfillment_at(
+                service_at = _future_fulfillment_at(
                     fulfillment, fulfillment_details, now=operation_now
                 )
                 fulfillment_details["fulfillment_at"] = service_at.isoformat()
@@ -2479,6 +2492,12 @@ class RestaurantService:
                 )
             result = await self._order_summary_with_conn(conn, order["id"])
             if result.get("status") == "pending" and result.get("items"):
+                if result.get("fulfillment") in {"pickup", "delivery"}:
+                    _future_fulfillment_at(
+                        str(result["fulfillment"]),
+                        result.get("fulfillment_details") or {},
+                        now=_restaurant_now(),
+                    )
                 digest = register_pending_confirmation(
                     call_id,
                     ACTION_CONFIRM_ORDER,
@@ -2535,10 +2554,12 @@ class RestaurantService:
                 )
         if fulfillment in {"pickup", "delivery"}:
             resolved_booking = None
-        fulfillment_details: JsonDict = {}
-        fulfillment_at = _fulfillment_at(fulfillment, {}, now=_restaurant_now())
+        fulfillment_details_base: JsonDict = {}
+        address = ""
+        instructions = ""
         if fulfillment == "delivery":
             address = " ".join(delivery_address.split())[:300]
+            instructions = " ".join(delivery_instructions.split())[:300]
             delivery_rule = _delivery_rule()
             postal_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", address)
             if not address or not postal_match:
@@ -2557,24 +2578,22 @@ class RestaurantService:
                     code="delivery_outside_zone",
                     status=409,
                 )
-            fulfillment_details = {
+            fulfillment_details_base = {
                 "address": address,
-                "instructions": " ".join(delivery_instructions.split())[:300],
+                "instructions": instructions,
                 "zone_id": str(delivery_rule.get("delivery_zone_id") or ""),
                 "postal_code": postal_code,
                 "zone_status": "eligible",
                 "provider": "synthetic_local",
                 "live_integration": False,
                 "delivery_fee": float(delivery_rule.get("delivery_fee") or 0),
-                "fulfillment_at": fulfillment_at.isoformat(),
             }
-        elif fulfillment == "pickup":
-            fulfillment_details = {"fulfillment_at": fulfillment_at.isoformat()}
         payload = {
             "call_id": call_id,
             "fulfillment_type": fulfillment,
             "booking_id": resolved_booking or 0,
-            "fulfillment_details": fulfillment_details,
+            "delivery_address": address,
+            "delivery_instructions": instructions,
         }
 
         async def operation(conn: Any) -> JsonDict:
@@ -2614,6 +2633,14 @@ class RestaurantService:
                         code="booking_not_found",
                         status=404,
                     )
+            fulfillment_details = dict(fulfillment_details_base)
+            if fulfillment in {"pickup", "delivery"}:
+                fulfillment_at = _fulfillment_at(
+                    fulfillment,
+                    {},
+                    now=_restaurant_now(),
+                )
+                fulfillment_details["fulfillment_at"] = fulfillment_at.isoformat()
             await conn.execute(
                 """
                 UPDATE orders
@@ -2863,12 +2890,13 @@ class RestaurantService:
                         code="delivery_minimum_not_met",
                         status=409,
                     )
-            service_at = _restaurant_now()
+            operation_now = _restaurant_now()
+            service_at = operation_now
             if summary.get("fulfillment") in {"pickup", "delivery"}:
-                service_at = _fulfillment_at(
+                service_at = _future_fulfillment_at(
                     str(summary["fulfillment"]),
                     summary.get("fulfillment_details") or {},
-                    now=service_at,
+                    now=operation_now,
                 )
                 fulfillment_status = get_restaurant_knowledge().schedule_status(
                     str(summary["fulfillment"]),

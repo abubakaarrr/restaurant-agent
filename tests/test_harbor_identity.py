@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.config import Settings
 from app.restaurant_knowledge import get_restaurant_knowledge
 from app.restaurant_settings import DEFAULT_SETTINGS, validate_restaurant_settings_update
 from app.services.restaurant import format_menu_price
@@ -29,6 +30,16 @@ def test_fixture_owned_identity_and_hours_are_not_operator_editable() -> None:
         }
     )
     assert result == {}
+
+
+def test_environment_cannot_define_fixture_owned_identity(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("RESTAURANT_NAME", "Pilot Bistro")
+    monkeypatch.setenv("RESTAURANT_TIMEZONE", "America/New_York")
+    configured = Settings(_env_file=None)
+    assert not hasattr(configured, "restaurant_name")
+    assert not hasattr(configured, "restaurant_timezone")
 
 
 def test_seed_menu_is_the_canonical_confirmed_fixture() -> None:

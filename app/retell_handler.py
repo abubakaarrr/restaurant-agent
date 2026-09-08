@@ -369,7 +369,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
 
             if not user_text:
                 runtime = load_restaurant_settings()
-                restaurant = runtime.get("restaurant_name") or settings.restaurant_name
+                restaurant = runtime["restaurant_name"]
                 agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
                 greeting = (
                     f"Hi, you've reached {restaurant}. This is {agent_name}. "

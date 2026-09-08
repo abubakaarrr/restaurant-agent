@@ -787,6 +787,120 @@ async def test_pickup_items_use_one_persisted_fulfillment_time(
     )
 
 
+async def test_existing_pickup_time_wins_over_active_booking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 14, 45, tzinfo=timezone_info),
+    )
+    call_id = "pickup-with-active-booking"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        booking_id = await connection.fetchval(
+            """
+            INSERT INTO bookings
+                (customer_name, customer_phone, table_id, booked_at, party_size)
+            VALUES ('Morgan', '+15035550101', 1, '2026-09-08 19:00', 2)
+            RETURNING id
+            """
+        )
+        await connection.execute(
+            "INSERT INTO call_sessions (session_id, state) VALUES ($1, $2::jsonb)",
+            call_id,
+            json.dumps({"booking_id": booking_id}),
+        )
+        await connection.execute(
+            """
+            INSERT INTO orders
+                (session_id, customer_name, customer_phone, fulfillment_type,
+                 fulfillment_details)
+            VALUES ($1, 'Morgan', '+15035550101', 'pickup', $2::jsonb)
+            """,
+            call_id,
+            json.dumps({"fulfillment_at": "2026-09-08T15:15:00-07:00"}),
+        )
+    finally:
+        await connection.close()
+
+    result = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="pickup-active-booking-add",
+        item_name="Market Greens",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert result["added"] is False
+    assert result["unavailable"] is True
+
+
+async def test_fulfillment_retry_replays_original_generated_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    call_id = "fulfillment-time-replay"
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 17, 0, tzinfo=timezone_info),
+    )
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="fulfillment-replay-add",
+        item_name="Market Greens",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert added["added"] is True
+    first = await restaurant_service.set_order_fulfillment(
+        call_id=call_id,
+        idempotency_key="fulfillment-replay-set",
+        fulfillment_type="pickup",
+    )
+
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 17, 5, tzinfo=timezone_info),
+    )
+    replay = await restaurant_service.set_order_fulfillment(
+        call_id=call_id,
+        idempotency_key="fulfillment-replay-set",
+        fulfillment_type="pickup",
+    )
+    assert replay["idempotent_replay"] is True
+    assert replay["fulfillment_details"]["fulfillment_at"] == first[
+        "fulfillment_details"
+    ]["fulfillment_at"]
+
+
+async def test_expired_fulfillment_cannot_create_confirmation_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    call_id = "expired-fulfillment-readback"
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 17, 0, tzinfo=timezone_info),
+    )
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="expired-fulfillment-add",
+        item_name="Market Greens",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert added["added"] is True
+
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 8, 18, 0, tzinfo=timezone_info),
+    )
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.get_order_summary(call_id=call_id)
+    assert exc.value.code == "fulfillment_time_expired"
+    assert get_pending_confirmation(call_id, ACTION_CONFIRM_ORDER) is None
+
+
 async def test_confirmed_delivery_total_uses_persisted_fee(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -16,7 +16,7 @@ _CANCELLATION_REVERSAL_RE = re.compile(
     r"^\s*(?:"
     r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
     r"(?:please\s+)?(?:do\s+not|don't)\s+cancel"
-    r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation))?"
+    r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation)|(?=\s*(?:[,;:.!?]|$)))"
     r"(?:[,;:]?\s+(?:please|i\s+was\s+just\s+(?:checking|asking)))?"
     r"|(?:actually[,;:]?\s+)?no[.,;:]?\s+(?:do\s+not|don't)\s+cancel\s+it\s+yet[.!]?\s+"
     r"i\s+was\s+just\s+checking\s+(?:what\s+)?the\s+cancellation\s+(?:process|policy)\s+is"
@@ -54,7 +54,7 @@ async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]
             "Unable to verify cancellation reversal session=%s", sid, exc_info=True
         )
         return {
-            "handled": not remaining_intent,
+            "handled": True,
             "kind": "cancellation_reversal_unavailable",
             "affirmation": affirmation,
             "message": (

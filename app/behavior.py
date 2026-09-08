@@ -436,13 +436,25 @@ def _canonical_humor_risk(text: str, caller_tokens: set[str]) -> bool:
     for topic in knowledge.topics:
         if topic.get("topic_id") == "topic.safety-emergency":
             phrases.extend(topic.get("aliases") or [])
-    allergen_tokens = {
-        token
-        for item in knowledge.menu_items
-        for allergen in item.get("allergens") or []
-        for token in text_tokens(str(allergen))
-    }
-    return bool(caller_tokens & allergen_tokens) or any(
+    def inflection_tokens(values: set[str]) -> set[str]:
+        normalized = set(values)
+        for token in values:
+            if len(token) > 4 and token.endswith("ies"):
+                normalized.add(f"{token[:-3]}y")
+            elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+                normalized.add(token[:-1])
+        return normalized
+
+    allergen_tokens = inflection_tokens(
+        {
+            token
+            for item in knowledge.menu_items
+            for allergen in item.get("allergens") or []
+            for token in text_tokens(str(allergen))
+        }
+    )
+    normalized_caller_tokens = inflection_tokens(caller_tokens)
+    return bool(normalized_caller_tokens & allergen_tokens) or any(
         text_tokens(phrase) <= caller_tokens
         for phrase in phrases
         if text_tokens(phrase)

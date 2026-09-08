@@ -35,9 +35,7 @@ class Settings(BaseSettings):
     langchain_api_key: str = ""
     langchain_project: str = "restaurant-agent-poc"
 
-    # Restaurant identity
-    restaurant_name: str = "Harbor & Hearth Kitchen"
-    restaurant_timezone: str = "America/Los_Angeles"
+    # Restaurant runtime settings
     restaurant_settings_file: str = "restaurant_settings.json"
 
     # Voice Cloning / TTS

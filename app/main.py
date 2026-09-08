@@ -190,7 +190,7 @@ async def health():
     runtime = _load_settings()
     return {
         "status": "ok",
-        "restaurant": runtime.get("restaurant_name") or settings.restaurant_name,
+        "restaurant": runtime["restaurant_name"],
         "agent_name": runtime.get("ai_agent_name") or settings.ai_agent_name,
         "voice_live_writes_enabled": settings.voice_live_writes_enabled,
         "managed_retell_ready": bool(
@@ -266,7 +266,7 @@ async def vapi_llm(request: Request):
 
         if not user_messages:
             runtime = _load_settings()
-            restaurant_name = runtime.get("restaurant_name") or settings.restaurant_name
+            restaurant_name = runtime["restaurant_name"]
             agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
             greeting = (
                 f"Hi, you've reached {restaurant_name}. This is {agent_name}. "
@@ -970,7 +970,7 @@ async def login_page(request: Request):
     return templates.TemplateResponse(
         request,
         "login.html",
-        {"restaurant": settings.restaurant_name, "error": None},
+        {"restaurant": _load_settings()["restaurant_name"], "error": None},
     )
 
 
@@ -991,7 +991,7 @@ async def login_submit(
         request,
         "login.html",
         {
-            "restaurant": settings.restaurant_name,
+            "restaurant": _load_settings()["restaurant_name"],
             "error": "Invalid username or password",
         },
         status_code=401,
@@ -1011,7 +1011,7 @@ async def browser_demo(request: Request):
         return RedirectResponse("/login", status_code=302)
 
     runtime = _load_settings()
-    restaurant_name = runtime.get("restaurant_name") or settings.restaurant_name
+    restaurant_name = runtime["restaurant_name"]
     agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
     vapi_pub = settings.vapi_public_key or ""
     vapi_asst = settings.vapi_assistant_id or ""
@@ -1046,7 +1046,7 @@ async def widget_demo(request: Request):
         request,
         "widget_demo.html",
         {
-            "restaurant": settings.restaurant_name,
+            "restaurant": _load_settings()["restaurant_name"],
             "widget_mode": settings.widget_mode,
             "retell_public_key": settings.retell_public_key,
             "retell_voice_agent_id": settings.retell_agent_id,

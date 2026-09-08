@@ -73,10 +73,8 @@ async def generate_response(
     )
 
     runtime = load_restaurant_settings()
-    timezone_name = str(runtime.get("timezone") or settings.restaurant_timezone)
-    restaurant_name = str(
-        runtime.get("restaurant_name") or agent_config.restaurant_name
-    )
+    timezone_name = str(runtime["timezone"])
+    restaurant_name = str(runtime["restaurant_name"])
     agent_name = str(runtime.get("ai_agent_name") or settings.ai_agent_name)
     try:
         tz = zoneinfo.ZoneInfo(timezone_name)

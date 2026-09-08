@@ -129,7 +129,7 @@ def _save_turn(session_id: str, history: list[dict], user_message: str, reply: s
 
 def opening_greeting() -> str:
     runtime = load_restaurant_settings()
-    restaurant = str(runtime.get("restaurant_name") or settings.restaurant_name)
+    restaurant = str(runtime["restaurant_name"])
     agent = str(runtime.get("ai_agent_name") or settings.ai_agent_name)
     return (
         f"Hi, you've reached {restaurant}. This is {agent}. "
@@ -205,7 +205,7 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
         }
         result = await restaurant_agent.ainvoke(
             payload,
-            config={"configurable": {"restaurant_name": settings.restaurant_name}},
+            config={"configurable": {}},
         )
         raw_messages = result.get("messages", [])
         reply = _extract_reply(raw_messages) or "I'm sorry, could you repeat that?"
@@ -242,7 +242,7 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
             payload["behavior_directive"] = retry_reason
             result = await restaurant_agent.ainvoke(
                 payload,
-                config={"configurable": {"restaurant_name": settings.restaurant_name}},
+                config={"configurable": {}},
             )
             raw_messages = result.get("messages", [])
             retried = _extract_reply(raw_messages)
@@ -303,7 +303,7 @@ async def stream_agent_tokens(
     # (Retell barge-in), the caller's utterance survives in history.
     _sessions[session_id] = history[-40:]
 
-    config = {"configurable": {"restaurant_name": settings.restaurant_name}}
+    config = {"configurable": {}}
     input_state = {
         "messages": history,
         "session_id": session_id,

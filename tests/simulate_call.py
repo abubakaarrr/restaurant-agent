@@ -32,6 +32,7 @@ load_dotenv()
 from langchain_core.messages import HumanMessage
 from app.agent.graph import restaurant_agent
 from app.config import settings
+from app.restaurant_settings import load_restaurant_settings
 
 
 DIVIDER = "-" * 60
@@ -59,7 +60,7 @@ async def run_scenario(title: str, turns: list[str]) -> list[str]:
                 "tool_iterations": 0,
                 "behavior_directive": "Use standard concise phone style.",
             },
-            config={"configurable": {"restaurant_name": settings.restaurant_name}},
+            config={"configurable": {}},
         )
 
         result_msgs = result.get("messages", [])
@@ -80,8 +81,9 @@ async def run_scenario(title: str, turns: list[str]) -> list[str]:
 
 
 async def main() -> None:
+    runtime = load_restaurant_settings()
     print(f"\nRestaurant AI Receptionist - Demo Simulation")
-    print(f"Restaurant: {settings.restaurant_name}")
+    print(f"Restaurant: {runtime['restaurant_name']}")
     print(f"Model: {settings.llm_model} via legacy LangGraph rollback adapter")
     booking_date = date.today() + timedelta(days=30)
 

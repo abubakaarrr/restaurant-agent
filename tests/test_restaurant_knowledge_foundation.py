@@ -22,7 +22,7 @@ from app.services.restaurant import (
 )
 from app.transfer_availability import current_staff_transfer_number
 from app.knowledge_search import search_faq_rows
-from app.tools.db import _format_order, check_menu_item_availability
+from app.tools.db import _format_order, check_menu_item_availability, get_full_menu
 from app.tools.rag import search_menu
 
 
@@ -515,6 +515,7 @@ def test_safe_humor_is_suppressed_for_configured_contexts(
         "They gave me food poisoning",
         "I'm allergic to sesame",
         "I have a tree nut concern",
+        "I'm concerned about peanuts",
         "I'm complaining about an injury",
     ],
 )
@@ -568,6 +569,8 @@ async def test_menu_adapters_preserve_service_period_unavailability(
     search = await search_menu.ainvoke({"query": "Market Greens"})
     assert "current service period" in search.casefold()
     assert "not currently effective" not in search.casefold()
+    full_menu = await get_full_menu.ainvoke({})
+    assert "Market Greens" in full_menu
 
 
 @pytest.mark.asyncio

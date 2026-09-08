@@ -601,7 +601,7 @@ async def add_guest_note(
 async def get_full_menu() -> str:
     """Return the live menu and prices from the database."""
     try:
-        result = await restaurant_service.list_menu()
+        result = await restaurant_service.list_menu(available_only=False)
     except RestaurantServiceError as error:
         return _error_text(error)
     grouped: dict[str, list[str]] = {}

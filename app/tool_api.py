@@ -17,7 +17,6 @@ from app.call_memory import (
     set_active_booking,
     update_reservation_draft as save_reservation_draft,
 )
-from app.caller_turn import process_caller_turn
 from app.config import settings
 from app.call_analytics import record_call_event
 from app.pending_confirmation import (
@@ -27,6 +26,7 @@ from app.pending_confirmation import (
     register_pending_confirmation,
 )
 from app.reservation_draft import compose_notes, flatten_draft
+from app.restaurant_settings import load_restaurant_settings
 from app.security import constant_time_equal
 from app.services.restaurant import RestaurantServiceError, restaurant_service
 
@@ -50,10 +50,6 @@ ToolAuth = Security(require_voice_tool_secret)
 
 class CallRequest(BaseModel):
     call_id: str = Field(min_length=1, max_length=200)
-
-
-class CallerTurnRequest(CallRequest):
-    utterance: str = Field(min_length=1, max_length=1000)
 
 
 class AvailabilityRequest(BaseModel):
@@ -222,14 +218,8 @@ async def voice_tool_health() -> dict[str, Any]:
     return {
         "ok": True,
         "writes_enabled": settings.voice_live_writes_enabled,
-        "restaurant": settings.restaurant_name,
+        "restaurant": load_restaurant_settings()["restaurant_name"],
     }
-
-
-@router.post("/caller-turn", dependencies=[ToolAuth])
-async def caller_turn(body: CallerTurnRequest) -> dict[str, Any]:
-    """Advance trusted turn state and apply any server-owned reversal."""
-    return _ok(await process_caller_turn(body.call_id, body.utterance))
 
 
 @router.post("/availability", dependencies=[ToolAuth])
@@ -465,7 +455,7 @@ async def log_unknown_question(body: LogUnknownQuestionRequest) -> dict[str, Any
 @router.get("/menu", dependencies=[ToolAuth])
 async def get_menu() -> dict[str, Any]:
     try:
-        return _ok(await restaurant_service.list_menu())
+        return _ok(await restaurant_service.list_menu(available_only=False))
     except RestaurantServiceError as error:
         _raise_service_error(error)
 

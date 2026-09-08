@@ -59,32 +59,30 @@ def test_availability_returns_typed_envelope(
     assert response.json()["result"]["available"] is True
 
 
-def test_authenticated_caller_turn_endpoint_uses_shared_reversal_boundary(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, str] = {}
-
-    async def fake_process(call_id: str, utterance: str):
-        captured.update(call_id=call_id, utterance=utterance)
-        return {
-            "handled": True,
-            "kind": "cancellation_reversal",
-            "message": "Cancellation stopped.",
-        }
-
-    monkeypatch.setattr(tool_api, "process_caller_turn", fake_process)
+def test_managed_caller_turn_endpoint_is_not_exposed(client: TestClient) -> None:
     response = client.post(
         "/api/voice-tools/caller-turn",
         headers={"X-Voice-Tool-Secret": "test-tool-secret"},
         json={"call_id": "managed-call-1", "utterance": "Don't cancel it."},
     )
+    assert response.status_code == 404
+
+
+def test_menu_endpoint_requests_complete_menu(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_menu(*, available_only: bool = True):
+        assert available_only is False
+        return {"items": [], "allergen_notice": "Shared kitchen."}
+
+    monkeypatch.setattr(tool_api.restaurant_service, "list_menu", fake_menu)
+    response = client.get(
+        "/api/voice-tools/menu",
+        headers={"X-Voice-Tool-Secret": "test-tool-secret"},
+    )
     assert response.status_code == 200
-    assert response.json()["result"]["kind"] == "cancellation_reversal"
-    assert captured == {
-        "call_id": "managed-call-1",
-        "utterance": "Don't cancel it.",
-    }
+    assert response.json()["result"]["items"] == []
 
 
 def test_write_forwards_idempotency_key(

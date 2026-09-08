@@ -9,6 +9,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.agent.runner import _extract_reply, clear_session, run_agent, stream_agent_tokens
+from app.caller_turn import process_caller_turn
 from app.call_flags import consume_end_call
 from app.reply_guard import is_repeated_reply
 
@@ -205,6 +206,46 @@ async def test_cancellation_reversal_with_new_request_routes_remaining_intent() 
     assert "seven" in reply.casefold()
     model.ainvoke.assert_awaited_once()
     clear_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_order_cancellation_is_not_a_reservation_reversal() -> None:
+    reversal = AsyncMock()
+    with (
+        patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
+        patch("app.caller_turn.begin_caller_turn", return_value=False),
+        patch(
+            "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
+            new=reversal,
+        ),
+    ):
+        result = await process_caller_turn(
+            "cancel-order-only",
+            "Don't cancel my pickup order; I need to change an item.",
+        )
+    assert result["handled"] is False
+    assert result["kind"] == "caller_turn"
+    reversal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_compound_reversal_does_not_continue_to_model() -> None:
+    reversal = AsyncMock(side_effect=RuntimeError("state unavailable"))
+    with (
+        patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
+        patch("app.caller_turn.begin_caller_turn", return_value=False),
+        patch(
+            "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
+            new=reversal,
+        ),
+    ):
+        result = await process_caller_turn(
+            "failed-reversal",
+            "Don't cancel it; I need to change the reservation.",
+        )
+    assert result["handled"] is True
+    assert result["kind"] == "cancellation_reversal_unavailable"
+    assert "couldn't verify" in result["message"].casefold()
 
 
 @pytest.mark.asyncio
