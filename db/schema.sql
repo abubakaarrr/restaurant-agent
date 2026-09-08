@@ -203,6 +203,7 @@ CREATE TABLE IF NOT EXISTS provider_webhook_events (
 -- ───────────────────── Operator knowledge loop ───────────────
 CREATE TABLE IF NOT EXISTS knowledge_gaps (
     id                  SERIAL PRIMARY KEY,
+    restaurant_id       TEXT,
     session_id          TEXT NOT NULL DEFAULT '',
     question            TEXT NOT NULL,
     question_normalized TEXT NOT NULL,
@@ -215,8 +216,8 @@ CREATE TABLE IF NOT EXISTS knowledge_gaps (
     resolved_at         TIMESTAMP,
     CHECK (status IN ('unresolved', 'resolved'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_gaps_session_question
-    ON knowledge_gaps (session_id, question_normalized);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_gaps_restaurant_session_question
+    ON knowledge_gaps (restaurant_id, session_id, question_normalized);
 CREATE INDEX IF NOT EXISTS idx_knowledge_gaps_status
     ON knowledge_gaps (status, created_at DESC);
 

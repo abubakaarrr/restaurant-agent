@@ -16,7 +16,7 @@ _CANCELLATION_REVERSAL_RE = re.compile(
     r"^\s*(?:"
     r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:]?\s+)?"
     r"(?:please\s+)?(?:do\s+not|don't)\s+cancel"
-    r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation)|(?=\s*(?:[,;:.!?]|$)))"
+    r"(?:\s+(?:it|that|the\s+reservation|my\s+reservation)(?:\s+yet)?|(?=\s*(?:[,;:.!?]|$)))"
     r"(?:[,;:]?\s+(?:please|i\s+was\s+just\s+(?:checking|asking)))?"
     r"|(?:actually[,;:]?\s+)?no[.,;:]?\s+(?:do\s+not|don't)\s+cancel\s+it\s+yet[.!]?\s+"
     r"i\s+was\s+just\s+checking\s+(?:what\s+)?the\s+cancellation\s+(?:process|policy)\s+is"
@@ -50,6 +50,14 @@ async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]
     try:
         result = await restaurant_service.reverse_pending_cancellation(sid)
     except Exception:
+        try:
+            await restaurant_service.invalidate_pending_cancellation(sid)
+        except Exception:
+            logger.warning(
+                "Unable to persist cancellation invalidation session=%s",
+                sid,
+                exc_info=True,
+            )
         logger.warning(
             "Unable to verify cancellation reversal session=%s", sid, exc_info=True
         )

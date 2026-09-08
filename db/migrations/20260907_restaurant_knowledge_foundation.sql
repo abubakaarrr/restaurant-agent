@@ -51,3 +51,8 @@ ALTER TABLE operator_knowledge ADD COLUMN IF NOT EXISTS restaurant_id TEXT NOT N
 DROP INDEX IF EXISTS uq_operator_knowledge_question_ci;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_knowledge_restaurant_question_ci
     ON operator_knowledge (restaurant_id, LOWER(question));
+
+ALTER TABLE knowledge_gaps ADD COLUMN IF NOT EXISTS restaurant_id TEXT;
+DROP INDEX IF EXISTS uq_knowledge_gaps_session_question;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_gaps_restaurant_session_question
+    ON knowledge_gaps (restaurant_id, session_id, question_normalized);

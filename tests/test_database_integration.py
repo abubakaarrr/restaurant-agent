@@ -1012,6 +1012,50 @@ async def test_booking_creation_does_not_rewrite_confirmed_delivery() -> None:
     assert dict(order["fulfillment_details"])["delivery_fee"] == 5
 
 
+async def test_booking_creation_attaches_only_unselected_draft_order() -> None:
+    call_id = "unselected-draft-before-booking"
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="unselected-draft-add",
+        item_name="Market Greens",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert added["fulfillment"] == "pickup"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        assert await connection.fetchval(
+            "SELECT fulfillment_type FROM orders WHERE session_id = $1", call_id
+        ) is None
+    finally:
+        await connection.close()
+
+    booking_date = _future_date()
+    confirmation = booking_confirmation_payload(
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+        date=booking_date,
+        time="19:00",
+        party_size=2,
+        notes="",
+    )
+    _arm(call_id, ACTION_CREATE_BOOKING, confirmation)
+    booked = await restaurant_service.create_booking(
+        call_id=call_id,
+        idempotency_key="unselected-draft-booking",
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+        date=booking_date,
+        time="19:00",
+        party_size=2,
+        notes="",
+        confirmed=True,
+    )
+    assert booked["order"]["fulfillment"] == "dine_in"
+    assert booked["order"]["booking_id"] == booked["booking_id"]
+    assert booked["order"]["fulfillment_details"] == {}
+
+
 async def test_confirmed_pickup_change_requires_staff_status_check() -> None:
     call_id = "confirmed-pickup-change"
     added = await restaurant_service.add_order_item(
@@ -1049,6 +1093,49 @@ async def test_confirmed_pickup_change_requires_staff_status_check() -> None:
     finally:
         await connection.close()
     assert quantity == 1
+
+
+async def test_legacy_confirmed_null_fulfillment_requires_staff_check() -> None:
+    call_id = "legacy-null-confirmed-fulfillment"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        menu_item = await connection.fetchrow(
+            "SELECT id, name, price FROM menu_items WHERE canonical_id = $1",
+            "menu.salad.market-greens",
+        )
+        order_id = await connection.fetchval(
+            """
+            INSERT INTO orders
+                (session_id, customer_name, customer_phone, status, fulfillment_type)
+            VALUES ($1, 'Morgan', '+15035550101', 'confirmed', NULL)
+            RETURNING id
+            """,
+            call_id,
+        )
+        order_item_id = await connection.fetchval(
+            """
+            INSERT INTO order_items
+                (order_id, menu_item_id, item_name, quantity, unit_price)
+            VALUES ($1, $2, $3, 1, $4)
+            RETURNING id
+            """,
+            order_id,
+            menu_item["id"],
+            menu_item["name"],
+            menu_item["price"],
+        )
+    finally:
+        await connection.close()
+
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.update_order_item(
+            call_id=call_id,
+            idempotency_key="legacy-null-confirmed-update",
+            order_item_id=order_item_id,
+            quantity=2,
+            caller_confirmed=True,
+        )
+    assert exc.value.code == "confirmed_fulfillment_change_requires_staff"
 
 
 async def test_dine_in_menu_period_uses_booking_time_and_rechecks_confirmation(
@@ -1254,3 +1341,76 @@ async def test_booking_time_change_rejects_expired_seasonal_order() -> None:
     finally:
         await connection.close()
     assert booked_at == datetime(2026, 9, 30, 19, 0)
+
+
+async def test_reschedule_ignores_later_inventory_for_confirmed_item() -> None:
+    call_id = "sold-out-order-booking-reschedule"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        menu_item = await connection.fetchrow(
+            "SELECT id, name, price FROM menu_items WHERE canonical_id = $1",
+            "menu.salad.market-greens",
+        )
+        booking_id = await connection.fetchval(
+            """
+            INSERT INTO bookings
+                (customer_name, customer_phone, table_id, booked_at, party_size)
+            VALUES ('Morgan', '+15035550101', 1, '2026-09-12 19:00', 2)
+            RETURNING id
+            """
+        )
+        order_id = await connection.fetchval(
+            """
+            INSERT INTO orders
+                (session_id, booking_id, customer_name, customer_phone,
+                 status, fulfillment_type)
+            VALUES ($1, $2, 'Morgan', '+15035550101', 'confirmed', 'dine_in')
+            RETURNING id
+            """,
+            call_id,
+            booking_id,
+        )
+        await connection.execute(
+            """
+            INSERT INTO order_items
+                (order_id, menu_item_id, item_name, quantity, unit_price)
+            VALUES ($1, $2, $3, 1, $4)
+            """,
+            order_id,
+            menu_item["id"],
+            menu_item["name"],
+            menu_item["price"],
+        )
+        await connection.execute(
+            """
+            UPDATE menu_items
+            SET available = FALSE, availability_status = 'sold_out'
+            WHERE id = $1
+            """,
+            menu_item["id"],
+        )
+        await connection.execute(
+            "INSERT INTO call_sessions (session_id, state) VALUES ($1, $2::jsonb)",
+            call_id,
+            json.dumps({"booking_id": booking_id}),
+        )
+    finally:
+        await connection.close()
+
+    await restaurant_service.update_confirmed_booking(
+        call_id=call_id,
+        idempotency_key="sold-out-reschedule-pending",
+        booking_id=booking_id,
+        confirmed=False,
+        date="2026-09-13",
+    )
+    begin_caller_turn(call_id, "yes")
+    updated = await restaurant_service.update_confirmed_booking(
+        call_id=call_id,
+        idempotency_key="sold-out-reschedule-confirmed",
+        booking_id=booking_id,
+        confirmed=True,
+        date="2026-09-13",
+    )
+    assert updated["updated"] is True
+    assert updated["date"] == "2026-09-13"

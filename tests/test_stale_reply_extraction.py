@@ -11,7 +11,15 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from app.agent.runner import _extract_reply, clear_session, run_agent, stream_agent_tokens
 from app.caller_turn import process_caller_turn
 from app.call_flags import consume_end_call
+from app.call_memory import clear_call_memory
+from app.pending_confirmation import (
+    ACTION_CANCEL_BOOKING,
+    cancel_booking_confirmation_payload,
+    get_pending_confirmation,
+    register_pending_confirmation,
+)
 from app.reply_guard import is_repeated_reply
+from app.services.restaurant import restaurant_service
 
 
 def test_extract_reply_ignores_assistant_text_before_latest_human() -> None:
@@ -229,14 +237,70 @@ async def test_order_cancellation_is_not_a_reservation_reversal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compound_reversal_accepts_yet_after_reservation_pronoun() -> None:
+    reversal = AsyncMock(
+        return_value={"reversed": True, "message": "The cancellation was stopped."}
+    )
+    with (
+        patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
+        patch("app.caller_turn.begin_caller_turn", return_value="negative"),
+        patch(
+            "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
+            new=reversal,
+        ),
+    ):
+        result = await process_caller_turn(
+            "cancel-yet-compound",
+            "Don't cancel it yet; I want to move it to seven.",
+        )
+    assert result["kind"] == "cancellation_reversal_with_remaining_intent"
+    assert result["handled"] is False
+    reversal.assert_awaited_once_with("cancel-yet-compound")
+
+
+@pytest.mark.asyncio
+async def test_reversal_persists_invalidation_before_booking_readback() -> None:
+    session_id = "cancel-invalidation-before-readback"
+    clear_call_memory(session_id)
+    register_pending_confirmation(
+        session_id,
+        ACTION_CANCEL_BOOKING,
+        cancel_booking_confirmation_payload(booking_id=87),
+    )
+    persist = AsyncMock()
+    lookup = AsyncMock(side_effect=RuntimeError("booking read unavailable"))
+    with (
+        patch.object(
+            restaurant_service,
+            "persist_call_state",
+            new=persist,
+        ),
+        patch.object(
+            restaurant_service,
+            "lookup_booking",
+            new=lookup,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="booking read unavailable"):
+            await restaurant_service.reverse_pending_cancellation(session_id)
+    assert get_pending_confirmation(session_id, ACTION_CANCEL_BOOKING) is None
+    assert persist.await_args.args[1]["pending_confirmations"] == {}
+
+
+@pytest.mark.asyncio
 async def test_failed_compound_reversal_does_not_continue_to_model() -> None:
     reversal = AsyncMock(side_effect=RuntimeError("state unavailable"))
+    invalidation = AsyncMock()
     with (
         patch("app.caller_turn.hydrate_call_memory", new=AsyncMock()),
         patch("app.caller_turn.begin_caller_turn", return_value=False),
         patch(
             "app.services.restaurant.restaurant_service.reverse_pending_cancellation",
             new=reversal,
+        ),
+        patch(
+            "app.services.restaurant.restaurant_service.invalidate_pending_cancellation",
+            new=invalidation,
         ),
     ):
         result = await process_caller_turn(
@@ -246,6 +310,7 @@ async def test_failed_compound_reversal_does_not_continue_to_model() -> None:
     assert result["handled"] is True
     assert result["kind"] == "cancellation_reversal_unavailable"
     assert "couldn't verify" in result["message"].casefold()
+    invalidation.assert_awaited_once_with("failed-reversal")
 
 
 @pytest.mark.asyncio

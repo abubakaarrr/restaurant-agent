@@ -29,6 +29,17 @@ def test_parking_word_maps_to_parking_not_table_availability() -> None:
     assert [record["topic_id"] for record in match.records] == ["topic.parking"]
 
 
+def test_equal_topic_aliases_return_ambiguity_instead_of_length_tiebreak() -> None:
+    match = get_restaurant_knowledge().find_topic(
+        "Do you have parking at your location?"
+    )
+    assert match.status == "ambiguous"
+    assert {record["topic_id"] for record in match.records} == {
+        "topic.address",
+        "topic.parking",
+    }
+
+
 @pytest.mark.asyncio
 async def test_unmatched_parking_question_is_logged_by_search_tool(monkeypatch) -> None:
     monkeypatch.setattr(
@@ -163,6 +174,15 @@ async def test_unknown_question_logs_and_resolve_is_searchable(monkeypatch) -> N
         await connection.execute(
             "TRUNCATE operator_knowledge, knowledge_gaps RESTART IDENTITY CASCADE"
         )
+        legacy_gap_id = await connection.fetchval(
+            """
+            INSERT INTO knowledge_gaps
+                (session_id, question, question_normalized)
+            VALUES ('legacy-call', 'Does Lamplighter have a rooftop?',
+                    'does lamplighter have a rooftop')
+            RETURNING id
+            """
+        )
         await connection.execute(
             """
             INSERT INTO operator_knowledge
@@ -181,6 +201,14 @@ async def test_unknown_question_logs_and_resolve_is_searchable(monkeypatch) -> N
 
     with pytest.raises(RestaurantServiceError):
         await restaurant_service.resolve_knowledge_gap(999, answer="Nope")
+    with pytest.raises(RestaurantServiceError) as legacy_error:
+        await restaurant_service.resolve_knowledge_gap(
+            legacy_gap_id,
+            answer="The old example restaurant has one.",
+        )
+    assert legacy_error.value.code == "gap_not_found"
+    listed = await restaurant_service.list_knowledge_gaps()
+    assert all(row["id"] != legacy_gap_id for row in listed["gaps"])
 
     logged = await restaurant_service.log_unknown_question(
         call_id="know-1",

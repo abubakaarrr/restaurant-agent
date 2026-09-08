@@ -974,7 +974,7 @@ async def test_knowledge_gap_rows_match_public_schema(
     )
 
     class Connection:
-        async def fetch(self, query: str) -> list[dict]:
+        async def fetch(self, query: str, *args: object) -> list[dict]:
             return next(responses)
 
     class Acquire:

@@ -419,11 +419,10 @@ class RestaurantKnowledge:
                 "known" if status == "current" else status,
                 (deepcopy(seating),),
             )
-        ranked: list[tuple[int, int, dict[str, Any]]] = []
+        ranked: list[tuple[int, dict[str, Any]]] = []
         stale: list[dict[str, Any]] = []
         for topic in self.topics:
             best_score = 0
-            best_length = 0
             phrases = [topic["topic_id"].removeprefix("topic.").replace("-", " ")]
             phrases.extend(topic.get("aliases") or [])
             for phrase in phrases:
@@ -446,30 +445,29 @@ class RestaurantKnowledge:
                     score += 2
                 if score > best_score:
                     best_score = score
-                    best_length = len(alias)
             if not best_score:
                 continue
             status = _effective_status(topic, today)
             if status != "current":
                 stale.append(topic)
                 continue
-            ranked.append((best_score, best_length, topic))
+            ranked.append((best_score, topic))
         if not ranked:
             if stale:
                 return TopicMatch(
                     _effective_status(stale[0], today), tuple(deepcopy(stale))
                 )
             return TopicMatch("unknown")
-        ranked.sort(key=lambda value: (-value[0], -value[1], value[2]["topic_id"]))
-        top_score, top_length, _ = ranked[0]
+        ranked.sort(key=lambda value: (-value[0], value[1]["topic_id"]))
+        top_score, _ = ranked[0]
         winners = [
             deepcopy(topic)
-            for score, length, topic in ranked
-            if score == top_score and length == top_length
+            for score, topic in ranked
+            if score == top_score
         ]
         if len(winners) > 1:
             return TopicMatch("ambiguous", tuple(winners))
-        return TopicMatch("known", (deepcopy(ranked[0][2]),))
+        return TopicMatch("known", (deepcopy(ranked[0][1]),))
 
     def resolve_customization(
         self,

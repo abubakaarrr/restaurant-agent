@@ -242,13 +242,19 @@ def _ensure_order_item_available_at(
     service_at: datetime,
     *,
     context: str,
+    require_current_inventory: bool = True,
 ) -> None:
     effective_from = item.get("effective_from")
     effective_to = item.get("effective_to")
     service_date = service_at.date()
     if (
-        not item.get("inventory_available")
-        or item.get("availability_status") != "available"
+        (
+            require_current_inventory
+            and (
+                not item.get("inventory_available")
+                or item.get("availability_status") != "available"
+            )
+        )
         or (
             effective_from
             and service_date < datetime.fromisoformat(str(effective_from)).date()
@@ -1039,7 +1045,8 @@ class RestaurantService:
                 """
                 UPDATE orders
                 SET booking_id = $1,
-                    fulfillment_type = 'dine_in'
+                    fulfillment_type = 'dine_in',
+                    fulfillment_details = '{}'::jsonb
                 WHERE session_id = $2
                   AND booking_id IS NULL
                   AND status = 'pending'
@@ -1301,6 +1308,7 @@ class RestaurantService:
                             attached_item,
                             proposed_at,
                             context="the proposed reservation time",
+                            require_current_inventory=False,
                         )
                 tables = await self.get_available_tables(
                     new_date,
@@ -1660,6 +1668,8 @@ class RestaurantService:
         pending = get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
         pending_payload = dict((pending or {}).get("payload") or {})
         memory = get_call_memory(call_id)
+        if pending:
+            await self.invalidate_pending_cancellation(call_id)
         try:
             booking_id = int(
                 pending_payload.get("booking_id") or memory.get("booking_id") or 0
@@ -1676,13 +1686,6 @@ class RestaurantService:
                 ),
             }
         booking = await self.lookup_booking(booking_id=booking_id)
-        if pending:
-            state_patch = pending_state_patch(call_id)
-            remaining = dict(state_patch.get("pending_confirmations") or {})
-            remaining.pop(ACTION_CANCEL_BOOKING, None)
-            state_patch["pending_confirmations"] = remaining
-            await self.persist_call_state(call_id, state_patch)
-            clear_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
         if booking["status"] == "cancelled":
             message = (
                 "That reservation is already cancelled, so I can't say it is unchanged. "
@@ -1701,6 +1704,11 @@ class RestaurantService:
             "status": booking["status"],
             "message": message,
         }
+
+    async def invalidate_pending_cancellation(self, call_id: str) -> None:
+        call_id = self._require_call_id(call_id)
+        clear_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
+        await self.persist_call_state(call_id, pending_state_patch(call_id))
 
     async def cancel_booking(
         self,
@@ -2385,7 +2393,7 @@ class RestaurantService:
                 booking_id,
             )
         if not order and create_if_missing:
-            fulfillment = "dine_in" if booking_id else "pickup"
+            fulfillment = "dine_in" if booking_id else None
             created = await conn.fetchrow(
                 """
                 INSERT INTO orders
@@ -2410,7 +2418,10 @@ class RestaurantService:
                 code="order_item_not_found" if order_item_id else "order_not_found",
                 status=404,
             )
-        if order["status"] == "confirmed" and order["fulfillment_type"] in {
+        fulfillment = order["fulfillment_type"] or (
+            "dine_in" if order["booking_id"] else "pickup"
+        )
+        if order["status"] == "confirmed" and fulfillment in {
             "pickup",
             "delivery",
         }:
@@ -3266,20 +3277,23 @@ class RestaurantService:
         normalized = normalize_question(question)
         excerpt = " ".join(context_excerpt.split())[:500]
         reply = " ".join(agent_response.split())[:500]
+        restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO knowledge_gaps
-                    (session_id, question, question_normalized, context_excerpt, agent_response)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (session_id, question_normalized) DO UPDATE
+                    (restaurant_id, session_id, question, question_normalized,
+                     context_excerpt, agent_response)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (restaurant_id, session_id, question_normalized) DO UPDATE
                 SET context_excerpt = CASE
                         WHEN knowledge_gaps.context_excerpt = '' THEN EXCLUDED.context_excerpt
                         ELSE knowledge_gaps.context_excerpt
                     END
                 RETURNING id, status, created_at
                 """,
+                restaurant_id,
                 call_id,
                 question,
                 normalized,
@@ -3295,6 +3309,7 @@ class RestaurantService:
         }
 
     async def list_knowledge_gaps(self) -> JsonDict:
+        restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
         pool = await get_pool()
         async with pool.acquire() as conn:
             gaps = await conn.fetch(
@@ -3302,17 +3317,21 @@ class RestaurantService:
                 SELECT id, session_id, question, context_excerpt, agent_response,
                        status, resolved_answer, resolved_by, created_at, resolved_at
                 FROM knowledge_gaps
+                WHERE restaurant_id = $1
                 ORDER BY CASE status WHEN 'unresolved' THEN 0 ELSE 1 END,
                          created_at DESC
-                """
+                """,
+                restaurant_id,
             )
             faq = await conn.fetch(
                 """
                 SELECT id, restaurant_id, question, answer, source_gap_id, active,
                        created_at, updated_at
                 FROM operator_knowledge
+                WHERE restaurant_id = $1
                 ORDER BY active DESC, updated_at DESC, id DESC
-                """
+                """,
+                restaurant_id,
             )
         return {
             "gaps": [
@@ -3365,10 +3384,11 @@ class RestaurantService:
                 gap = await conn.fetchrow(
                     """
                     SELECT id, question FROM knowledge_gaps
-                    WHERE id = $1
+                    WHERE id = $1 AND restaurant_id = $2
                     FOR UPDATE
                     """,
                     gap_id,
+                    restaurant_id,
                 )
                 if not gap:
                     raise RestaurantServiceError(
@@ -3420,11 +3440,12 @@ class RestaurantService:
                         resolved_answer = $2,
                         resolved_by = $3,
                         resolved_at = NOW()
-                    WHERE id = $1
+                    WHERE id = $1 AND restaurant_id = $4
                     """,
                     gap["id"],
                     answer,
                     resolved_by,
+                    restaurant_id,
                 )
         return {
             "resolved": True,
