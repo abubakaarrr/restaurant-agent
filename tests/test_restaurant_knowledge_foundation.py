@@ -655,6 +655,41 @@ async def test_conversation_inputs_execute_grounded_menu_tool(
 
 
 @pytest.mark.asyncio
+async def test_menu_search_normalizes_plural_allergen_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = get_restaurant_knowledge().find_menu_item("Chilled Peanut Noodles").item
+
+    async def canonical_menu(*, available_only: bool = True) -> dict:
+        return {
+            "items": [
+                {
+                    "name": item["name"],
+                    "category": item["category_id"],
+                    "description": item["description"],
+                    "dietary": item["dietary_tags"],
+                    "aliases": item["aliases"],
+                    "ingredients": item["ingredients"],
+                    "allergens": item["allergens"],
+                    "price": item["price"],
+                    "price_estimated": False,
+                    "available": True,
+                    "availability": item["availability"],
+                    "cross_contact": item["cross_contact"],
+                }
+            ],
+            "allergen_notice": item["cross_contact"],
+    }
+
+    monkeypatch.setattr(restaurant_service, "list_menu", canonical_menu)
+    result = (
+        await search_menu.ainvoke({"query": "Which dishes contain peanuts?"})
+    ).casefold()
+    assert "chilled peanut noodles" in result
+    assert "allergy safety" in result
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("query", "expected"),
     [

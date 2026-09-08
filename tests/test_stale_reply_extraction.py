@@ -259,7 +259,14 @@ async def test_compound_reversal_accepts_yet_after_reservation_pronoun() -> None
 
 
 @pytest.mark.asyncio
-async def test_compound_reversal_accepts_leading_actually() -> None:
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "Actually, don't cancel it; move it to seven.",
+        "No, don't cancel my booking; move it to seven.",
+    ],
+)
+async def test_compound_reversal_accepts_leading_correction(utterance: str) -> None:
     reversal = AsyncMock(
         return_value={"reversed": True, "message": "The cancellation was stopped."}
     )
@@ -273,7 +280,7 @@ async def test_compound_reversal_accepts_leading_actually() -> None:
     ):
         result = await process_caller_turn(
             "cancel-actually-compound",
-            "Actually, don't cancel it; move it to seven.",
+            utterance,
         )
     assert result["kind"] == "cancellation_reversal_with_remaining_intent"
     assert result["handled"] is False

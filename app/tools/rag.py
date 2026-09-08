@@ -14,9 +14,21 @@ from app.services.restaurant import (
 )
 
 
+def _normalize_token(token: str) -> str:
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 4 and token.endswith(
+        ("ches", "shes", "sses", "xes", "zes")
+    ):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+
 def _tokens(value: str) -> set[str]:
     return {
-        token
+        _normalize_token(token)
         for token in re.findall(r"[a-z0-9]+", value.casefold())
         if len(token) > 2
     }
@@ -53,6 +65,7 @@ async def search_menu(query: str, session_id: str = "") -> str:
     if not matches:
         return "No grounded menu result matched that question. Ask the caller to clarify."
     selected = matches[:8]
+
     def _availability_label(item: dict) -> str:
         if item.get("available"):
             return "available"

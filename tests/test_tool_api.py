@@ -68,6 +68,15 @@ def test_managed_caller_turn_endpoint_is_not_exposed(client: TestClient) -> None
     assert response.status_code == 404
 
 
+def test_managed_order_notes_endpoint_is_not_exposed(client: TestClient) -> None:
+    response = client.post(
+        "/api/voice-tools/orders/notes",
+        headers={"X-Voice-Tool-Secret": "test-tool-secret"},
+        json={"call_id": "managed-call-1", "order_notes": "No utensils"},
+    )
+    assert response.status_code == 404
+
+
 def test_menu_endpoint_requests_complete_menu(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

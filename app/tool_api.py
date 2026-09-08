@@ -94,11 +94,6 @@ class MenuItemRequest(BaseModel):
 class AddOrderItemRequest(CallRequest, MenuItemRequest):
     quantity: int = Field(default=1, ge=1, le=20)
     notes: str = Field(default="", max_length=300)
-    modifier_ids: list[str] = Field(default_factory=list, max_length=12)
-    removals: list[str] = Field(default_factory=list, max_length=12)
-    substitutions: list[str] = Field(default_factory=list, max_length=12)
-    order_notes: str = Field(default="", max_length=500)
-    allergy_notes: str = Field(default="", max_length=500)
     booking_id: int = Field(default=0, ge=0)
     customer_name: str = Field(default="", max_length=100)
     customer_phone: str = Field(default="", max_length=200)
@@ -125,14 +120,6 @@ class ConfirmOrderRequest(CallRequest):
 class SetOrderFulfillmentRequest(CallRequest):
     fulfillment_type: str = Field(min_length=1, max_length=20)
     booking_id: int = Field(default=0, ge=0)
-    delivery_address: str = Field(default="", max_length=300)
-    delivery_instructions: str = Field(default="", max_length=300)
-
-
-class SetOrderNotesRequest(CallRequest):
-    order_notes: str | None = Field(default=None, max_length=500)
-    allergy_notes: str | None = Field(default=None, max_length=500)
-    confirmed: bool = False
 
 
 class LookupOrderRequest(BaseModel):
@@ -480,11 +467,6 @@ async def add_order_item(
             item_name=body.item_name,
             quantity=body.quantity,
             notes=body.notes,
-            modifier_ids=body.modifier_ids,
-            removals=body.removals,
-            substitutions=body.substitutions,
-            order_notes=body.order_notes,
-            allergy_notes=body.allergy_notes,
             booking_id=body.booking_id,
             customer_name=body.customer_name,
             customer_phone=body.customer_phone,
@@ -516,29 +498,8 @@ async def set_order_fulfillment(
             idempotency_key=idempotency_key,
             fulfillment_type=body.fulfillment_type,
             booking_id=body.booking_id or None,
-            delivery_address=body.delivery_address,
-            delivery_instructions=body.delivery_instructions,
         )
         _audit(body.call_id, "set_order_fulfillment", result)
-        return _ok(result)
-    except RestaurantServiceError as error:
-        _raise_service_error(error)
-
-
-@router.post("/orders/notes", dependencies=[ToolAuth])
-async def set_order_notes(
-    body: SetOrderNotesRequest,
-    idempotency_key: str = Header(default="", alias="Idempotency-Key"),
-) -> dict[str, Any]:
-    try:
-        result = await restaurant_service.set_order_notes(
-            call_id=body.call_id,
-            idempotency_key=idempotency_key,
-            order_notes=body.order_notes,
-            allergy_notes=body.allergy_notes,
-            caller_confirmed=body.confirmed,
-        )
-        _audit(body.call_id, "set_order_notes", result)
         return _ok(result)
     except RestaurantServiceError as error:
         _raise_service_error(error)

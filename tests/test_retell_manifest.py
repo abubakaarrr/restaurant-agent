@@ -20,6 +20,13 @@ def test_retell_manifest_references_real_routes_and_prompts() -> None:
         tool["name"] != "process_caller_turn"
         for tool in manifest["conversation_flow_review"]["tool_endpoint_placeholders"]
     )
+    assert "synthetic_local_delivery_order" not in manifest["conversation_flow_review"][
+        "required_paths"
+    ]
+    assert {
+        tool["name"]
+        for tool in manifest["conversation_flow_review"]["tool_endpoint_placeholders"]
+    }.isdisjoint({"set_order_fulfillment", "set_order_notes"})
 
     routes = {
         (route.path, method)
