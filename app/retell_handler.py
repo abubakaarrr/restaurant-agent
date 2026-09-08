@@ -406,11 +406,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 continue
 
             if directive.direct_reply is not None:
-                transfer_number = (
-                    current_staff_transfer_number()
-                    if directive.control is BehaviorControl.HANDOFF
-                    else ""
-                )
+                transfer_number = directive.transfer_number
                 await send(
                     _response_event(
                         active_response_id,

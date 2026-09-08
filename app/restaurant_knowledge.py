@@ -347,7 +347,7 @@ class RestaurantKnowledge:
         }
 
     def current_menu(self, *, on_date: date | None = None) -> list[dict[str, Any]]:
-        today = on_date or date.today()
+        today = on_date or self.local_date()
         return [
             deepcopy(item)
             for item in self.menu_items
@@ -358,7 +358,7 @@ class RestaurantKnowledge:
         requested = normalize_text(query)
         if not requested:
             return MenuMatch("missing")
-        today = on_date or date.today()
+        today = on_date or self.local_date()
         current = self.current_menu(on_date=today)
         all_records = list(self.menu_items)
 
@@ -406,7 +406,7 @@ class RestaurantKnowledge:
         query_tokens = text_tokens(normalized)
         if not query_tokens:
             return TopicMatch("missing")
-        today = on_date or date.today()
+        today = on_date or self.local_date()
         if "open" in query_tokens and query_tokens & {"table", "tables"}:
             seating = next(
                 topic for topic in self.topics if topic["topic_id"] == "topic.seating"
@@ -428,14 +428,13 @@ class RestaurantKnowledge:
                 alias_tokens = text_tokens(alias)
                 if not alias_tokens or not alias_tokens <= query_tokens:
                     continue
-                if alias_tokens == {"open"} and query_tokens & {
-                    "table",
-                    "tables",
-                    "reservation",
-                    "reservations",
-                    "booking",
-                    "book",
-                }:
+                if (
+                    topic["topic_id"] == "topic.hours"
+                    and alias_tokens in ({"open"}, {"close"})
+                    and not self._hours_alias_has_context(
+                        alias, normalized, query_tokens
+                    )
+                ):
                     continue
                 score = len(alias_tokens) * 10
                 if normalized == alias:
@@ -762,7 +761,54 @@ class RestaurantKnowledge:
             "customer_message": "The item is not available in the current service period.",
         }
 
-    def resolve_hours_query(self, query: str) -> dict[str, Any] | None:
+    def local_date(self) -> date:
+        return datetime.now(ZoneInfo(self.identity["timezone"])).date()
+
+    @staticmethod
+    def _hours_alias_has_context(
+        alias: str, normalized_query: str, query_tokens: set[str]
+    ) -> bool:
+        if normalized_query == alias:
+            return True
+        if alias == "close" and re.search(r"\bclose\s+to\b", normalized_query):
+            return False
+        if query_tokens & {
+            "table",
+            "tables",
+            "reservation",
+            "reservations",
+            "booking",
+            "book",
+        }:
+            return False
+        temporal_tokens = {
+            "when",
+            "time",
+            "hours",
+            "today",
+            "tonight",
+            "tomorrow",
+            "late",
+            "until",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+            *_MONTHS,
+        }
+        if query_tokens & temporal_tokens:
+            return True
+        return bool(
+            alias == "open"
+            and re.search(r"\b(?:are|will)\s+you\s+open\b", normalized_query)
+        )
+
+    def resolve_hours_query(
+        self, query: str, *, on_date: date | None = None
+    ) -> dict[str, Any] | None:
         normalized = normalize_text(query)
         tokens = text_tokens(query)
         requested_date: date | None = None
@@ -780,8 +826,7 @@ class RestaurantKnowledge:
                 normalized,
             )
             if month_match:
-                fixture_year = date.fromisoformat(self.raw["effective_from"]).year
-                year = int(month_match.group(3) or fixture_year)
+                year = int(month_match.group(3) or (on_date or self.local_date()).year)
                 try:
                     requested_date = date(
                         year,
@@ -792,6 +837,7 @@ class RestaurantKnowledge:
                     return None
 
         exceptions = self.raw["hours"].get("exceptions") or []
+        requested_year = supplied_year or (on_date or self.local_date()).year
         mismatched_named_exception = False
         for exception in exceptions:
             start = datetime.fromisoformat(exception["starts_at"])
@@ -803,11 +849,7 @@ class RestaurantKnowledge:
                 if token not in {"hours", "holiday", "private", "event", str(exception_date.year)}
             }
             named_exception = bool(name_tokens) and name_tokens <= tokens
-            if (
-                named_exception
-                and supplied_year is not None
-                and supplied_year != exception_date.year
-            ):
+            if named_exception and requested_year != exception_date.year:
                 mismatched_named_exception = True
                 continue
             if requested_date == exception_date or named_exception:
@@ -823,10 +865,10 @@ class RestaurantKnowledge:
         if mismatched_named_exception:
             return {
                 "status": "unavailable",
-                "date": str(supplied_year),
+                "date": str(requested_year),
                 "kind": "exception_not_published",
                 "customer_message": (
-                    f"Hours for that {supplied_year} holiday are not in the current "
+                    f"Hours for that {requested_year} holiday are not in the current "
                     "Harbor & Hearth schedule. I won't reuse another year's hours."
                 ),
             }

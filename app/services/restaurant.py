@@ -13,7 +13,6 @@ import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -39,8 +38,6 @@ from app.restaurant_settings import HOURS_UNCONFIRMED_NOTE, load_restaurant_sett
 from app.restaurant_knowledge import (
     KnowledgeFixtureError,
     get_restaurant_knowledge,
-    normalize_text as normalize_knowledge_text,
-    text_tokens,
 )
 from app.security import canonical_request_hash, normalize_caller_phone
 from app.pending_confirmation import (
@@ -330,20 +327,15 @@ class RestaurantService:
         *,
         order_notes: str | None = None,
         allergy_notes: str | None = None,
-        order_id: int = 0,
-        booking_id: int = 0,
+        order_id: int,
     ) -> None:
-        if bool(order_id) == bool(booking_id):
-            raise ValueError("Specify exactly one order note owner")
-        owner_column = "id" if order_id else "booking_id"
-        owner_value = order_id or booking_id
         await conn.execute(
-            f"""
+            """
             UPDATE orders
             SET notes = CASE WHEN $1::text IS NULL THEN notes ELSE $1 END,
                 allergy_notes = CASE WHEN $2::text IS NULL THEN allergy_notes ELSE $2 END,
                 draft_version = draft_version + 1
-            WHERE {owner_column} = $3
+            WHERE id = $3
               AND (
                   ($1::text IS NOT NULL AND notes IS DISTINCT FROM $1)
                   OR ($2::text IS NOT NULL AND allergy_notes IS DISTINCT FROM $2)
@@ -351,7 +343,7 @@ class RestaurantService:
             """,
             order_notes,
             allergy_notes,
-            owner_value,
+            order_id,
         )
 
     @staticmethod
@@ -1280,11 +1272,6 @@ class RestaurantService:
                 booking_id,
                 require_approval_for_paid_items,
             )
-            await self._update_order_notes_with_conn(
-                conn,
-                order_notes=rebuilt_notes,
-                booking_id=booking_id,
-            )
             await conn.execute(
                 "UPDATE orders SET customer_name = $1 WHERE booking_id = $2",
                 updated_name,
@@ -1402,11 +1389,22 @@ class RestaurantService:
                     combined,
                     row["id"],
                 )
-                await self._update_order_notes_with_conn(
-                    conn,
-                    order_notes=combined,
-                    booking_id=row["id"],
+                attached_order = await conn.fetchrow(
+                    """
+                    SELECT id, notes FROM orders
+                    WHERE booking_id = $1 AND status IN ('pending', 'confirmed')
+                    ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    row["id"],
                 )
+                if attached_order:
+                    await self._update_order_notes_with_conn(
+                        conn,
+                        order_notes=_combine_notes(attached_order["notes"] or "", note),
+                        order_id=attached_order["id"],
+                    )
                 saved_on_booking = True
                 target_booking = int(row["id"])
             else:
@@ -1756,14 +1754,22 @@ class RestaurantService:
                 pass
         return {**result, "idempotent_replay": replayed}
 
-    async def list_menu(self, *, available_only: bool = True) -> JsonDict:
+    async def list_menu(
+        self,
+        *,
+        available_only: bool = True,
+        at: datetime | None = None,
+        conn: Any | None = None,
+    ) -> JsonDict:
+        moment = at or _restaurant_now()
+        local_date = moment.date()
         try:
             knowledge = get_restaurant_knowledge()
             canonical_source_id = knowledge.metadata["source_id"]
             canonical_item_ids = [item["item_id"] for item in knowledge.menu_items]
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
+
+            async def fetch_rows(active_conn: Any) -> list[Any]:
+                return await active_conn.fetch(
                     """
                     SELECT id, canonical_id, name, aliases, category, price,
                            description, dietary, ingredients, allergens,
@@ -1774,8 +1780,8 @@ class RestaurantService:
                            (
                                available = TRUE
                                AND availability_status = 'available'
-                               AND (effective_from IS NULL OR effective_from <= CURRENT_DATE)
-                               AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+                               AND (effective_from IS NULL OR effective_from <= $4::date)
+                               AND (effective_to IS NULL OR effective_to >= $4::date)
                            ) AS available
                     FROM menu_items
                     WHERE source_id = $2
@@ -1785,8 +1791,8 @@ class RestaurantService:
                           OR (
                               available = TRUE
                               AND availability_status = 'available'
-                              AND (effective_from IS NULL OR effective_from <= CURRENT_DATE)
-                              AND (effective_to IS NULL OR effective_to >= CURRENT_DATE)
+                              AND (effective_from IS NULL OR effective_from <= $4::date)
+                              AND (effective_to IS NULL OR effective_to >= $4::date)
                           )
                     )
                     ORDER BY category, name
@@ -1794,7 +1800,14 @@ class RestaurantService:
                     available_only,
                     canonical_source_id,
                     canonical_item_ids,
+                    local_date,
                 )
+            if conn is None:
+                pool = await get_pool()
+                async with pool.acquire() as active_conn:
+                    rows = await fetch_rows(active_conn)
+            else:
+                rows = await fetch_rows(conn)
         except Exception as exc:
             raise RestaurantServiceError(
                 "Current menu information is temporarily unavailable. I can take a callback message, but I cannot confirm menu availability.",
@@ -1802,14 +1815,12 @@ class RestaurantService:
                 status=503,
             ) from exc
 
-        now = _restaurant_now()
-
         def _menu_payload(row: Any) -> JsonDict:
             metadata = _json_value(row["knowledge_metadata"] or {})
             if not isinstance(metadata, dict):
                 metadata = {}
             service_status = knowledge.menu_service_status(
-                row["service_periods"] or [], now
+                row["service_periods"] or [], moment
             )
             available = bool(row["available"]) and bool(service_status["available"])
             return {
@@ -1857,66 +1868,35 @@ class RestaurantService:
             ),
         }
 
-    async def find_menu_item(self, item_name: str) -> JsonDict:
-        requested = normalize_knowledge_text(item_name)
-        if not requested:
+    async def find_menu_item(
+        self,
+        item_name: str,
+        *,
+        at: datetime | None = None,
+        conn: Any | None = None,
+    ) -> JsonDict:
+        if not str(item_name or "").strip():
             raise RestaurantServiceError("An item_name is required.")
-        menu = await self.list_menu(available_only=False)
+        moment = at or _restaurant_now()
+        knowledge = get_restaurant_knowledge()
+        canonical_match = knowledge.find_menu_item(item_name, on_date=moment.date())
+        menu = await self.list_menu(available_only=False, at=moment, conn=conn)
         items: list[JsonDict] = menu["items"]
-        exact = [
-            item
-            for item in items
-            if requested
-            in {
-                normalize_knowledge_text(item["name"]),
-                *(normalize_knowledge_text(alias) for alias in item.get("aliases") or []),
-            }
-        ]
-        if len(exact) == 1:
-            return {"match": exact[0], "needs_confirmation": False, "candidates": []}
-
-        requested_tokens = text_tokens(requested)
-        contained = []
-        for item in items:
-            item_tokens = text_tokens(item["name"])
-            if requested_tokens and (
-                requested_tokens < item_tokens or item_tokens < requested_tokens
-            ):
-                contained.append(item)
-        if len(contained) == 1:
-            return {
-                "match": None,
-                "needs_confirmation": True,
-                "candidates": contained,
-            }
-        if contained:
-            contained.sort(key=lambda item: item["name"])
-            return {
-                "match": None,
-                "needs_confirmation": True,
-                "candidates": contained[:3],
-            }
-
-        ranked = sorted(
-            (
-                (
-                    max(
-                        SequenceMatcher(
-                            None, requested, normalize_knowledge_text(candidate)
-                        ).ratio()
-                        for candidate in [item["name"], *(item.get("aliases") or [])]
-                    ),
-                    item,
-                )
-                for item in items
-            ),
-            key=lambda pair: pair[0],
-            reverse=True,
+        items_by_id = {item["item_id"]: item for item in items}
+        matched = (
+            items_by_id.get(canonical_match.item["item_id"])
+            if canonical_match.item is not None
+            else None
         )
-        candidates = [item for score, item in ranked[:3] if score >= 0.72]
+        candidates = [
+            items_by_id[candidate["item_id"]]
+            for candidate in canonical_match.candidates
+            if candidate["item_id"] in items_by_id
+        ]
         return {
-            "match": None,
-            "needs_confirmation": bool(candidates),
+            "match": matched,
+            "status": canonical_match.status,
+            "needs_confirmation": canonical_match.status == "ambiguous",
             "candidates": candidates,
         }
 
@@ -1980,48 +1960,18 @@ class RestaurantService:
             raise RestaurantServiceError(
                 "Quantity must be between 1 and 20.", code="invalid_quantity"
             )
-        match = await self.find_menu_item(item_name)
-        if not match["match"]:
-            return {
-                "added": False,
-                "needs_confirmation": match["needs_confirmation"],
-                "candidates": match["candidates"],
-            }
-        menu_item = match["match"]
-        if not menu_item["available"]:
-            return {
-                "added": False,
-                "unavailable": True,
-                "item": menu_item,
-                "candidates": [
-                    item
-                    for item in (await self.list_menu())["items"]
-                    if item.get("item_id") in set(menu_item.get("alternative_item_ids") or [])
-                ],
-            }
-        if menu_item.get("item_id", "").startswith("menu.alcohol.") or "alcohol" in (
-            menu_item.get("dietary_tags") or []
+        canonical_item = get_restaurant_knowledge().find_menu_item(
+            item_name, on_date=_restaurant_now().date()
+        ).item
+        if canonical_item and (
+            canonical_item.get("item_id", "").startswith("menu.alcohol.")
+            or "alcohol" in (canonical_item.get("dietary_tags") or [])
         ):
             raise RestaurantServiceError(
                 "Alcohol is available as read-only synthetic menu information and cannot be added to an order.",
                 code="alcohol_transaction_unsupported",
                 status=409,
             )
-        customization = get_restaurant_knowledge().resolve_customization(
-            menu_item,
-            modifier_ids=modifier_ids,
-            removals=removals,
-            substitutions=substitutions,
-        )
-        if customization["status"] != "valid":
-            return {
-                "added": False,
-                "needs_confirmation": customization["status"] == "clarification_required",
-                "customization_status": customization["status"],
-                "message": customization["message"],
-                "choices": customization.get("choices", []),
-                "candidates": [],
-            }
         name = self._validate_name(customer_name) if customer_name else ""
         phone = self._validate_phone(customer_phone) if customer_phone else ""
         notes = notes.strip()[:300]
@@ -2029,12 +1979,12 @@ class RestaurantService:
         allergy_notes = allergy_notes.strip()[:500]
         payload = {
             "call_id": call_id,
-            "menu_item_id": menu_item["id"],
+            "item_name": item_name,
             "quantity": quantity,
             "notes": notes,
-            "modifiers": customization["modifiers"],
-            "removals": customization["removals"],
-            "substitutions": customization["substitutions"],
+            "modifier_ids": list(modifier_ids),
+            "removals": list(removals),
+            "substitutions": list(substitutions),
             "order_notes": order_notes,
             "allergy_notes": allergy_notes,
             "booking_id": booking_id,
@@ -2047,6 +1997,74 @@ class RestaurantService:
             resolved_booking = booking_id or await self._booking_id_from_session(
                 conn, call_id
             )
+            if not resolved_booking:
+                resolved_booking = int(
+                    await conn.fetchval(
+                        """
+                        SELECT COALESCE(booking_id, 0) FROM orders
+                        WHERE session_id = $1 AND status IN ('pending', 'confirmed')
+                        ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
+                        LIMIT 1
+                        """,
+                        call_id,
+                    )
+                    or 0
+                )
+            service_at = _restaurant_now()
+            if resolved_booking:
+                booked_at = await conn.fetchval(
+                    "SELECT booked_at FROM bookings WHERE id = $1 AND status = 'confirmed'",
+                    resolved_booking,
+                )
+                if booked_at is not None:
+                    service_at = booked_at
+            match = await self.find_menu_item(item_name, at=service_at, conn=conn)
+            if not match["match"]:
+                return {
+                    "added": False,
+                    "status": match.get("status", "unknown"),
+                    "needs_confirmation": match["needs_confirmation"],
+                    "candidates": match["candidates"],
+                }
+            menu_item = match["match"]
+            if not menu_item["available"]:
+                alternatives = {
+                    item.get("item_id"): item
+                    for item in (await self.list_menu(at=service_at, conn=conn))["items"]
+                }
+                return {
+                    "added": False,
+                    "unavailable": True,
+                    "item": menu_item,
+                    "candidates": [
+                        alternatives[item_id]
+                        for item_id in menu_item.get("alternative_item_ids") or []
+                        if item_id in alternatives
+                    ],
+                }
+            if menu_item.get("item_id", "").startswith(
+                "menu.alcohol."
+            ) or "alcohol" in (menu_item.get("dietary_tags") or []):
+                raise RestaurantServiceError(
+                    "Alcohol is available as read-only synthetic menu information and cannot be added to an order.",
+                    code="alcohol_transaction_unsupported",
+                    status=409,
+                )
+            customization = get_restaurant_knowledge().resolve_customization(
+                menu_item,
+                modifier_ids=modifier_ids,
+                removals=removals,
+                substitutions=substitutions,
+            )
+            if customization["status"] != "valid":
+                return {
+                    "added": False,
+                    "needs_confirmation": customization["status"] == "clarification_required",
+                    "customization_status": customization["status"],
+                    "message": customization["message"],
+                    "choices": customization.get("choices", []),
+                    "candidates": [],
+                }
             order = await self._lock_order_for_mutation(
                 conn,
                 call_id=call_id,
@@ -2296,7 +2314,9 @@ class RestaurantService:
             """
             SELECT oi.id, oi.item_name, oi.quantity, oi.unit_price, oi.subtotal,
                    oi.notes, oi.modifiers, oi.removals, oi.substitutions,
-                   mi.canonical_id, mi.dietary,
+                   mi.canonical_id, mi.dietary, mi.service_periods,
+                   mi.available AS inventory_available, mi.availability_status,
+                   mi.effective_from, mi.effective_to,
                    COALESCE(oi.proposed, FALSE) AS proposed
             FROM order_items oi
             LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
@@ -2321,6 +2341,11 @@ class RestaurantService:
                 "removals": list(item["removals"] or []),
                 "substitutions": _json_value(item["substitutions"] or []),
                 "dietary_tags": list(item["dietary"] or []),
+                "service_periods": list(item["service_periods"] or []),
+                "inventory_available": bool(item["inventory_available"]),
+                "availability_status": item["availability_status"] or "unavailable",
+                "effective_from": str(item["effective_from"] or ""),
+                "effective_to": str(item["effective_to"] or ""),
                 "proposed": bool(item["proposed"]),
             }
 
@@ -2768,6 +2793,48 @@ class RestaurantService:
                 raise RestaurantServiceError(
                     "The draft order is empty.", code="empty_order", status=409
                 )
+            service_at = _restaurant_now()
+            if summary["fulfillment"] == "dine_in":
+                service_at = await conn.fetchval(
+                    "SELECT booked_at FROM bookings WHERE id = $1 AND status = 'confirmed'",
+                    order["booking_id"],
+                )
+                if service_at is None:
+                    raise RestaurantServiceError(
+                        "A confirmed reservation is required for a dine-in pre-order.",
+                        code="booking_required",
+                        status=409,
+                    )
+            service_date = service_at.date()
+            for item in summary["items"]:
+                effective_from = item.get("effective_from")
+                effective_to = item.get("effective_to")
+                if (
+                    not item.get("inventory_available")
+                    or item.get("availability_status") != "available"
+                    or (
+                        effective_from
+                        and service_date < datetime.fromisoformat(effective_from).date()
+                    )
+                    or (
+                        effective_to
+                        and service_date > datetime.fromisoformat(effective_to).date()
+                    )
+                ):
+                    raise RestaurantServiceError(
+                        f"{item['item_name']} is not available for that fulfillment time.",
+                        code="menu_item_unavailable",
+                        status=409,
+                    )
+                service_status = get_restaurant_knowledge().menu_service_status(
+                    item.get("service_periods") or [], service_at
+                )
+                if not service_status["available"]:
+                    raise RestaurantServiceError(
+                        f"{item['item_name']} is not available during that service period.",
+                        code="service_period_unavailable",
+                        status=409,
+                    )
             if any(
                 item.get("item_id", "").startswith("menu.alcohol.")
                 or "alcohol" in (item.get("dietary_tags") or [])

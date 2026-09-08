@@ -138,13 +138,14 @@ def search_faq_rows(
         overlap = query_tokens & question_tokens
         normalized_faq = normalize_question(question)
         phrase_match = bool(
-            normalized_query
+            min(len(query_tokens), len(question_tokens)) >= 2
+            and normalized_query
             and (
                 normalized_query in normalized_faq
                 or normalized_faq in normalized_query
             )
         )
-        if not phrase_match and len(overlap) < 2 and not query_tokens <= question_tokens:
+        if not phrase_match and len(overlap) < 2:
             continue
         points = len(overlap) + (100 if phrase_match else 0)
         scored.append(

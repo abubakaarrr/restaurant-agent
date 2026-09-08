@@ -270,6 +270,7 @@ class BehaviorDirective:
     reminder_after_seconds: float
     direct_reply: str | None = None
     control: BehaviorControl = BehaviorControl.CONTINUE
+    transfer_number: str = ""
     pace: PacePreference | None = None
     locale: str | None = None
     accessibility_preferences: tuple[AccessibilityPreference, ...] = field(
@@ -831,6 +832,7 @@ def _direct_reply(
     control: BehaviorControl,
     terminal_reason: str | None,
     handoff_reason: str | None,
+    handoff_destination: Mapping[str, Any] | None,
     silence_count: int,
     boundary_kind: str | None,
     boundary_strikes: int,
@@ -839,7 +841,7 @@ def _direct_reply(
     safe_humor: bool,
 ) -> str | None:
     if handoff_reason is not None:
-        destination = resolve_handoff_destination(handoff_reason)
+        destination = handoff_destination or {}
         if destination["can_transfer"]:
             return "Of course. I'll connect you with a staff member now."
         if destination["owner"] == "manager_callback":
@@ -1286,6 +1288,7 @@ def reduce_behavior(
         control=control,
         terminal_reason=terminal_reason,
         handoff_reason=handoff_reason,
+        handoff_destination=destination,
         silence_count=silence_count,
         boundary_kind=boundary_kind,
         boundary_strikes=boundary_strikes,
@@ -1319,6 +1322,11 @@ def reduce_behavior(
         reminder_after_seconds=reminder_after,
         direct_reply=direct_reply,
         control=control,
+        transfer_number=(
+            str(destination["transfer_number"])
+            if control is BehaviorControl.HANDOFF and destination
+            else ""
+        ),
         pace=effective_pace,
         locale=explicit_locale,
         accessibility_preferences=accessibility,

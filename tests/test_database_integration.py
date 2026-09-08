@@ -600,3 +600,124 @@ async def test_seeded_alcohol_item_cannot_be_confirmed_as_transaction() -> None:
         ) == "pending"
     finally:
         await connection.close()
+
+
+async def test_booking_note_sync_preserves_order_owned_notes() -> None:
+    call_id = "booking-order-note-ownership"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        booking_id = await connection.fetchval(
+            """
+            INSERT INTO bookings
+                (customer_name, customer_phone, table_id, booked_at, party_size, notes)
+            VALUES ('Morgan', '+15035550101', 1, '2026-09-12 19:00', 2, '')
+            RETURNING id
+            """
+        )
+        await connection.execute(
+            "INSERT INTO call_sessions (session_id, state) VALUES ($1, $2::jsonb)",
+            call_id,
+            json.dumps({"booking_id": booking_id}),
+        )
+        order_id = await connection.fetchval(
+            """
+            INSERT INTO orders
+                (session_id, booking_id, customer_name, customer_phone,
+                 fulfillment_type, notes)
+            VALUES ($1, $2, 'Morgan', '+15035550101', 'dine_in', 'No utensils')
+            RETURNING id
+            """,
+            call_id,
+            booking_id,
+        )
+    finally:
+        await connection.close()
+
+    noted = await restaurant_service.add_guest_note(
+        call_id=call_id,
+        idempotency_key="booking-note-sync-1",
+        note="Quiet table if possible",
+        booking_id=booking_id,
+    )
+    assert noted["saved"] is True
+
+    await restaurant_service.update_confirmed_booking(
+        call_id=call_id,
+        idempotency_key="booking-note-update-1",
+        booking_id=booking_id,
+        confirmed=False,
+        occasion="Birthday",
+    )
+    begin_caller_turn(call_id, "yes")
+    await restaurant_service.update_confirmed_booking(
+        call_id=call_id,
+        idempotency_key="booking-note-update-2",
+        booking_id=booking_id,
+        confirmed=True,
+        occasion="Birthday",
+    )
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        assert await connection.fetchval(
+            "SELECT notes FROM orders WHERE id = $1", order_id
+        ) == "No utensils; Quiet table if possible"
+    finally:
+        await connection.close()
+
+
+async def test_dine_in_menu_period_uses_booking_time_and_rechecks_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timezone_info = ZoneInfo("America/Los_Angeles")
+    monkeypatch.setattr(
+        "app.services.restaurant._restaurant_now",
+        lambda: datetime(2026, 9, 12, 10, 0, tzinfo=timezone_info),
+    )
+    call_id = "future-dinner-menu-period"
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        booking_id = await connection.fetchval(
+            """
+            INSERT INTO bookings
+                (customer_name, customer_phone, table_id, booked_at, party_size)
+            VALUES ('Morgan', '+15035550101', 1, '2026-09-12 19:00', 2)
+            RETURNING id
+            """
+        )
+        await connection.execute(
+            "INSERT INTO call_sessions (session_id, state) VALUES ($1, $2::jsonb)",
+            call_id,
+            json.dumps({"booking_id": booking_id}),
+        )
+    finally:
+        await connection.close()
+
+    added = await restaurant_service.add_order_item(
+        call_id=call_id,
+        idempotency_key="future-dinner-add-1",
+        item_name="Market Greens",
+        booking_id=booking_id,
+        customer_name="Morgan",
+        customer_phone="+15035550101",
+    )
+    assert added["added"] is True
+
+    summary = await restaurant_service.get_order_summary(call_id=call_id)
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        await connection.execute(
+            "UPDATE bookings SET booked_at = '2026-09-12 10:00' WHERE id = $1",
+            booking_id,
+        )
+    finally:
+        await connection.close()
+    begin_caller_turn(call_id, "yes")
+    with pytest.raises(RestaurantServiceError) as exc:
+        await restaurant_service.confirm_order(
+            call_id=call_id,
+            idempotency_key="future-dinner-confirm-1",
+            expected_draft_version=summary["draft_version"],
+            approved=True,
+        )
+    assert exc.value.code == "service_period_unavailable"

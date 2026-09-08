@@ -121,6 +121,42 @@ async def test_transfer_uses_only_server_configured_number(
 
 
 @pytest.mark.asyncio
+async def test_behavior_transfer_carries_the_resolved_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(handler, "_record_background", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "app.behavior.resolve_handoff_destination",
+        lambda reason: {
+            "owner": "staff",
+            "channel": "voice_transfer",
+            "transfer_number": "+15035550149",
+            "can_transfer": True,
+        },
+    )
+    monkeypatch.setattr(handler, "current_staff_transfer_number", lambda: "")
+    websocket = FakeWebSocket(
+        [
+            {
+                "interaction_type": "response_required",
+                "response_id": 81,
+                "transcript": [
+                    {"role": "user", "content": "Connect me to a person"}
+                ],
+            }
+        ]
+    )
+    await handler.handle_retell_connection(websocket, "call-resolved-transfer")
+    completion = [
+        json.loads(item)
+        for item in websocket.sent
+        if json.loads(item).get("content_complete")
+    ][-1]
+    assert completion["transfer_number"] == "+15035550149"
+    assert "connect you" in completion["content"].casefold()
+
+
+@pytest.mark.asyncio
 async def test_unintelligible_audio_is_repaired_without_llm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

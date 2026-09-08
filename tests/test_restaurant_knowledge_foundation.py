@@ -181,6 +181,12 @@ def test_unknown_topic_never_borrows_unrelated_fact() -> None:
     assert match.status == "unknown"
     assert match.records == ()
 
+    proximity = get_restaurant_knowledge().find_topic(
+        "Are you close to Director Park?"
+    )
+    assert proximity.status == "unknown"
+    assert proximity.records == ()
+
 
 def test_operator_faq_requires_specific_question_overlap() -> None:
     rows = [
@@ -189,6 +195,7 @@ def test_operator_faq_requires_specific_question_overlap() -> None:
             "answer": "Private events require an events callback.",
         }
     ]
+    assert search_faq_rows("room?", rows) == []
     assert search_faq_rows("Do you have a rooftop room?", rows) == []
     assert search_faq_rows("private room wedding", rows)[0]["kind"] == "operator_faq"
 
@@ -524,6 +531,12 @@ async def test_named_holiday_does_not_reuse_another_year() -> None:
     assert result["answers"] == []
     assert "won't reuse another year's hours" in result["formatted"]
 
+    yearless = get_restaurant_knowledge().resolve_hours_query(
+        "What are your Christmas Eve hours?", on_date=date(2027, 6, 1)
+    )
+    assert yearless["status"] == "unavailable"
+    assert yearless["date"] == "2027"
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -684,8 +697,11 @@ async def test_menu_read_boundary_excludes_stale_restaurant_rows(
         ),
     ]
 
+    effective_dates: list[date] = []
+
     class Connection:
         async def fetch(self, query: str, *args: object) -> list[dict]:
+            effective_dates.append(args[-1])
             return rows
 
     class Acquire:
@@ -714,6 +730,13 @@ async def test_menu_read_boundary_excludes_stale_restaurant_rows(
     )
     unavailable = await restaurant_service.list_menu()
     assert unavailable["items"] == []
+
+    dinner = datetime(2026, 9, 12, 19, 0, tzinfo=timezone_info)
+    available = await restaurant_service.list_menu(at=dinner)
+    assert [entry["name"] for entry in available["items"]] == ["Market Greens"]
+    matched = await restaurant_service.find_menu_item("house salad", at=dinner)
+    assert matched["match"]["item_id"] == "menu.salad.market-greens"
+    assert effective_dates[-1] == dinner.date()
 
 
 def test_human_handoff_copy_depends_on_configured_destination(monkeypatch: pytest.MonkeyPatch) -> None:
