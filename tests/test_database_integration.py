@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 import os
 from zoneinfo import ZoneInfo
@@ -415,6 +415,58 @@ async def test_live_menu_seed_is_idempotent_without_embeddings() -> None:
         ) >= 50
         assert await connection.fetchval(
             "SELECT COUNT(*) FROM restaurant_knowledge_records WHERE synthetic IS NOT TRUE"
+        ) == 0
+        menu_dates = await connection.fetchrow(
+            """
+            SELECT effective_from, effective_to
+            FROM menu_items
+            WHERE canonical_id = 'menu.seasonal.corn-ravioli'
+            """
+        )
+        assert menu_dates["effective_from"] == date(2026, 6, 1)
+        assert menu_dates["effective_to"] == date(2026, 9, 30)
+        knowledge_date = await connection.fetchval(
+            """
+            SELECT effective_from
+            FROM restaurant_knowledge_records
+            WHERE canonical_id = 'hours.canonical'
+            """
+        )
+        assert knowledge_date == date(2026, 9, 1)
+    finally:
+        await connection.close()
+
+
+async def test_seed_command_rolls_back_partial_data_on_invalid_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import db.seed as seed_module
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        await connection.execute(
+            """
+            TRUNCATE restaurant_knowledge_records, menu_items, tables
+            RESTART IDENTITY CASCADE
+            """
+        )
+    finally:
+        await connection.close()
+
+    invalid_items = deepcopy(seed_module.MENU_ITEMS)
+    invalid_items[0]["effective_from"] = "not-a-date"
+    monkeypatch.setattr(seed_module, "DATABASE_URL", settings.database_url)
+    monkeypatch.setattr(seed_module, "MENU_ITEMS", invalid_items)
+
+    with pytest.raises(ValueError, match="Invalid isoformat string"):
+        await seed_module.main(with_embeddings=False)
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        assert await connection.fetchval("SELECT COUNT(*) FROM tables") == 0
+        assert await connection.fetchval("SELECT COUNT(*) FROM menu_items") == 0
+        assert await connection.fetchval(
+            "SELECT COUNT(*) FROM restaurant_knowledge_records"
         ) == 0
     finally:
         await connection.close()

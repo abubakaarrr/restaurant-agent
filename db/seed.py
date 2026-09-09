@@ -8,6 +8,7 @@ pgvector embeddings require ``--with-embeddings`` and an OpenAI key.
 
 import argparse
 import asyncio
+from datetime import date
 import json
 import os
 import sys
@@ -68,6 +69,16 @@ MENU_ITEMS = list(KNOWLEDGE.menu_items)
 
 
 # ── Knowledge chunking ────────────────────────────────────────
+
+
+def _database_date(value: object) -> date | None:
+    """Normalize fixture ISO dates for asyncpg's PostgreSQL DATE codec."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value))
+
 
 KNOWLEDGE_FILES = [
     ("menu", "app/knowledge/menu.md"),
@@ -197,8 +208,8 @@ async def seed(conn: asyncpg.Connection, *, with_embeddings: bool = False) -> No
             json.dumps(metadata, sort_keys=True),
             item["source_id"],
             item["data_version"],
-            item["effective_from"],
-            item.get("effective_to"),
+            _database_date(item["effective_from"]),
+            _database_date(item.get("effective_to")),
         )
     print(f"  -> {len(MENU_ITEMS)} menu items seeded.")
 
@@ -267,8 +278,8 @@ async def seed(conn: asyncpg.Connection, *, with_embeddings: bool = False) -> No
             meta["source_id"],
             meta["schema_version"],
             meta["data_version"],
-            effective_from,
-            effective_to,
+            _database_date(effective_from),
+            _database_date(effective_to),
             payload.get("status", "current"),
             display_text,
             json.dumps(payload, sort_keys=True),
@@ -320,7 +331,8 @@ async def main(*, with_embeddings: bool = False) -> None:
 
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        await seed(conn, with_embeddings=with_embeddings)
+        async with conn.transaction():
+            await seed(conn, with_embeddings=with_embeddings)
     finally:
         await conn.close()
 
