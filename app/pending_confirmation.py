@@ -44,7 +44,7 @@ _AFFIRMATIVE_RE = re.compile(
 _NEGATIVE_RE = re.compile(
     r"(?:"
     r"\bno\b|\bnope\b|not correct|\bwait\b|\bactually\b|\bchange\b|"
-    r"hold on|never ?mind|don'?t|do not|wrong|instead"
+    r"hold on|never ?mind|don'?t|do not|not\s+cancel|wrong|instead"
     r")",
     re.IGNORECASE,
 )

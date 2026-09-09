@@ -439,6 +439,7 @@ def test_order_notes_and_customizations_are_confirmation_integrity_data() -> Non
         "fulfillment_details": {
             "address": "101 Test Avenue",
             "instructions": "Leave with the front desk",
+            "fulfillment_at": "2026-09-08T17:30:00-07:00",
         },
         "order_notes": "No utensils",
         "allergy_notes": "Severe sesame allergy",
@@ -466,8 +467,9 @@ def test_order_notes_and_customizations_are_confirmation_integrity_data() -> Non
 
     readback = _format_order(summary)
     for expected in (
-        "extra cheddar", "remove: onion jam", "Cut in half", "No utensils",
-        "Severe sesame allergy", "Delivery address", "front desk", "delivery fee", "$29.00",
+        "extra cheddar", "+$2.00", "remove: onion jam", "Cut in half", "No utensils",
+        "Severe sesame allergy", "Delivery address", "front desk", "delivery fee",
+        "2026-09-08T17:30:00-07:00", "$29.00",
     ):
         assert expected.casefold() in readback.casefold()
 
@@ -479,11 +481,6 @@ def test_order_notes_and_customizations_are_confirmation_integrity_data() -> Non
             "This is the third time this failed.",
             BehaviorMode.DEESCALATING,
             ("acknowledge the concern", "concrete next step"),
-        ),
-        (
-            "Are the fries famous?",
-            BehaviorMode.STANDARD,
-            ("loyal following", "check whether they're available"),
         ),
         (
             "Are you a real person?",
@@ -517,47 +514,10 @@ def test_personal_identity_reply_does_not_use_a_parallel_agent_name(
     assert "Avery" not in reply
 
 
-@pytest.mark.parametrize(
-    "unsafe_context",
-    [
-        "allergy?",
-        "complaint!",
-        "payment.",
-        "refund?",
-        "injury!",
-        "safety?",
-        "emergency!",
-        "repeated failure.",
-    ],
-)
-def test_safe_humor_is_suppressed_for_configured_contexts(
-    unsafe_context: str,
-) -> None:
-    result = reduce_behavior(
-        None,
-        TurnObservation(text=f"Are the fries famous? This is about {unsafe_context}"),
-    )
+def test_safe_humor_question_continues_to_grounded_agent_path() -> None:
+    result = reduce_behavior(None, TurnObservation(text="Are the fries famous?"))
     assert result.directive.direct_reply is None
-
-
-@pytest.mark.parametrize(
-    "high_risk_phrase",
-    [
-        "They gave me food poisoning",
-        "I'm allergic to sesame",
-        "I have a tree nut concern",
-        "I'm concerned about peanuts",
-        "I'm complaining about an injury",
-    ],
-)
-def test_canonical_risk_aliases_and_inflections_precede_humor(
-    high_risk_phrase: str,
-) -> None:
-    result = reduce_behavior(
-        None,
-        TurnObservation(text=f"Are the fries famous? {high_risk_phrase}."),
-    )
-    assert "loyal following" not in (result.directive.direct_reply or "").casefold()
+    assert result.directive.control is BehaviorControl.CONTINUE
 
 
 @pytest.mark.asyncio
@@ -676,6 +636,11 @@ async def test_conversation_inputs_execute_grounded_menu_tool(
             "Which dishes contain tomatoes?",
             "tomato fennel soup",
         ),
+        (
+            "Lentil Pot Pie",
+            "Which pies do you have?",
+            "lentil pot pie",
+        ),
     ],
 )
 async def test_menu_search_normalizes_plural_terms(
@@ -711,6 +676,51 @@ async def test_menu_search_normalizes_plural_terms(
     result = (await search_menu.ainvoke({"query": query})).casefold()
     assert expected_name in result
     assert "allergy safety" in result
+
+
+@pytest.mark.asyncio
+async def test_menu_search_returns_canonical_paid_modifier_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    knowledge = get_restaurant_knowledge()
+    item = knowledge.find_menu_item("Coava Drip Coffee").item
+    modifier = knowledge.modifier_options["modifier.almond-milk"]
+
+    async def canonical_menu(*, available_only: bool = True) -> dict:
+        return {
+            "items": [
+                {
+                    "name": item["name"],
+                    "category": item["category_id"],
+                    "description": item["description"],
+                    "dietary": item["dietary_tags"],
+                    "aliases": item["aliases"],
+                    "ingredients": item["ingredients"],
+                    "allergens": item["allergens"],
+                    "price": item["price"],
+                    "price_estimated": False,
+                    "available": True,
+                    "availability": item["availability"],
+                    "cross_contact": item["cross_contact"],
+                    "modifier_options": [modifier],
+                }
+            ],
+            "allergen_notice": item["cross_contact"],
+        }
+
+    monkeypatch.setattr(restaurant_service, "list_menu", canonical_menu)
+    result = (
+        await search_menu.ainvoke(
+            {
+                "query": (
+                    "Can I get almond milk in the coffee, what does it cost, "
+                    "and what allergen does it contain?"
+                )
+            }
+        )
+    ).casefold()
+    for expected in ("coava drip coffee", "almond milk", "$1.00 extra", "tree_nut"):
+        assert expected in result
 
 
 @pytest.mark.asyncio

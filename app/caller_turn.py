@@ -17,14 +17,14 @@ from app.pending_confirmation import (
 logger = logging.getLogger(__name__)
 
 _CANCELLATION_REVERSAL_RE = re.compile(
-    r"\b(?:do\s+not|don't)\s+cancel"
+    r"\b(?:do\s+not|don't|not)\s+cancel"
     r"(?:\s+(?:it|that|(?:the|my)\s+(?:reservation|booking))(?:\s+yet)?|(?=\s*(?:[,;:.!?]|$)))",
     re.IGNORECASE,
 )
 _ORDER_CANCELLATION_RE = re.compile(
-    r"\b(?:do\s+not|don't)\s+cancel\s+"
+    r"\b(?:do\s+not|don't|not)\s+cancel\s+"
     r"(?:(?:the|my)\s+)?(?:pickup|delivery)(?:\s+order)?\b|"
-    r"\b(?:do\s+not|don't)\s+cancel\s+(?:(?:the|my)\s+)?order\b",
+    r"\b(?:do\s+not|don't|not)\s+cancel\s+(?:(?:the|my)\s+)?order\b",
     re.IGNORECASE,
 )
 _CANCELLATION_ONLY_TAIL_RE = re.compile(

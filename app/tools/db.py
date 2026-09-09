@@ -53,7 +53,12 @@ def _format_order(summary: dict) -> str:
         if not isinstance(option, dict):
             return str(option)
         name = str(option.get("name") or option.get("option_id") or "option")
-        return name + (f" ({option['selection']})" if option.get("selection") else "")
+        if option.get("selection"):
+            name += f" ({option['selection']})"
+        price_delta = float(option.get("price_delta") or 0)
+        if price_delta:
+            name += f" (+${price_delta:.2f})"
+        return name
 
     def _format_item(item: dict) -> str:
         details: list[str] = []
@@ -101,6 +106,9 @@ def _format_order(summary: dict) -> str:
         text += f" Delivery address: {fulfillment_details['address']}."
     if fulfillment_details.get("instructions"):
         text += f" Delivery instructions: {fulfillment_details['instructions']}."
+    if fulfillment_details.get("fulfillment_at"):
+        label = str(summary.get("fulfillment") or "fulfillment").replace("_", " ").title()
+        text += f" {label} time: {fulfillment_details['fulfillment_at']}."
     for fee in summary.get("fees") or []:
         text += f" {fee.get('name', 'Fee')}: ${float(fee.get('amount') or 0):.2f}."
     if nonce:
@@ -825,7 +833,8 @@ async def get_order_summary(session_id: str) -> str:
     if result.get("readback_required"):
         return (
             text
-            + " readback_required=true. Read every item, fulfillment type, and total, "
+            + " readback_required=true. Read every item, paid option, fulfillment detail, "
+            "fee, and total, "
             "then ask if all details are correct."
         )
     return (

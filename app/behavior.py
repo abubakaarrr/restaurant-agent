@@ -27,12 +27,6 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
-from app.config import settings
-from app.restaurant_knowledge import (
-    KnowledgeFixtureError,
-    get_restaurant_knowledge,
-    text_tokens,
-)
 from app.transfer_availability import resolve_handoff_destination
 
 
@@ -414,52 +408,6 @@ _PERSONAL_IDENTITY_PATTERNS = (
     re.compile(r"\b(?:are|am)\s+(?:you|i)\s+(?:a\s+)?(?:real\s+person|human|ai|robot|bot)\b"),
     re.compile(r"\bwhat\s+(?:are|kind\s+of\s+bot\s+are)\s+you\b"),
 )
-_SAFE_HUMOR_PATTERNS = (
-    re.compile(r"\b(?:are|how)\s+(?:the\s+)?fries\s+(?:famous|popular)\b"),
-)
-_HUMOR_RISK_INFLECTIONS = re.compile(
-    r"\b(?:allerg(?:y|ies|ic|en|ens)|complain(?:t|ts|ed|ing)?|"
-    r"frustrat(?:ed|ing|ion)|injur(?:y|ies|ed)|poison(?:ing|ed)|"
-    r"emergenc(?:y|ies)|refunds?|payments?|unsafe|"
-    r"repeated\s+fail(?:ure|ures|ed|ing))\b"
-)
-
-
-def _canonical_humor_risk(text: str, caller_tokens: set[str]) -> bool:
-    """Recognize canonical unsafe aliases and ordinary inflections before humor."""
-    if _HUMOR_RISK_INFLECTIONS.search(text):
-        return True
-    knowledge = get_restaurant_knowledge()
-    phrases = list(
-        knowledge.raw["conversation_style"]["light_humor"]["forbidden_contexts"]
-    )
-    for topic in knowledge.topics:
-        if topic.get("topic_id") == "topic.safety-emergency":
-            phrases.extend(topic.get("aliases") or [])
-    def inflection_tokens(values: set[str]) -> set[str]:
-        normalized = set(values)
-        for token in values:
-            if len(token) > 4 and token.endswith("ies"):
-                normalized.add(f"{token[:-3]}y")
-            elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-                normalized.add(token[:-1])
-        return normalized
-
-    allergen_tokens = inflection_tokens(
-        {
-            token
-            for item in knowledge.menu_items
-            for allergen in item.get("allergens") or []
-            for token in text_tokens(str(allergen))
-        }
-    )
-    normalized_caller_tokens = inflection_tokens(caller_tokens)
-    return bool(normalized_caller_tokens & allergen_tokens) or any(
-        text_tokens(phrase) <= caller_tokens
-        for phrase in phrases
-        if text_tokens(phrase)
-    )
-
 _HANDOFF_MANAGER_PATTERNS = (
     re.compile(
         r"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?"
@@ -880,7 +828,6 @@ def _direct_reply(
     boundary_strikes: int,
     unintelligible: bool,
     personal_identity: bool,
-    safe_humor: bool,
 ) -> str | None:
     if handoff_reason is not None:
         destination = handoff_destination or {}
@@ -904,12 +851,6 @@ def _direct_reply(
             "I'm Harbor & Hearth's virtual host. "
             "I can help with a reservation, an order, or restaurant questions."
         )
-    if safe_humor:
-        return (
-            "The fries have a loyal following, but I try not to let it go to their heads. "
-            "I can check whether they're available right now."
-        )
-
     if silence_count == 1:
         return "Take your time—I'm here when you're ready."
     if silence_count == 2:
@@ -1095,17 +1036,6 @@ def reduce_behavior(
     confusion = meaningful and _matches(_CONFUSION_PATTERNS, text)
     complaint = meaningful and _matches(_COMPLAINT_PATTERNS, text)
     personal_identity = meaningful and _matches(_PERSONAL_IDENTITY_PATTERNS, text)
-    caller_tokens = text_tokens(text)
-    try:
-        unsafe_humor_context = _canonical_humor_risk(text, caller_tokens)
-    except (KnowledgeFixtureError, KeyError, TypeError):
-        unsafe_humor_context = True
-    safe_humor = (
-        meaningful
-        and not complaint
-        and not unsafe_humor_context
-        and _matches(_SAFE_HUMOR_PATTERNS, text)
-    )
 
     fingerprint = _utterance_fingerprint(text) if meaningful else ""
     repetition_proxy = bool(
@@ -1327,7 +1257,6 @@ def reduce_behavior(
         boundary_strikes=boundary_strikes,
         unintelligible=unintelligible,
         personal_identity=personal_identity,
-        safe_humor=safe_humor,
     )
     prompt_instruction = _prompt_instruction(
         mode=mode,

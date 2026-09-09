@@ -15,6 +15,8 @@ from app.services.restaurant import (
 
 
 def _normalize_token(token: str) -> str:
+    if len(token) == 4 and token.endswith("ies"):
+        return token[:-1]
     if len(token) > 4 and token.endswith("ies"):
         return token[:-3] + "y"
     if len(token) > 4 and token.endswith(
@@ -34,6 +36,37 @@ def _tokens(value: str) -> set[str]:
     }
 
 
+def _modifier_search_text(option: dict) -> str:
+    return " ".join(
+        [
+            str(option.get("option_id") or "").replace(".", " ").replace("-", " "),
+            str(option.get("name") or ""),
+            str(option.get("kind") or "").replace("_", " "),
+            str(option.get("availability") or ""),
+            str(option.get("availability_note") or ""),
+            str(option.get("warning") or ""),
+            " ".join(option.get("allergens") or []),
+            " ".join(option.get("choices") or []),
+        ]
+    )
+
+
+def _format_modifier(option: dict) -> str:
+    name = str(option.get("name") or option.get("option_id") or "option")
+    price = float(option.get("price_delta") or 0)
+    price_text = f"${price:.2f} extra" if price else "no extra charge"
+    allergens = ", ".join(option.get("allergens") or []) or "none listed"
+    availability = str(option.get("availability") or "unknown")
+    details = [price_text, f"allergens: {allergens}", availability]
+    if option.get("choices"):
+        details.append("choices: " + ", ".join(option["choices"]))
+    if option.get("availability_note"):
+        details.append(str(option["availability_note"]))
+    if option.get("warning"):
+        details.append(str(option["warning"]))
+    return f"{name} ({'; '.join(details)})"
+
+
 @tool
 async def search_menu(query: str, session_id: str = "") -> str:
     """Search canonical menu ingredients, allergens, dietary tags, availability, and prices."""
@@ -47,6 +80,7 @@ async def search_menu(query: str, session_id: str = "") -> str:
     query_tokens = _tokens(query)
     matches: list[dict] = []
     for item in menu["items"]:
+        modifier_options = item.get("modifier_options") or []
         searchable = " ".join(
             [
                 item["name"],
@@ -56,6 +90,7 @@ async def search_menu(query: str, session_id: str = "") -> str:
                 " ".join(item.get("aliases") or []),
                 " ".join(item.get("ingredients") or []),
                 " ".join(item.get("allergens") or []),
+                " ".join(_modifier_search_text(option) for option in modifier_options),
             ]
         )
         score = len(query_tokens & _tokens(searchable))
@@ -82,18 +117,26 @@ async def search_menu(query: str, session_id: str = "") -> str:
             return str(item.get("service_message") or "unavailable").rstrip(".")
         return "not currently effective"
 
-    lines = [
-        (
+    lines = []
+    for item in selected:
+        modifier_options = item.get("modifier_options") or []
+        options_text = (
+            "Options: "
+            + ", ".join(_format_modifier(option) for option in modifier_options)
+            + ". "
+            if modifier_options
+            else ""
+        )
+        lines.append(
             f"{item['name']} ({format_menu_price(item)}, "
             f"{_availability_label(item)}): "
             f"{item['description'] or 'No additional description.'} "
             f"Ingredients: {', '.join(item.get('ingredients') or []) or 'not listed'}. "
             f"Allergens: {', '.join(item.get('allergens') or []) or 'no recipe allergen listed'}. "
             f"Dietary tags: {', '.join(item['dietary']) or 'none listed'}. "
+            f"{options_text}"
             f"Cross-contact: {item.get('cross_contact') or menu['allergen_notice']}"
         )
-        for item in selected
-    ]
     missing: list[str] = []
     lowered = query.casefold()
     if any(word in lowered for word in ("ingredient", "what's in", "what is in")) and any(

@@ -1948,6 +1948,11 @@ class RestaurantService:
             metadata = _json_value(row["knowledge_metadata"] or {})
             if not isinstance(metadata, dict):
                 metadata = {}
+            modifier_options = [
+                deepcopy(knowledge.modifier_options[option_id])
+                for option_id in metadata.get("modifier_options") or []
+                if option_id in knowledge.modifier_options
+            ]
             effective_from = row["effective_from"]
             effective_to = row["effective_to"]
             effective_status = (
@@ -1978,6 +1983,7 @@ class RestaurantService:
                 "dietary_tags": list(row["dietary"] or []),
                 "ingredients": list(row["ingredients"] or []),
                 "allergens": list(row["allergens"] or []),
+                "modifier_options": modifier_options,
                 "service_periods": list(row["service_periods"] or []),
                 "availability": row["availability_status"],
                 "available": available,

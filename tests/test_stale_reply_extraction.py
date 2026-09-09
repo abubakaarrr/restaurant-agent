@@ -254,7 +254,16 @@ async def test_cancellation_reversal_with_new_request_routes_remaining_intent() 
 
 
 @pytest.mark.asyncio
-async def test_order_cancellation_is_not_a_reservation_reversal() -> None:
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "Don't cancel my pickup order; I need to change an item.",
+        "I want to change an item, not cancel my pickup order.",
+    ],
+)
+async def test_order_cancellation_is_not_a_reservation_reversal(
+    utterance: str,
+) -> None:
     session_id = "cancel-order-only"
     _register_pending_cancellation(session_id)
     reversal = AsyncMock()
@@ -267,7 +276,7 @@ async def test_order_cancellation_is_not_a_reservation_reversal() -> None:
     ):
         result = await process_caller_turn(
             session_id,
-            "Don't cancel my pickup order; I need to change an item.",
+            utterance,
         )
     assert result["handled"] is False
     assert result["kind"] == "caller_turn"
@@ -308,6 +317,7 @@ async def test_compound_reversal_accepts_yet_after_reservation_pronoun() -> None
         "Wait, don't cancel my booking; move it to seven.",
         "Wait, move my booking to seven.",
         "Move it to seven, but don't cancel my booking.",
+        "I want to move it to seven, not cancel it.",
     ],
 )
 async def test_compound_reversal_accepts_leading_correction(utterance: str) -> None:

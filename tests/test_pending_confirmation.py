@@ -31,6 +31,7 @@ def test_classify_affirmation_keywords() -> None:
     assert classify_affirmation("no") == "negative"
     assert classify_affirmation("wait, change the time") == "negative"
     assert classify_affirmation("actually make it six") == "negative"
+    assert classify_affirmation("move it to seven, not cancel it") == "negative"
     assert classify_affirmation("what time do you close?") == "unclear"
     assert classify_affirmation("yes, but change the name") == "negative"
 
