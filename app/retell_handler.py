@@ -25,10 +25,16 @@ from app.behavior import (
 )
 from app.behavior_store import load_behavior_state, save_behavior_state
 from app.call_analytics import record_call_event
-from app.call_flags import consume_call_control
+from app.call_flags import clear_call_control, consume_call_control
 from app.caller_turn import process_caller_turn
 from app.config import settings
 from app.restaurant_settings import load_restaurant_settings
+from app.spoken_delivery import (
+    INCOMPLETE_INPUT_REPLY,
+    TRANSFER_UNAVAILABLE_REPLY,
+    ResponseGenerationGate,
+    sanitize_spoken_text,
+)
 from app.transfer_availability import current_staff_transfer_number
 
 
@@ -65,7 +71,7 @@ def _response_event(
     payload: dict[str, Any] = {
         "response_type": "response",
         "response_id": response_id,
-        "content": content,
+        "content": sanitize_spoken_text(content),
         "content_complete": complete,
     }
     if end_call:
@@ -131,9 +137,10 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
 
     caller_number = ""
     current_task: asyncio.Task[None] | None = None
-    active_response_id = -1
+    response_gate = ResponseGenerationGate()
     reminder_count = 0
     latest_transcript: list[dict[str, Any]] = []
+    greeting_sent = False
 
     async def apply_behavior(
         turn: dict[str, Any],
@@ -176,6 +183,10 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
         current_task.cancel()
         with suppress(asyncio.CancelledError):
             await current_task
+        # Tools may have set an end/transfer flag before their generation was
+        # interrupted. It belongs to that cancelled turn and must never leak
+        # into the next response.
+        clear_call_control(call_id)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _record_background(
             call_id,
@@ -184,6 +195,20 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             payload={"reason": reason},
         )
         current_task = None
+
+    def response_allowed(response_id: int, stage: str) -> bool:
+        if response_gate.allows(response_id):
+            return True
+        _record_background(
+            call_id,
+            "stale_response_suppressed",
+            response_id=response_id,
+            payload={
+                "active_response_id": response_gate.active_response_id,
+                "stage": stage,
+            },
+        )
+        return False
 
     async def run_turn(
         response_id: int,
@@ -203,11 +228,14 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 behavior_directive,
                 prepared_caller_turn=caller_turn,
             ):
-                if response_id != active_response_id:
+                if not response_allowed(response_id, "stream_chunk"):
                     return
                 if not token:
                     continue
-                await send(_response_event(response_id, token, complete=False))
+                spoken_token = sanitize_spoken_text(token)
+                if not spoken_token:
+                    continue
+                await send(_response_event(response_id, spoken_token, complete=False))
                 if not first_chunk_sent:
                     first_chunk_sent = True
                     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -218,7 +246,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                         duration_ms=elapsed_ms,
                     )
 
-            if response_id != active_response_id:
+            if not response_allowed(response_id, "completion"):
                 return
             control = consume_call_control(call_id)
             end_call = bool(control and control.action == "end")
@@ -230,10 +258,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 if transfer_number:
                     no_interruption = True
                 else:
-                    final_content = (
-                        "I'm sorry, I can't transfer the call right now. "
-                        "I can take a message and callback details for the restaurant team."
-                    )
+                    final_content = TRANSFER_UNAVAILABLE_REPLY
             await send(
                 _response_event(
                     response_id,
@@ -259,7 +284,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             raise
         except Exception:
             logger.error("Retell agent stream error", exc_info=True)
-            if response_id == active_response_id:
+            if response_allowed(response_id, "error_fallback"):
                 with suppress(Exception):
                     transfer_number = current_staff_transfer_number()
                     await send(
@@ -289,7 +314,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             # close the current response so Retell never waits forever.
             if (
                 not completed
-                and response_id == active_response_id
+                and response_gate.allows(response_id)
                 and not asyncio.current_task().cancelled()
             ):
                 with suppress(Exception):
@@ -334,8 +359,11 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 continue
 
             was_interrupted = bool(current_task and not current_task.done())
+            # Invalidate the old response before awaiting cancellation.  Any
+            # task that resumes during cancellation sees the new generation
+            # and cannot send a stale chunk or completion.
+            response_gate.begin(int(message.get("response_id", 0)))
             await cancel_current("new_response")
-            active_response_id = int(message.get("response_id", 0))
 
             if interaction == "reminder_required":
                 # A reminder is never a replay of the previous user action.
@@ -349,7 +377,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 end_call = directive.control is BehaviorControl.END_CALL
                 await send(
                     _response_event(
-                        active_response_id,
+                        response_gate.active_response_id,
                         content,
                         complete=True,
                         end_call=end_call,
@@ -358,7 +386,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 _record_background(
                     call_id,
                     "silence_reminder",
-                    response_id=active_response_id,
+                    response_id=response_gate.active_response_id,
                     payload={"count": reminder_count},
                 )
                 continue
@@ -370,7 +398,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             user_turn = _latest_user_turn(latest_transcript)
             user_text = str(user_turn.get("content") or "").strip()
 
-            if not user_text:
+            if not user_text and not greeting_sent:
                 runtime = load_restaurant_settings()
                 restaurant = runtime["restaurant_name"]
                 agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
@@ -379,15 +407,28 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     "How can I help you today?"
                 )
                 await send(
-                    _response_event(active_response_id, greeting, complete=True)
+                    _response_event(response_gate.active_response_id, greeting, complete=True)
+                )
+                greeting_sent = True
+                continue
+
+            if not user_text:
+                await send(
+                    _response_event(
+                        response_gate.active_response_id,
+                        INCOMPLETE_INPUT_REPLY,
+                        complete=True,
+                    )
                 )
                 continue
+
+            greeting_sent = True
 
             caller_turn = await process_caller_turn(call_id, user_text)
             if caller_turn.get("handled"):
                 await send(
                     _response_event(
-                        active_response_id,
+                        response_gate.active_response_id,
                         str(caller_turn.get("message") or ""),
                         complete=True,
                     )
@@ -403,7 +444,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 can_transfer = bool(transfer_number)
                 await send(
                     _response_event(
-                        active_response_id,
+                        response_gate.active_response_id,
                         (
                             "I'm sorry, I don't support that language reliably yet. "
                             + (
@@ -423,7 +464,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 transfer_number = directive.transfer_number
                 await send(
                     _response_event(
-                        active_response_id,
+                        response_gate.active_response_id,
                         directive.direct_reply,
                         complete=True,
                         end_call=directive.control is BehaviorControl.END_CALL,
@@ -436,11 +477,11 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             _record_background(
                 call_id,
                 "response_requested",
-                response_id=active_response_id,
+                response_id=response_gate.active_response_id,
             )
             current_task = asyncio.create_task(
                 run_turn(
-                    active_response_id,
+                    response_gate.active_response_id,
                     user_text,
                     directive.prompt_instruction,
                     caller_turn,

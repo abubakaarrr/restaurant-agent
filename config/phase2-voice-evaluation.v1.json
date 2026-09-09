@@ -1,0 +1,123 @@
+{
+  "schema_version": "restaurant-voice-evaluation.v1",
+  "evaluation_id": "phase2-voice-humanization-2026-09-09",
+  "restaurant_fixture_id": "fixture.harbor-and-hearth.phase1",
+  "scenario_repeats_per_arm": 10,
+  "randomization_seed": 20260909,
+  "arms": [
+    {
+      "id": "current_retell_baseline",
+      "label": "Current Retell baseline",
+      "provider_action_required": true
+    },
+    {
+      "id": "retell_native_clone",
+      "label": "Retell-native authorized clone",
+      "provider_action_required": true
+    }
+  ],
+  "metric_definitions": {
+    "agent_generation_latency_ms": "agent_text_first_token_ms minus agent_request_start_ms",
+    "provider_network_latency_ms": "provider_response_ms minus provider_request_start_ms",
+    "first_audio_latency_ms": "first_audio_playback_ms minus customer_speech_end_ms",
+    "completion_latency_ms": "final_audio_completion_ms minus customer_speech_end_ms",
+    "interruption_recovery_ms": "cancellation_effective_ms minus interruption_ms",
+    "stale_response_incident": "any old assistant text or audio delivered after a newer customer turn begins",
+    "error": "a generation, provider, transport, or playback failure",
+    "timeout": "a response stage exceeding its configured deadline",
+    "fallback": "actual activation of the current baseline because the selected challenger is unavailable or fails",
+    "preference_scale": "integer 1 to 5; higher is better"
+  },
+  "preference_dimensions": [
+    "naturalness",
+    "warmth",
+    "clarity",
+    "pronunciation",
+    "expressiveness",
+    "confidence",
+    "conversational_pacing",
+    "feels_like_a_real_human"
+  ],
+  "scenarios": [
+    {
+      "id": "greeting",
+      "kind": "greeting",
+      "customer_input": "",
+      "required": ["restaurant_name", "agent_identity", "one_opening_question"]
+    },
+    {
+      "id": "simple_faq",
+      "kind": "faq",
+      "customer_input": "What is your address?",
+      "topic_id": "topic.address",
+      "required": ["canonical_address", "short_direct_answer"]
+    },
+    {
+      "id": "menu_clarification",
+      "kind": "menu_clarification",
+      "customer_input": "Do you have chicken?",
+      "menu_query": "chicken",
+      "required": ["canonical_candidates", "no_item_mutation", "one_choice_question"]
+    },
+    {
+      "id": "allergy_question",
+      "kind": "allergy",
+      "customer_input": "Is the Hearth Burger safe for a severe gluten allergy?",
+      "menu_query": "Hearth Burger",
+      "required": ["listed_allergens", "no_safety_guarantee", "cross_contact_warning"]
+    },
+    {
+      "id": "reservation_availability",
+      "kind": "reservation",
+      "customer_input": "Can I get a table for two?",
+      "required": ["no_invented_availability", "one_missing_field_question"]
+    },
+    {
+      "id": "order_correction",
+      "kind": "order_correction",
+      "customer_input": "Actually, make that one Hearth Burger, not two.",
+      "menu_query": "Hearth Burger",
+      "new_quantity": 1,
+      "old_quantity": 2,
+      "required": ["correct_item", "correct_quantity", "no_completed_mutation_claim"]
+    },
+    {
+      "id": "frustration",
+      "kind": "frustration",
+      "customer_input": "This is frustrating. You are not listening.",
+      "required": ["brief_acknowledgement", "one_repair_question", "no_emotion_label"]
+    },
+    {
+      "id": "interruption",
+      "kind": "interruption",
+      "customer_input": "Actually, make it seven o'clock instead.",
+      "old_response_id": 70,
+      "new_response_id": 71,
+      "required": ["old_generation_invalidated", "newest_turn_only", "zero_stale_response"]
+    },
+    {
+      "id": "silence_incomplete_input",
+      "kind": "silence_incomplete",
+      "customer_input": "(unintelligible audio)",
+      "required": ["bounded_silence_ladder", "no_action_replay", "one_repair_question"]
+    },
+    {
+      "id": "unknown_request",
+      "kind": "unknown",
+      "customer_input": "Do you have a rooftop telescope policy?",
+      "required": ["explicit_unknown", "no_borrowed_fact", "no_transfer_claim"]
+    },
+    {
+      "id": "transfer_unavailable",
+      "kind": "transfer_unavailable",
+      "customer_input": "Please connect me to a person.",
+      "required": ["no_transfer_claim", "callback_message_offer"]
+    },
+    {
+      "id": "personal_identity",
+      "kind": "personal_identity",
+      "customer_input": "Are you a real person?",
+      "required": ["truthful_virtual_host_identity", "restaurant_scope"]
+    }
+  ]
+}

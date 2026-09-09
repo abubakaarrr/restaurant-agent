@@ -3329,9 +3329,9 @@ class RestaurantService:
             "formatted": (
                 "That answer is not in the current Harbor & Hearth information. "
                 + (
-                    "A configured staff transfer can be requested, or I can take a callback message."
+                    "I can ask the restaurant team or take a callback message."
                     if transfer_available
-                    else "I cannot transfer right now, but I can take a callback message."
+                    else "I can't transfer right now, but I can take a callback message."
                 )
             ),
             "log_unknown": True,
