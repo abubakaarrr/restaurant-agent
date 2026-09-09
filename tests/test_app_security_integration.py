@@ -88,7 +88,7 @@ def test_dashboard_csrf_voice_auth_and_signed_webhook(
             client.put(
                 "/api/settings",
                 headers={"X-CSRF-Token": csrf},
-                json={"restaurant_name": "Pilot Restaurant"},
+                json={"ai_agent_name": "Avery Rose"},
             ).status_code
             == 200
         )

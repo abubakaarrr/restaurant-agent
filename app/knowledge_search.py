@@ -104,17 +104,9 @@ def score_text(query: str, *parts: str) -> int:
     if not query_tokens:
         return 0
     haystack = tokens(" ".join(parts))
-    score = len(query_tokens & haystack)
-    for query_token in query_tokens:
-        if query_token in haystack:
-            continue
-        if any(
-            query_token in hay_token or hay_token in query_token
-            for hay_token in haystack
-            if min(len(query_token), len(hay_token)) >= 4
-        ):
-            score += 1
-    return score
+    # Whole-token overlap is deliberately conservative. Substring matching made
+    # unrelated words such as "dress" and "address" equivalent.
+    return len(query_tokens & haystack)
 
 
 def search_static_knowledge(query: str, *, limit: int = 4) -> list[dict[str, Any]]:
@@ -135,12 +127,30 @@ def search_faq_rows(
     limit: int = 4,
 ) -> list[dict[str, Any]]:
     scored: list[dict[str, Any]] = []
+    query_tokens = tokens(query)
+    normalized_query = normalize_question(query)
+    if not query_tokens:
+        return []
     for row in rows:
         question = str(row.get("question") or "")
         answer = str(row.get("answer") or "")
-        points = score_text(query, question, answer)
-        if not points:
+        question_tokens = tokens(question)
+        overlap = query_tokens & question_tokens
+        normalized_faq = normalize_question(question)
+        phrase_match = bool(
+            min(len(query_tokens), len(question_tokens)) >= 2
+            and normalized_query
+            and (
+                normalized_query in normalized_faq
+                or normalized_faq in normalized_query
+            )
+        )
+        faq_coverage = len(overlap) / len(question_tokens) if question_tokens else 0
+        if not phrase_match and not (
+            len(overlap) >= 2 and faq_coverage >= 0.75
+        ):
             continue
+        points = len(overlap) + (100 if phrase_match else 0)
         scored.append(
             {
                 "kind": "operator_faq",

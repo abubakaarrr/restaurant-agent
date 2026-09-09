@@ -59,6 +59,41 @@ def test_availability_returns_typed_envelope(
     assert response.json()["result"]["available"] is True
 
 
+def test_managed_caller_turn_endpoint_is_not_exposed(client: TestClient) -> None:
+    response = client.post(
+        "/api/voice-tools/caller-turn",
+        headers={"X-Voice-Tool-Secret": "test-tool-secret"},
+        json={"call_id": "managed-call-1", "utterance": "Don't cancel it."},
+    )
+    assert response.status_code == 404
+
+
+def test_managed_order_notes_endpoint_is_not_exposed(client: TestClient) -> None:
+    response = client.post(
+        "/api/voice-tools/orders/notes",
+        headers={"X-Voice-Tool-Secret": "test-tool-secret"},
+        json={"call_id": "managed-call-1", "order_notes": "No utensils"},
+    )
+    assert response.status_code == 404
+
+
+def test_menu_endpoint_requests_complete_menu(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_menu(*, available_only: bool = True):
+        assert available_only is False
+        return {"items": [], "allergen_notice": "Shared kitchen."}
+
+    monkeypatch.setattr(tool_api.restaurant_service, "list_menu", fake_menu)
+    response = client.get(
+        "/api/voice-tools/menu",
+        headers={"X-Voice-Tool-Secret": "test-tool-secret"},
+    )
+    assert response.status_code == 200
+    assert response.json()["result"]["items"] == []
+
+
 def test_write_forwards_idempotency_key(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -94,3 +129,36 @@ def test_write_forwards_idempotency_key(
     assert response.status_code == 200
     assert captured["idempotency_key"] == "retell-call-1-booking-1"
     assert captured["confirmed"] is True
+
+
+@pytest.mark.parametrize(("payload_notes", "expected"), [(None, None), ("", "")])
+def test_update_order_item_distinguishes_omitted_notes_from_clear(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    payload_notes: str | None,
+    expected: str | None,
+) -> None:
+    captured: dict = {}
+
+    async def fake_update_order_item(**kwargs):
+        captured.update(kwargs)
+        return {"updated": True}
+
+    monkeypatch.setattr(
+        tool_api.restaurant_service,
+        "update_order_item",
+        fake_update_order_item,
+    )
+    payload = {"call_id": "call-1", "order_item_id": 3, "quantity": 2}
+    if payload_notes is not None:
+        payload["notes"] = payload_notes
+    response = client.post(
+        "/api/voice-tools/orders/items/update",
+        headers={
+            "X-Voice-Tool-Secret": "test-tool-secret",
+            "Idempotency-Key": "update-item-1",
+        },
+        json=payload,
+    )
+    assert response.status_code == 200
+    assert captured["notes"] == expected

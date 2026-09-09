@@ -6,6 +6,7 @@ import re
 
 from langchain_core.tools import tool
 
+from app.call_memory import resolve_session_id
 from app.services.restaurant import (
     RestaurantServiceError,
     format_menu_price,
@@ -13,31 +14,83 @@ from app.services.restaurant import (
 )
 
 
+def _normalize_token(token: str) -> str:
+    if len(token) == 4 and token.endswith("ies"):
+        return token[:-1]
+    if len(token) > 4 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 4 and token.endswith(
+        ("ches", "shes", "sses", "xes", "zes", "oes")
+    ):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+
 def _tokens(value: str) -> set[str]:
     return {
-        token
+        _normalize_token(token)
         for token in re.findall(r"[a-z0-9]+", value.casefold())
         if len(token) > 2
     }
 
 
+def _modifier_search_text(option: dict) -> str:
+    return " ".join(
+        [
+            str(option.get("option_id") or "").replace(".", " ").replace("-", " "),
+            str(option.get("name") or ""),
+            str(option.get("kind") or "").replace("_", " "),
+            str(option.get("availability") or ""),
+            str(option.get("availability_note") or ""),
+            str(option.get("warning") or ""),
+            " ".join(option.get("allergens") or []),
+            " ".join(option.get("choices") or []),
+        ]
+    )
+
+
+def _format_modifier(option: dict) -> str:
+    name = str(option.get("name") or option.get("option_id") or "option")
+    price = float(option.get("price_delta") or 0)
+    price_text = f"${price:.2f} extra" if price else "no extra charge"
+    allergens = ", ".join(option.get("allergens") or []) or "none listed"
+    availability = str(option.get("availability") or "unknown")
+    details = [price_text, f"allergens: {allergens}", availability]
+    if option.get("choices"):
+        details.append("choices: " + ", ".join(option["choices"]))
+    if option.get("availability_note"):
+        details.append(str(option["availability_note"]))
+    if option.get("warning"):
+        details.append(str(option["warning"]))
+    return f"{name} ({'; '.join(details)})"
+
+
 @tool
-async def search_menu(query: str) -> str:
-    """Search live menu names, descriptions, categories, dietary tags, and prices."""
+async def search_menu(query: str, session_id: str = "") -> str:
+    """Search canonical menu ingredients, allergens, dietary tags, availability, and prices."""
     try:
-        menu = await restaurant_service.list_menu()
+        # Ingredient and allergen questions must remain answerable for sold-out
+        # items; availability is reported separately and never inferred.
+        menu = await restaurant_service.list_menu(available_only=False)
     except RestaurantServiceError as error:
         return f"{error.code}: {error.message}"
 
     query_tokens = _tokens(query)
     matches: list[dict] = []
     for item in menu["items"]:
+        modifier_options = item.get("modifier_options") or []
         searchable = " ".join(
             [
                 item["name"],
                 item["category"],
                 item["description"],
                 " ".join(item["dietary"]),
+                " ".join(item.get("aliases") or []),
+                " ".join(item.get("ingredients") or []),
+                " ".join(item.get("allergens") or []),
+                " ".join(_modifier_search_text(option) for option in modifier_options),
             ]
         )
         score = len(query_tokens & _tokens(searchable))
@@ -46,25 +99,93 @@ async def search_menu(query: str) -> str:
     matches.sort(key=lambda item: (-item["_score"], item["name"]))
     if not matches:
         return "No grounded menu result matched that question. Ask the caller to clarify."
-    lines = [
-        (
-            f"{item['name']} ({format_menu_price(item)}, "
-            f"{'available' if item['available'] else 'sold out'}): "
-            f"{item['description'] or 'No additional description.'} "
-            f"Dietary tags: {', '.join(item['dietary']) or 'none listed'}."
+    selected = matches[:8]
+
+    def _availability_label(item: dict) -> str:
+        if item.get("available"):
+            return "available"
+        if item.get("effective_status") == "future":
+            return f"available from {item.get('effective_from')}"
+        if item.get("effective_status") == "expired":
+            return f"no longer available after {item.get('effective_to')}"
+        status = str(item.get("availability") or "")
+        if status == "sold_out":
+            return "sold out"
+        if status == "not_yet_available":
+            return "not yet available"
+        if item.get("service_status") != "available":
+            return str(item.get("service_message") or "unavailable").rstrip(".")
+        return "not currently effective"
+
+    lines = []
+    for item in selected:
+        modifier_options = item.get("modifier_options") or []
+        options_text = (
+            "Options: "
+            + ", ".join(_format_modifier(option) for option in modifier_options)
+            + ". "
+            if modifier_options
+            else ""
         )
-        for item in matches[:8]
-    ]
-    return " ".join(lines) + f" Allergy safety: {menu['allergen_notice']}"
+        lines.append(
+            f"{item['name']} ({format_menu_price(item)}, "
+            f"{_availability_label(item)}): "
+            f"{item['description'] or 'No additional description.'} "
+            f"Ingredients: {', '.join(item.get('ingredients') or []) or 'not listed'}. "
+            f"Allergens: {', '.join(item.get('allergens') or []) or 'no recipe allergen listed'}. "
+            f"Dietary tags: {', '.join(item['dietary']) or 'none listed'}. "
+            f"{options_text}"
+            f"Cross-contact: {item.get('cross_contact') or menu['allergen_notice']}"
+        )
+    missing: list[str] = []
+    lowered = query.casefold()
+    if any(word in lowered for word in ("ingredient", "what's in", "what is in")) and any(
+        not item.get("ingredients") for item in selected
+    ):
+        missing.append("ingredients")
+    if any(word in lowered for word in ("serving", "how many people", "portion")) and any(
+        not item.get("portion") for item in selected
+    ):
+        missing.append("serving_size")
+    suffix = f" Allergy safety: {menu['allergen_notice']}"
+    if missing and session_id:
+        try:
+            gap = await restaurant_service.log_unknown_question(
+                call_id=session_id,
+                question=query,
+                context_excerpt="Missing canonical menu fields: " + ", ".join(missing),
+                agent_response="The requested menu detail is not in current canonical data.",
+            )
+            suffix += (
+                f" Missing canonical fields: {', '.join(missing)}. "
+                f"Knowledge gap logged (id {gap['gap_id']})."
+            )
+        except RestaurantServiceError as error:
+            suffix += f" Missing canonical fields: {', '.join(missing)}; {error.code}."
+    return " ".join(lines) + suffix
 
 
 @tool
-async def search_restaurant_info(query: str) -> str:
+async def search_restaurant_info(query: str, session_id: str = "") -> str:
     """Answer hours, address, parking, cancellation, late arrival, patio, birthday cake, and other restaurant policy questions from approved knowledge. If nothing matches, do not transfer; call log_unknown_question."""
     try:
         result = await restaurant_service.restaurant_info(query)
     except RestaurantServiceError as error:
         return f"{error.code}: {error.message}"
+    if result.get("log_unknown"):
+        try:
+            logged = await restaurant_service.log_unknown_question(
+                call_id=resolve_session_id(session_id),
+                question=query,
+                context_excerpt=f"knowledge_status={result.get('status', 'unknown')}",
+                agent_response=result.get("formatted") or "The answer is not in current restaurant information.",
+            )
+            return (
+                (result.get("formatted") or "No grounded restaurant answer matched that question.")
+                + f" Knowledge gap logged (id {logged['gap_id']})."
+            )
+        except RestaurantServiceError as error:
+            return f"{error.code}: {error.message}"
     if result.get("formatted"):
         return result["formatted"]
     parts: list[str] = []

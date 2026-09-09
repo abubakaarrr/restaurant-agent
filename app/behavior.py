@@ -27,6 +27,8 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
+from app.transfer_availability import resolve_handoff_destination
+
 
 class BehaviorMode(str, Enum):
     """High-level response style selected by the reducer."""
@@ -262,6 +264,7 @@ class BehaviorDirective:
     reminder_after_seconds: float
     direct_reply: str | None = None
     control: BehaviorControl = BehaviorControl.CONTINUE
+    transfer_number: str = ""
     pace: PacePreference | None = None
     locale: str | None = None
     accessibility_preferences: tuple[AccessibilityPreference, ...] = field(
@@ -399,8 +402,12 @@ _COMPLAINT_PATTERNS = (
     re.compile(r"\bterrible\s+service\b"),
     re.compile(r"\byou\s+keep\s+(?:asking|repeating|interrupting)\b"),
     re.compile(r"\bstop\s+interrupting\b"),
+    re.compile(r"\bthis\s+is\s+the\s+(?:third|fourth|fifth)\s+time\s+this\s+failed\b"),
 )
-
+_PERSONAL_IDENTITY_PATTERNS = (
+    re.compile(r"\b(?:are|am)\s+(?:you|i)\s+(?:a\s+)?(?:real\s+person|human|ai|robot|bot)\b"),
+    re.compile(r"\bwhat\s+(?:are|kind\s+of\s+bot\s+are)\s+you\b"),
+)
 _HANDOFF_MANAGER_PATTERNS = (
     re.compile(
         r"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?"
@@ -425,6 +432,10 @@ _HANDOFF_MANAGER_PATTERNS = (
     ),
 )
 _HANDOFF_HUMAN_PATTERNS = (
+    re.compile(
+        r"\b(?:transfer|connect|put)\s+me\s+(?:to|through\s+to)\s+"
+        r"(?:a\s+)?(?:human|person|staff\s+member|employee|real\s+person)\b"
+    ),
     re.compile(
         r"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?"
         r"(?:transfer|connect|put)\s+me\s+(?:to|through\s+to)\s+"
@@ -811,20 +822,35 @@ def _direct_reply(
     control: BehaviorControl,
     terminal_reason: str | None,
     handoff_reason: str | None,
+    handoff_destination: Mapping[str, Any] | None,
     silence_count: int,
     boundary_kind: str | None,
     boundary_strikes: int,
     unintelligible: bool,
+    personal_identity: bool,
 ) -> str | None:
-    if control is BehaviorControl.HANDOFF:
-        if handoff_reason == "manager_requested":
-            return "Of course. I'll connect you with a manager now."
-        return "Of course. I'll connect you with a staff member now."
+    if handoff_reason is not None:
+        destination = handoff_destination or {}
+        if destination["can_transfer"]:
+            return "Of course. I'll connect you with a staff member now."
+        if destination["owner"] == "manager_callback":
+            return (
+                "A manager isn't available by transfer now, but I can take a message "
+                "and callback details for the manager."
+            )
+        return (
+            "I can't transfer the call right now, but I can take a message and "
+            "callback details for the restaurant team."
+        )
     if control is BehaviorControl.END_CALL:
         if terminal_reason == "silence":
             return "I haven't heard you, so I'll end the call for now. Please call back anytime."
         return "I'm ending the call now."
-
+    if personal_identity:
+        return (
+            "I'm Harbor & Hearth's virtual host. "
+            "I can help with a reservation, an order, or restaurant questions."
+        )
     if silence_count == 1:
         return "Take your time—I'm here when you're ready."
     if silence_count == 2:
@@ -1009,6 +1035,7 @@ def reduce_behavior(
     )
     confusion = meaningful and _matches(_CONFUSION_PATTERNS, text)
     complaint = meaningful and _matches(_COMPLAINT_PATTERNS, text)
+    personal_identity = meaningful and _matches(_PERSONAL_IDENTITY_PATTERNS, text)
 
     fingerprint = _utterance_fingerprint(text) if meaningful else ""
     repetition_proxy = bool(
@@ -1107,10 +1134,27 @@ def reduce_behavior(
     elif boundary_strikes == 0:
         boundary_clean_turns = 0
 
-    handoff_reason = handoff_request or state.explicit_handoff_reason
+    handoff_reason = handoff_request or (
+        state.explicit_handoff_reason
+        if state.terminal_control is BehaviorControl.HANDOFF
+        else None
+    )
     terminal_control = state.terminal_control
     terminal_reason = state.terminal_reason
-    if terminal_control is None and handoff_reason is not None:
+    destination = (
+        resolve_handoff_destination(handoff_reason) if handoff_reason is not None else None
+    )
+    if terminal_control is BehaviorControl.HANDOFF and not (
+        destination and destination["can_transfer"]
+    ):
+        terminal_control = None
+        terminal_reason = None
+    if (
+        terminal_control is None
+        and handoff_request is not None
+        and destination
+        and destination["can_transfer"]
+    ):
         terminal_control = BehaviorControl.HANDOFF
         terminal_reason = "handoff"
     elif (
@@ -1146,7 +1190,9 @@ def reduce_behavior(
         interruption_timestamps=interruption_timestamps,
         interruption_count=interruption_count,
         boundary_strikes=boundary_strikes,
-        explicit_handoff_reason=handoff_reason,
+        explicit_handoff_reason=(
+            handoff_reason if terminal_control is BehaviorControl.HANDOFF else None
+        ),
         speech_rate_samples=rate_samples,
         inferred_pace=inferred_pace,
         turn_index=turn_index,
@@ -1205,10 +1251,12 @@ def reduce_behavior(
         control=control,
         terminal_reason=terminal_reason,
         handoff_reason=handoff_reason,
+        handoff_destination=destination,
         silence_count=silence_count,
         boundary_kind=boundary_kind,
         boundary_strikes=boundary_strikes,
         unintelligible=unintelligible,
+        personal_identity=personal_identity,
     )
     prompt_instruction = _prompt_instruction(
         mode=mode,
@@ -1236,6 +1284,11 @@ def reduce_behavior(
         reminder_after_seconds=reminder_after,
         direct_reply=direct_reply,
         control=control,
+        transfer_number=(
+            str(destination["transfer_number"])
+            if control is BehaviorControl.HANDOFF and destination
+            else ""
+        ),
         pace=effective_pace,
         locale=explicit_locale,
         accessibility_preferences=accessibility,

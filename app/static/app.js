@@ -682,44 +682,13 @@ async function addNewMenuItem() {
 
 // ── Settings page ─────────────────────────────────────────────
 
-const LANG_CHECKBOXES = {
-  English: 'langEn',
-  French: 'langFr',
-  Spanish: 'langEs',
-  Arabic: 'langAr',
-  Urdu: 'langUr',
-};
-
-const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
-
 async function loadSettings() {
   try {
     const res = await fetch('/api/settings', { headers: authHeaders() });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const s = await res.json();
 
-    document.getElementById('setName').value = s.restaurant_name || '';
-    document.getElementById('setPhone').value = s.phone_number || '';
-    document.getElementById('setTimezone').value = s.timezone || 'UTC';
-    document.getElementById('setCapacity').value = s.seating_capacity || '';
-    document.getElementById('setAddress').value = s.street_address || '';
-    document.getElementById('setCity').value = s.city || '';
-    document.getElementById('setAgentName').value = s.ai_agent_name || 'Clough';
-
-    const langs = s.languages || ['English'];
-    Object.entries(LANG_CHECKBOXES).forEach(([lang, id]) => {
-      const cb = document.getElementById(id);
-      if (cb) cb.checked = langs.includes(lang);
-    });
-
-    const hours = s.opening_hours || {};
-    DAYS.forEach(day => {
-      const h = hours[day] || {};
-      const openEl = document.getElementById(`hours-${day}-open`);
-      const closeEl = document.getElementById(`hours-${day}-close`);
-      if (openEl && h.open) openEl.value = h.open;
-      if (closeEl && h.close) closeEl.value = h.close;
-    });
+    document.getElementById('setAgentName').value = s.ai_agent_name || 'Avery';
   } catch (e) {
     console.error('Load settings error:', e);
     document.getElementById('settingsStatus').textContent = 'Failed to load settings';
@@ -733,32 +702,8 @@ async function saveSettings() {
   btn.disabled = true;
   status.textContent = '';
 
-  const languages = [];
-  Object.entries(LANG_CHECKBOXES).forEach(([lang, id]) => {
-    const cb = document.getElementById(id);
-    if (cb && cb.checked) languages.push(lang);
-  });
-
-  const opening_hours = {};
-  DAYS.forEach(day => {
-    const open = document.getElementById(`hours-${day}-open`).value;
-    const close = document.getElementById(`hours-${day}-close`).value;
-    if (open && close) {
-      opening_hours[day] = { open, close };
-    }
-  });
-
   const payload = {
-    restaurant_name: document.getElementById('setName').value.trim(),
-    phone_number: document.getElementById('setPhone').value.trim(),
-    timezone: document.getElementById('setTimezone').value,
-    seating_capacity: parseInt(document.getElementById('setCapacity').value) || 60,
-    street_address: document.getElementById('setAddress').value.trim(),
-    city: document.getElementById('setCity').value.trim(),
-    ai_agent_name: document.getElementById('setAgentName').value.trim() || 'Clough',
-    languages,
-    opening_hours,
-    hours_unconfirmed: Object.keys(opening_hours).length === 0,
+    ai_agent_name: document.getElementById('setAgentName').value.trim() || 'Avery',
   };
 
   try {

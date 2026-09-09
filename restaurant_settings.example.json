@@ -1,14 +1,5 @@
 {
-  "restaurant_name": "The Lamplighter Public House",
-  "tagline": "Vancouver's oldest pub, Gastown, est. 1925",
-  "phone_number": "+16046874424",
-  "timezone": "America/Vancouver",
-  "seating_capacity": 60,
-  "street_address": "92 Water St",
-  "city": "Vancouver, BC V6B 2K8",
-  "ai_agent_name": "Clough",
-  "languages": ["English"],
-  "opening_hours": {},
-  "hours_unconfirmed": true,
-  "hours_note": "Opening hours are not confirmed with the venue. Public listings disagree, including whether Monday is open. Do not invent a weekly schedule."
+  "restaurant_id": "restaurant.harbor-and-hearth.portland",
+  "data_version": "2026.09.07-phase1",
+  "ai_agent_name": "Avery"
 }

@@ -1,6 +1,7 @@
 """Deterministic safety and transition tests for caller behavior."""
 
 from dataclasses import FrozenInstanceError
+from datetime import datetime
 
 import pytest
 
@@ -276,7 +277,14 @@ def test_silence_ladder_resets_on_speech_and_ends_after_three_silences() -> None
     assert late_packet.directive.control is BehaviorControl.END_CALL
 
 
-def test_explicit_human_and_manager_requests_handoff_and_stay_sticky() -> None:
+def test_explicit_human_transfer_is_sticky_but_manager_uses_callback(monkeypatch) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "staff_transfer_number", "+15035550149")
+    monkeypatch.setattr(
+        "app.transfer_availability._now",
+        lambda timezone_info: datetime(2026, 9, 8, 12, tzinfo=timezone_info),
+    )
     unrelated = _reduce(BehaviorState(), "I need a table for my manager.")
     assert unrelated.directive.control is BehaviorControl.CONTINUE
     assert unrelated.state.explicit_handoff_reason is None
@@ -287,19 +295,19 @@ def test_explicit_human_and_manager_requests_handoff_and_stay_sticky() -> None:
     assert "staff member" in (human.directive.direct_reply or "")
 
     manager = _reduce(BehaviorState(), "Could you connect me to a manager?")
-    assert manager.state.explicit_handoff_reason == "manager_requested"
-    assert manager.directive.control is BehaviorControl.HANDOFF
-    assert "manager" in (manager.directive.direct_reply or "")
+    assert manager.state.explicit_handoff_reason is None
+    assert manager.directive.control is BehaviorControl.CONTINUE
+    assert "callback" in (manager.directive.direct_reply or "")
 
     common_manager_request = _reduce(BehaviorState(), "Can I speak to a manager?")
-    assert common_manager_request.directive.control is BehaviorControl.HANDOFF
+    assert common_manager_request.directive.control is BehaviorControl.CONTINUE
 
     common_human_request = _reduce(BehaviorState(), "Can I talk with a human?")
     assert common_human_request.directive.control is BehaviorControl.HANDOFF
 
-    sticky = _reduce(manager.state, "Hello?")
+    sticky = _reduce(human.state, "Hello?")
     assert sticky.directive.control is BehaviorControl.HANDOFF
-    assert sticky.state.explicit_handoff_reason == "manager_requested"
+    assert sticky.state.explicit_handoff_reason == "human_requested"
 
 
 def test_abuse_uses_a_three_step_boundary_ladder() -> None:

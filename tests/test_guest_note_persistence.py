@@ -5,12 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import os
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 
 from app.call_memory import (
     clear_call_memory,
     format_memory_for_prompt,
+    get_call_memory,
     update_reservation_draft,
 )
 
@@ -19,6 +21,34 @@ pytestmark_db = pytest.mark.skipif(
     os.getenv("RUN_DB_INTEGRATION") != "1" or not os.getenv("TEST_DATABASE_URL"),
     reason="Set RUN_DB_INTEGRATION=1 with TEST_DATABASE_URL",
 )
+
+
+@pytest.mark.asyncio
+async def test_order_note_does_not_enter_reservation_memory(monkeypatch) -> None:
+    from app.services.restaurant import restaurant_service
+    from app.tools.db import add_guest_note
+
+    call_id = "order-note-owner"
+    clear_call_memory(call_id)
+    add_note = AsyncMock(
+        return_value={
+            "saved": True,
+            "booking_id": 0,
+            "saved_on_booking": False,
+            "note_owner": "order",
+            "notes": "No utensils",
+            "guest_notes": "",
+        }
+    )
+    monkeypatch.setattr(restaurant_service, "add_guest_note", add_note)
+    try:
+        response = await add_guest_note.ainvoke(
+            {"session_id": call_id, "note": "No utensils"}
+        )
+        assert "on the order" in response.casefold()
+        assert get_call_memory(call_id).get("guest_notes") in {None, ""}
+    finally:
+        clear_call_memory(call_id)
 
 
 @pytestmark_db

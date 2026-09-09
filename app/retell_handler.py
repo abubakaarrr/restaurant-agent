@@ -26,8 +26,10 @@ from app.behavior import (
 from app.behavior_store import load_behavior_state, save_behavior_state
 from app.call_analytics import record_call_event
 from app.call_flags import consume_call_control
+from app.caller_turn import process_caller_turn
 from app.config import settings
 from app.restaurant_settings import load_restaurant_settings
+from app.transfer_availability import current_staff_transfer_number
 
 
 logger = logging.getLogger(__name__)
@@ -187,6 +189,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
         response_id: int,
         user_text: str,
         behavior_directive: str = "",
+        caller_turn: dict[str, Any] | None = None,
     ) -> None:
         nonlocal current_task
         started = time.monotonic()
@@ -198,6 +201,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 user_text,
                 caller_number,
                 behavior_directive,
+                prepared_caller_turn=caller_turn,
             ):
                 if response_id != active_response_id:
                     return
@@ -222,13 +226,13 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             final_content = ""
             no_interruption = False
             if control and control.action == "transfer":
-                if settings.staff_transfer_number:
-                    transfer_number = settings.staff_transfer_number
+                transfer_number = control.transfer_number
+                if transfer_number:
                     no_interruption = True
                 else:
                     final_content = (
-                        "I'm sorry, the staff transfer line is not configured. "
-                        "Please call the restaurant directly."
+                        "I'm sorry, I can't transfer the call right now. "
+                        "I can take a message and callback details for the restaurant team."
                     )
             await send(
                 _response_event(
@@ -257,15 +261,20 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             logger.error("Retell agent stream error", exc_info=True)
             if response_id == active_response_id:
                 with suppress(Exception):
+                    transfer_number = current_staff_transfer_number()
                     await send(
                         _response_event(
                             response_id,
                             (
                                 "I'm sorry, I had a technical issue. "
-                                "I can connect you with the restaurant team."
+                                + (
+                                    "I can connect you with the restaurant team."
+                                    if transfer_number
+                                    else "I can't transfer right now, but I can take a callback message."
+                                )
                             ),
                             complete=True,
-                            transfer_number=settings.staff_transfer_number,
+                            transfer_number=transfer_number,
                         )
                     )
                     completed = True
@@ -363,7 +372,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
 
             if not user_text:
                 runtime = load_restaurant_settings()
-                restaurant = runtime.get("restaurant_name") or settings.restaurant_name
+                restaurant = runtime["restaurant_name"]
                 agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
                 greeting = (
                     f"Hi, you've reached {restaurant}. This is {agent_name}. "
@@ -374,12 +383,24 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 )
                 continue
 
+            caller_turn = await process_caller_turn(call_id, user_text)
+            if caller_turn.get("handled"):
+                await send(
+                    _response_event(
+                        active_response_id,
+                        str(caller_turn.get("message") or ""),
+                        complete=True,
+                    )
+                )
+                continue
+
             directive = await apply_behavior(
                 user_turn,
                 interrupted=was_interrupted,
             )
             if directive.locale and not _locale_supported(directive.locale):
-                can_transfer = bool(settings.staff_transfer_number)
+                transfer_number = current_staff_transfer_number()
+                can_transfer = bool(transfer_number)
                 await send(
                     _response_event(
                         active_response_id,
@@ -388,24 +409,18 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                             + (
                                 "I'll connect you with the restaurant team."
                                 if can_transfer
-                                else "Please call the restaurant team directly."
+                                else "I can't transfer right now, but I can take a callback message."
                             )
                         ),
                         complete=True,
-                        transfer_number=(
-                            settings.staff_transfer_number if can_transfer else ""
-                        ),
+                        transfer_number=transfer_number,
                         no_interruption_allowed=can_transfer,
                     )
                 )
                 continue
 
             if directive.direct_reply is not None:
-                transfer_number = (
-                    settings.staff_transfer_number
-                    if directive.control is BehaviorControl.HANDOFF
-                    else ""
-                )
+                transfer_number = directive.transfer_number
                 await send(
                     _response_event(
                         active_response_id,
@@ -428,6 +443,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     active_response_id,
                     user_text,
                     directive.prompt_instruction,
+                    caller_turn,
                 )
             )
     except WebSocketDisconnect:

@@ -26,6 +26,7 @@ from app.pending_confirmation import (
     register_pending_confirmation,
 )
 from app.reservation_draft import compose_notes, flatten_draft
+from app.restaurant_settings import load_restaurant_settings
 from app.security import constant_time_equal
 from app.services.restaurant import RestaurantServiceError, restaurant_service
 
@@ -54,7 +55,7 @@ class CallRequest(BaseModel):
 class AvailabilityRequest(BaseModel):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     time: str = Field(pattern=r"^\d{2}:\d{2}$")
-    party_size: int = Field(ge=1, le=12)
+    party_size: int = Field(ge=1, le=24)
     preferred_location: str = Field(default="", max_length=40)
     call_id: str = Field(default="", max_length=200)
 
@@ -102,7 +103,7 @@ class AddOrderItemRequest(CallRequest, MenuItemRequest):
 class UpdateOrderItemRequest(CallRequest):
     order_item_id: int = Field(gt=0)
     quantity: int = Field(ge=1, le=20)
-    notes: str = Field(default="", max_length=300)
+    notes: str | None = Field(default=None, max_length=300)
     confirmed: bool = False
 
 
@@ -135,7 +136,7 @@ class UpdateReservationDraftRequest(CallRequest):
     customer_phone: str | None = Field(default=None, max_length=200)
     date: str | None = Field(default=None, max_length=10)
     time: str | None = Field(default=None, max_length=5)
-    party_size: int | None = Field(default=None, ge=0, le=12)
+    party_size: int | None = Field(default=None, ge=0, le=24)
     seating_preference: str | None = Field(default=None, max_length=80)
     seating_backup: str | None = Field(default=None, max_length=80)
     seating_avoid: str | None = Field(default=None, max_length=80)
@@ -149,7 +150,7 @@ class UpdateConfirmedBookingRequest(CallRequest):
     booking_id: int = Field(default=0, ge=0)
     date: str = Field(default="", max_length=10)
     time: str = Field(default="", max_length=5)
-    party_size: int = Field(default=0, ge=0, le=12)
+    party_size: int = Field(default=0, ge=0, le=24)
     seating_preference: str | None = Field(default=None, max_length=80)
     seating_backup: str | None = Field(default=None, max_length=80)
     seating_avoid: str | None = Field(default=None, max_length=80)
@@ -204,7 +205,7 @@ async def voice_tool_health() -> dict[str, Any]:
     return {
         "ok": True,
         "writes_enabled": settings.voice_live_writes_enabled,
-        "restaurant": settings.restaurant_name,
+        "restaurant": load_restaurant_settings()["restaurant_name"],
     }
 
 
@@ -441,7 +442,7 @@ async def log_unknown_question(body: LogUnknownQuestionRequest) -> dict[str, Any
 @router.get("/menu", dependencies=[ToolAuth])
 async def get_menu() -> dict[str, Any]:
     try:
-        return _ok(await restaurant_service.list_menu())
+        return _ok(await restaurant_service.list_menu(available_only=False))
     except RestaurantServiceError as error:
         _raise_service_error(error)
 

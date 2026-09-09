@@ -110,8 +110,8 @@ def patch_draft(
                 draft[key] = int(value)
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"{key} must be an integer.") from exc
-            if key == "party_size" and draft[key] and not 1 <= draft[key] <= 12:
-                raise ValueError("Party size must be between 1 and 12.")
+            if key == "party_size" and draft[key] and not 1 <= draft[key] <= 24:
+                raise ValueError("Party size must be between 1 and 24.")
             if draft[key] < 0:
                 draft[key] = 0
         elif key in BOOL_FIELDS:
@@ -166,6 +166,8 @@ def preferred_location(draft: dict[str, Any] | str) -> str:
         return "patio"
     if "private" in lowered:
         return "private"
+    if "bar" in lowered or "high top" in lowered or "high-top" in lowered:
+        return "bar"
     if "indoor" in lowered or "main" in lowered:
         return "main"
     return ""
@@ -180,6 +182,8 @@ def normalize_preferred_location(value: str) -> str:
         return "patio"
     if "private" in text:
         return "private"
+    if "bar" in text or "high top" in text or "high-top" in text:
+        return "bar"
     if text in {"indoor", "inside", "main", "dining", "dining room"}:
         return "main"
     return text

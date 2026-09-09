@@ -7,8 +7,9 @@ import os
 
 import pytest
 
-from app.call_memory import clear_call_memory, get_call_memory
+from app.call_memory import clear_call_memory, get_call_memory, hydrate_call_memory
 from app.pending_confirmation import (
+    ACTION_CANCEL_BOOKING,
     ACTION_CONFIRM_ORDER,
     ACTION_CREATE_BOOKING,
     begin_caller_turn,
@@ -16,6 +17,7 @@ from app.pending_confirmation import (
     classify_affirmation,
     clear_pending_confirmation,
     order_confirmation_payload,
+    pending_state_patch,
     register_pending_confirmation,
     require_pending_confirmation,
 )
@@ -29,6 +31,7 @@ def test_classify_affirmation_keywords() -> None:
     assert classify_affirmation("no") == "negative"
     assert classify_affirmation("wait, change the time") == "negative"
     assert classify_affirmation("actually make it six") == "negative"
+    assert classify_affirmation("move it to seven, not cancel it") == "negative"
     assert classify_affirmation("what time do you close?") == "unclear"
     assert classify_affirmation("yes, but change the name") == "negative"
 
@@ -117,6 +120,56 @@ def test_require_pending_accepts_after_yes_on_later_turn() -> None:
     begin_caller_turn("pc-ok", "yes")
     require_pending_confirmation("pc-ok", ACTION_CREATE_BOOKING, payload)
     assert get_call_memory("pc-ok")["last_turn_affirmation"] == "affirmative"
+
+
+def test_cancellation_confirmation_is_not_durable() -> None:
+    session_id = "pc-cancel-nondurable"
+    clear_call_memory(session_id)
+    register_pending_confirmation(
+        session_id,
+        ACTION_CANCEL_BOOKING,
+        {"booking_id": 42},
+    )
+    assert ACTION_CANCEL_BOOKING not in pending_state_patch(session_id)[
+        "pending_confirmations"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hydration_discards_legacy_pending_cancellation(monkeypatch) -> None:
+    session_id = "pc-cancel-legacy-hydration"
+    clear_call_memory(session_id)
+
+    class Connection:
+        async def fetchrow(self, query: str, *args: object):
+            if "FROM call_sessions" in query:
+                return {
+                    "caller_phone": "",
+                    "state": {
+                        "pending_confirmations": {
+                            ACTION_CANCEL_BOOKING: {"payload": {"booking_id": 42}}
+                        }
+                    },
+                }
+            return None
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    async def fake_pool():
+        return Pool()
+
+    monkeypatch.setattr("app.call_memory.get_pool", fake_pool)
+    restored = await hydrate_call_memory(session_id)
+    assert restored["pending_confirmations"] == {}
 
 
 pytestmark_db = pytest.mark.skipif(

@@ -1,5 +1,5 @@
 -- ══════════════════════════════════════════════════════════════
--- The Lamplighter Public House — Database Schema
+-- Harbor & Hearth Kitchen — Database Schema
 -- Run: psql restaurant_agent -f db/schema.sql
 -- ══════════════════════════════════════════════════════════════
 
@@ -56,10 +56,45 @@ CREATE TABLE IF NOT EXISTS menu_items (
     description TEXT,
     dietary     TEXT[] DEFAULT '{}',     -- ['vegetarian','vegan','gluten-free','halal']
     available   BOOLEAN DEFAULT TRUE,
-    price_estimated BOOLEAN NOT NULL DEFAULT FALSE
+    price_estimated BOOLEAN NOT NULL DEFAULT FALSE,
+    canonical_id TEXT,
+    aliases TEXT[] NOT NULL DEFAULT '{}',
+    ingredients TEXT[] NOT NULL DEFAULT '{}',
+    allergens TEXT[] NOT NULL DEFAULT '{}',
+    service_periods TEXT[] NOT NULL DEFAULT '{}',
+    availability_status TEXT NOT NULL DEFAULT 'available',
+    knowledge_metadata JSONB NOT NULL DEFAULT '{}',
+    source_id TEXT NOT NULL DEFAULT '',
+    data_version TEXT NOT NULL DEFAULT '',
+    effective_from DATE,
+    effective_to DATE
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_menu_items_name_ci
     ON menu_items (LOWER(name));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_menu_items_canonical_id
+    ON menu_items (canonical_id) WHERE canonical_id IS NOT NULL;
+
+-- Versioned structured restaurant facts. Payload remains JSONB because record
+-- shapes differ across hours, policies, areas, escalation routes, and style.
+CREATE TABLE IF NOT EXISTS restaurant_knowledge_records (
+    canonical_id   TEXT PRIMARY KEY,
+    record_type    TEXT NOT NULL,
+    category_id    TEXT NOT NULL,
+    source_id      TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    data_version   TEXT NOT NULL,
+    effective_from DATE NOT NULL,
+    effective_to   DATE,
+    status          TEXT NOT NULL DEFAULT 'current',
+    display_text    TEXT NOT NULL DEFAULT '',
+    payload         JSONB NOT NULL,
+    synthetic       BOOLEAN NOT NULL DEFAULT TRUE,
+    CHECK (synthetic IS TRUE)
+);
+CREATE INDEX IF NOT EXISTS idx_restaurant_knowledge_category
+    ON restaurant_knowledge_records(record_type, category_id);
+CREATE INDEX IF NOT EXISTS idx_restaurant_knowledge_effective
+    ON restaurant_knowledge_records(effective_from, effective_to);
 
 -- ─────────────────────────── Call Sessions ───────────────────
 CREATE TABLE IF NOT EXISTS call_sessions (
@@ -84,15 +119,17 @@ CREATE TABLE IF NOT EXISTS orders (
     customer_name   TEXT DEFAULT '',
     customer_phone  TEXT DEFAULT '',
     status          TEXT DEFAULT 'pending',   -- pending | confirmed | cancelled
-    fulfillment_type TEXT,                   -- dine_in | pickup | null until set
+    fulfillment_type TEXT,                   -- dine_in | pickup | delivery | null until set
+    fulfillment_details JSONB NOT NULL DEFAULT '{}',
     total_amount    NUMERIC(10,2) DEFAULT 0,
     notes           TEXT DEFAULT '',
+    allergy_notes   TEXT DEFAULT '',
     draft_version   INT NOT NULL DEFAULT 1,
     created_at      TIMESTAMP DEFAULT NOW(),
     confirmed_at    TIMESTAMP,
     CHECK (
         fulfillment_type IS NULL
-        OR fulfillment_type IN ('dine_in', 'pickup')
+        OR fulfillment_type IN ('dine_in', 'pickup', 'delivery')
     )
 );
 
@@ -110,6 +147,9 @@ CREATE TABLE IF NOT EXISTS order_items (
     unit_price      NUMERIC(10,2) NOT NULL,
     subtotal        NUMERIC(10,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
     notes           TEXT DEFAULT '',
+    modifiers       JSONB NOT NULL DEFAULT '[]',
+    removals        TEXT[] NOT NULL DEFAULT '{}',
+    substitutions   JSONB NOT NULL DEFAULT '[]',
     proposed        BOOLEAN NOT NULL DEFAULT FALSE
 );
 
@@ -163,6 +203,7 @@ CREATE TABLE IF NOT EXISTS provider_webhook_events (
 -- ───────────────────── Operator knowledge loop ───────────────
 CREATE TABLE IF NOT EXISTS knowledge_gaps (
     id                  SERIAL PRIMARY KEY,
+    restaurant_id       TEXT,
     session_id          TEXT NOT NULL DEFAULT '',
     question            TEXT NOT NULL,
     question_normalized TEXT NOT NULL,
@@ -175,13 +216,14 @@ CREATE TABLE IF NOT EXISTS knowledge_gaps (
     resolved_at         TIMESTAMP,
     CHECK (status IN ('unresolved', 'resolved'))
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_gaps_session_question
-    ON knowledge_gaps (session_id, question_normalized);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_knowledge_gaps_restaurant_session_question
+    ON knowledge_gaps (restaurant_id, session_id, question_normalized);
 CREATE INDEX IF NOT EXISTS idx_knowledge_gaps_status
     ON knowledge_gaps (status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS operator_knowledge (
     id              SERIAL PRIMARY KEY,
+    restaurant_id   TEXT NOT NULL DEFAULT '',
     question        TEXT NOT NULL,
     answer          TEXT NOT NULL,
     source_gap_id   INT REFERENCES knowledge_gaps(id) ON DELETE SET NULL,
@@ -189,5 +231,5 @@ CREATE TABLE IF NOT EXISTS operator_knowledge (
     created_at      TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMP NOT NULL DEFAULT NOW()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_knowledge_question_ci
-    ON operator_knowledge (LOWER(question));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_operator_knowledge_restaurant_question_ci
+    ON operator_knowledge (restaurant_id, LOWER(question));

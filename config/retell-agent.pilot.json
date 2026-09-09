@@ -3,6 +3,9 @@
   "manifest_version": "2026-08-12",
   "directly_importable": false,
   "notice": "Redacted, version-controlled desired state for dashboard/API review. It is not a Retell API request body.",
+  "phase1_limitations": {
+    "managed_cancellation_reversal": "unsupported; deterministic cancellation reversal is limited to local and self-hosted transports"
+  },
   "pilot_scope": {
     "market": "US_OR_CANADA",
     "direction": "inbound",

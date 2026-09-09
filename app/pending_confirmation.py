@@ -44,7 +44,7 @@ _AFFIRMATIVE_RE = re.compile(
 _NEGATIVE_RE = re.compile(
     r"(?:"
     r"\bno\b|\bnope\b|not correct|\bwait\b|\bactually\b|\bchange\b|"
-    r"hold on|never ?mind|don'?t|do not|wrong|instead"
+    r"hold on|never ?mind|don'?t|do not|not\s+cancel|wrong|instead"
     r")",
     re.IGNORECASE,
 )
@@ -98,15 +98,31 @@ def order_confirmation_payload(summary: dict[str, Any]) -> dict[str, Any]:
             {
                 "item_name": str(item.get("item_name") or item.get("name") or ""),
                 "quantity": int(item.get("quantity") or 0),
+                "unit_price": round(float(item.get("unit_price") or 0), 2),
+                "subtotal": round(float(item.get("subtotal") or 0), 2),
                 "notes": str(item.get("notes") or ""),
+                "modifiers": item.get("modifiers") or [],
+                "removals": item.get("removals") or [],
+                "substitutions": item.get("substitutions") or [],
             }
         )
-    items.sort(key=lambda row: (row["item_name"], row["quantity"], row["notes"]))
+    items.sort(
+        key=lambda row: (
+            row["item_name"],
+            row["quantity"],
+            row["notes"],
+            json.dumps(row["modifiers"], sort_keys=True, default=str),
+        )
+    )
     return {
         "order_id": int(summary.get("order_id") or 0),
         "draft_version": int(summary.get("draft_version") or 0),
         "booking_id": int(summary.get("booking_id") or 0),
         "fulfillment": str(summary.get("fulfillment") or ""),
+        "fulfillment_details": summary.get("fulfillment_details") or {},
+        "order_notes": str(summary.get("order_notes") or ""),
+        "allergy_notes": str(summary.get("allergy_notes") or ""),
+        "fees": summary.get("fees") or [],
         "total": round(float(summary.get("total") or 0), 2),
         "items": items,
     }
@@ -267,8 +283,10 @@ def get_pending_confirmation(
 def pending_state_patch(session_id: str) -> dict[str, Any]:
     """Fields to merge into call_sessions.state for cross-request durability."""
     mem = get_call_memory(session_id)
+    pending = _pending_map(session_id)
+    pending.pop(ACTION_CANCEL_BOOKING, None)
     return {
-        "pending_confirmations": mem.get("pending_confirmations") or {},
+        "pending_confirmations": pending,
         "confirmation_turn": int(mem.get("confirmation_turn") or 0),
         "last_turn_affirmation": str(mem.get("last_turn_affirmation") or "unclear"),
     }

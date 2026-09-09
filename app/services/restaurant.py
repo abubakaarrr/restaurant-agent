@@ -11,8 +11,8 @@ import json
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
 from typing import Any, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -22,7 +22,6 @@ from app.knowledge_search import (
     format_knowledge_hits,
     normalize_question,
     search_faq_rows,
-    search_static_knowledge,
 )
 from app.reservation_draft import (
     DRAFT_STATUS_CANCELLED,
@@ -36,6 +35,10 @@ from app.reservation_draft import (
     preferred_location as draft_preferred_location,
 )
 from app.restaurant_settings import HOURS_UNCONFIRMED_NOTE, load_restaurant_settings
+from app.restaurant_knowledge import (
+    KnowledgeFixtureError,
+    get_restaurant_knowledge,
+)
 from app.security import canonical_request_hash, normalize_caller_phone
 from app.pending_confirmation import (
     ACTION_CANCEL_BOOKING,
@@ -45,6 +48,7 @@ from app.pending_confirmation import (
     booking_confirmation_payload,
     cancel_booking_confirmation_payload,
     clear_pending_confirmation,
+    get_pending_confirmation,
     order_confirmation_payload,
     pending_state_patch,
     register_pending_confirmation,
@@ -56,10 +60,28 @@ from app.turn_evidence import (
     record_availability,
     record_order_summary,
 )
+from app.transfer_availability import current_staff_transfer_number
 
 
 JsonDict = dict[str, Any]
 T = TypeVar("T", bound=JsonDict)
+RESERVATION_DURATION_MINUTES = 90
+
+
+def _restaurant_now() -> datetime:
+    try:
+        timezone_info = ZoneInfo(get_restaurant_knowledge().identity["timezone"])
+    except (KnowledgeFixtureError, KeyError, ZoneInfoNotFoundError):
+        timezone_info = timezone.utc
+    return datetime.now(timezone_info)
+
+
+def _topic_rule(topic_id: str) -> JsonDict:
+    knowledge = get_restaurant_knowledge()
+    for topic in knowledge.topics:
+        if topic.get("topic_id") == topic_id:
+            return deepcopy(topic.get("rule") or {})
+    return {}
 
 
 class RestaurantServiceError(Exception):
@@ -99,6 +121,11 @@ def format_menu_price(item: Mapping[str, Any]) -> str:
 
 def format_availability_speech(result: Mapping[str, Any]) -> str:
     nonce = result.get("availability_nonce") or ""
+    if result.get("restaurant_closed"):
+        return (
+            f"Unavailable: {result.get('message') or 'The restaurant is closed at that time.'} "
+            f"availability_nonce={nonce}."
+        )
     if result.get("available"):
         tables = ", ".join(
             f"table {row['table_number']} ({row['capacity']} seats, {row['location']})"
@@ -161,6 +188,98 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _delivery_rule() -> JsonDict:
+    match = get_restaurant_knowledge().find_topic("delivery")
+    if match.status != "known":
+        return {}
+    return deepcopy(match.records[0].get("rule") or {})
+
+
+def _fulfillment_delay_minutes(fulfillment: str) -> int:
+    if fulfillment == "delivery":
+        estimates = _delivery_rule().get("delivery_eta_minutes") or [45]
+        return int(estimates[0])
+    return 30
+
+
+def _fulfillment_at(
+    fulfillment: str,
+    details: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    stored = str(details.get("fulfillment_at") or "")
+    if stored:
+        try:
+            return datetime.fromisoformat(stored)
+        except ValueError:
+            pass
+    return (now or _restaurant_now()) + timedelta(
+        minutes=_fulfillment_delay_minutes(fulfillment)
+    )
+
+
+def _future_fulfillment_at(
+    fulfillment: str,
+    details: Mapping[str, Any],
+    *,
+    now: datetime,
+) -> datetime:
+    service_at = _fulfillment_at(fulfillment, details, now=now)
+    if service_at.tzinfo is None and now.tzinfo is not None:
+        service_at = service_at.replace(tzinfo=now.tzinfo)
+    if service_at <= now:
+        raise RestaurantServiceError(
+            "The saved fulfillment time has passed. Set pickup or delivery again before reviewing or confirming this order.",
+            code="fulfillment_time_expired",
+            status=409,
+        )
+    return service_at
+
+
+def _ensure_order_item_available_at(
+    item: Mapping[str, Any],
+    service_at: datetime,
+    *,
+    context: str,
+    require_current_inventory: bool = True,
+) -> None:
+    effective_from = item.get("effective_from")
+    effective_to = item.get("effective_to")
+    service_date = service_at.date()
+    if (
+        (
+            require_current_inventory
+            and (
+                not item.get("inventory_available")
+                or item.get("availability_status") != "available"
+            )
+        )
+        or (
+            effective_from
+            and service_date < datetime.fromisoformat(str(effective_from)).date()
+        )
+        or (
+            effective_to
+            and service_date > datetime.fromisoformat(str(effective_to)).date()
+        )
+    ):
+        raise RestaurantServiceError(
+            f"{item['item_name']} is not available for {context}.",
+            code="menu_item_unavailable",
+            status=409,
+        )
+    service_status = get_restaurant_knowledge().menu_service_status(
+        item.get("service_periods") or [], service_at
+    )
+    if not service_status["available"]:
+        raise RestaurantServiceError(
+            f"{item['item_name']} is not available during {context}.",
+            code="service_period_unavailable",
+            status=409,
+        )
+
+
 class RestaurantService:
     """Database-backed, provider-neutral restaurant operations."""
 
@@ -212,9 +331,18 @@ class RestaurantService:
 
     @staticmethod
     def _validate_party_size(value: int) -> int:
-        if not 1 <= value <= 12:
+        rule = _topic_rule("topic.reservations")
+        maximum = int(rule.get("max_phone_party") or 10)
+        large_party_min = int(rule.get("large_party_min") or maximum + 1)
+        if large_party_min <= value <= 24:
             raise RestaurantServiceError(
-                "Party size must be between 1 and 12.",
+                "Parties of 11 to 24 require the private-dining reservations route; phone table inventory was not checked or booked.",
+                code="large_party_route_required",
+                status=409,
+            )
+        if not 1 <= value <= maximum:
+            raise RestaurantServiceError(
+                f"Phone table reservations support parties of 1 to {maximum}.",
                 code="invalid_party_size",
             )
         return value
@@ -229,18 +357,20 @@ class RestaurantService:
                 code="invalid_datetime",
             ) from exc
         try:
-            timezone_info = ZoneInfo(settings.restaurant_timezone)
-        except ZoneInfoNotFoundError:
+            timezone_info = ZoneInfo(get_restaurant_knowledge().identity["timezone"])
+        except (KnowledgeFixtureError, KeyError, ZoneInfoNotFoundError):
             timezone_info = timezone.utc
-        now_local = datetime.now(timezone_info).replace(tzinfo=None)
+        now_local = _restaurant_now().astimezone(timezone_info).replace(tzinfo=None)
         if value < now_local:
             raise RestaurantServiceError(
                 "The requested reservation time is in the past.",
                 code="past_booking",
             )
-        if value > now_local + timedelta(days=366):
+        window_days = int(_topic_rule("topic.reservations").get("window_days") or 30)
+        released_days = window_days if now_local.hour >= 9 else window_days - 1
+        if value.date() > now_local.date() + timedelta(days=released_days):
             raise RestaurantServiceError(
-                "Reservations can only be made up to one year ahead.",
+                f"Reservations open {window_days} days ahead at 9:00 AM Pacific.",
                 code="booking_too_far_ahead",
             )
         return value
@@ -277,6 +407,31 @@ class RestaurantService:
         )
 
     @staticmethod
+    async def _update_order_notes_with_conn(
+        conn: Any,
+        *,
+        order_notes: str | None = None,
+        allergy_notes: str | None = None,
+        order_id: int,
+    ) -> None:
+        await conn.execute(
+            """
+            UPDATE orders
+            SET notes = CASE WHEN $1::text IS NULL THEN notes ELSE $1 END,
+                allergy_notes = CASE WHEN $2::text IS NULL THEN allergy_notes ELSE $2 END,
+                draft_version = draft_version + 1
+            WHERE id = $3
+              AND (
+                  ($1::text IS NOT NULL AND notes IS DISTINCT FROM $1)
+                  OR ($2::text IS NOT NULL AND allergy_notes IS DISTINCT FROM $2)
+              )
+            """,
+            order_notes,
+            allergy_notes,
+            order_id,
+        )
+
+    @staticmethod
     def _coerce_state(value: Any) -> dict[str, Any]:
         if isinstance(value, str):
             try:
@@ -308,6 +463,7 @@ class RestaurantService:
             WHERE t.capacity >= $1
               {location_filter}
               AND ($7::int = 0 OR t.table_number = $7)
+              AND NOT (LOWER(t.location) = ANY($8::text[]))
               AND NOT EXISTS (
                 SELECT 1
                 FROM bookings b
@@ -421,9 +577,29 @@ class RestaurantService:
     ) -> list[JsonDict]:
         dt = self._parse_booking_datetime(date, time)
         party_size = self._validate_party_size(party_size)
+        operating_status = self._reservation_operating_status(dt)
+        if not operating_status["available"]:
+            raise RestaurantServiceError(
+                operating_status["customer_message"],
+                code="restaurant_closed",
+                status=409,
+            )
         window_start = dt - timedelta(minutes=30)
-        window_end = dt + timedelta(minutes=90)
+        window_end = dt + timedelta(minutes=RESERVATION_DURATION_MINUTES)
         location = (preferred_location or "").strip().casefold()
+        knowledge = get_restaurant_knowledge()
+        closed_locations: list[str] = []
+        for area in knowledge.raw["dining_areas"]:
+            area_location = str(area["area_id"]).removeprefix("area.").casefold()
+            if party_size > int(area.get("max_phone_party") or 10):
+                closed_locations.append(area_location)
+                continue
+            if area_location == "patio" and not knowledge.schedule_status(
+                "patio", dt, duration_minutes=RESERVATION_DURATION_MINUTES
+            )["available"]:
+                closed_locations.append(area_location)
+        if location and location in closed_locations:
+            return []
         if require_location_match is None:
             require_location_match = bool(location)
         sql = self._table_select_sql(
@@ -438,6 +614,7 @@ class RestaurantService:
             location,
             limit,
             int(table_number or 0),
+            closed_locations,
         )
         if conn is not None:
             rows = await conn.fetch(sql, *args)
@@ -467,7 +644,9 @@ class RestaurantService:
             if row["location"]
         }
         payload = {
-            "max_party_phone": 12,
+            "max_party_phone": int(
+                _topic_rule("topic.reservations").get("max_phone_party") or 10
+            ),
             "max_seats_by_location": by_location,
             "largest_table": max(by_location.values()) if by_location else 0,
         }
@@ -486,6 +665,28 @@ class RestaurantService:
         call_id: str = "",
     ) -> JsonDict:
         preferred = normalize_preferred_location(preferred_location)
+        requested = self._parse_booking_datetime(date, time)
+        party_size = self._validate_party_size(party_size)
+        operating_status = self._reservation_operating_status(requested)
+        if not operating_status["available"]:
+            result = {
+                "available": False,
+                "restaurant_closed": True,
+                "date": date,
+                "time": time,
+                "party_size": party_size,
+                "preferred_location": preferred,
+                "availability_nonce": secrets.token_hex(8),
+                "impossible_at_location": False,
+                "max_seats_at_location": 0,
+                "tables": [],
+                "available_sections": [],
+                "alternatives": [],
+                "message": operating_status["customer_message"],
+                "hours_kind": operating_status["kind"],
+            }
+            self._record_availability_result(result, call_id)
+            return result
         limits = await self.seating_limits()
         max_at_location = int((limits.get("max_seats_by_location") or {}).get(preferred) or 0)
         impossible_at_location = bool(preferred and max_at_location and party_size > max_at_location)
@@ -535,16 +736,29 @@ class RestaurantService:
             ),
             "alternatives": alternatives,
         }
+        self._record_availability_result(result, call_id)
+        return result
+
+    @staticmethod
+    def _record_availability_result(result: JsonDict, call_id: str) -> None:
         record_availability(result)
         from app.availability_offer import remember_availability_offer
         from app.call_memory import resolve_session_id
 
-        # Always remember — including negative results — so party-size edits can
-        # ground accept/reject on a real check_table_availability outcome.
         sid = resolve_session_id(call_id) if call_id else resolve_session_id()
         if sid:
             remember_availability_offer(sid, result)
-        return result
+
+    @staticmethod
+    def _reservation_operating_status(requested: datetime) -> JsonDict:
+        knowledge = get_restaurant_knowledge()
+        status = knowledge.operating_status(requested)
+        if not status["available"]:
+            return status
+        end = requested + timedelta(minutes=RESERVATION_DURATION_MINUTES) - timedelta(
+            microseconds=1
+        )
+        return knowledge.operating_status(end)
 
     async def _availability_alternatives(
         self,
@@ -568,6 +782,10 @@ class RestaurantService:
         if preferred and not skip_preferred_times:
             for minutes in (-60, 60, -120, 120, -30, 30):
                 candidate = requested + timedelta(minutes=minutes)
+                if not self._reservation_operating_status(candidate)[
+                    "available"
+                ]:
+                    continue
                 candidate_tables = await self.get_available_tables(
                     candidate.date().isoformat(),
                     candidate.strftime("%H:%M"),
@@ -786,6 +1004,26 @@ class RestaurantService:
                     code="readback_required",
                     status=409,
                 )
+            attachable_order = await conn.fetchrow(
+                """
+                SELECT id FROM orders
+                WHERE session_id = $1
+                  AND booking_id IS NULL
+                  AND status = 'pending'
+                  AND COALESCE(fulfillment_type, 'dine_in') = 'dine_in'
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                call_id,
+            )
+            if attachable_order:
+                await self._ensure_order_items_valid_at(
+                    conn,
+                    int(attachable_order["id"]),
+                    dt,
+                    context="the reservation time",
+                )
             row = await conn.fetchrow(
                 """
                 INSERT INTO bookings
@@ -823,27 +1061,27 @@ class RestaurantService:
             clear_pending_confirmation(call_id, ACTION_CREATE_BOOKING)
             state.update(pending_state_patch(call_id))
             await self._merge_session_state(conn, call_id, state, caller_phone=phone)
-            await conn.execute(
-                """
-                UPDATE orders
-                SET booking_id = $1,
-                    fulfillment_type = 'dine_in'
-                WHERE session_id = $2
-                  AND booking_id IS NULL
-                  AND status IN ('pending', 'confirmed')
-                """,
-                row["id"],
-                call_id,
-            )
+            if attachable_order:
+                await conn.execute(
+                    """
+                    UPDATE orders
+                    SET booking_id = $1,
+                        fulfillment_type = 'dine_in',
+                        fulfillment_details = '{}'::jsonb
+                    WHERE id = $2
+                    """,
+                    row["id"],
+                    attachable_order["id"],
+                )
             attached_order = None
             order_row = await conn.fetchrow(
                 """
                 SELECT id FROM orders
-                WHERE session_id = $1 AND status IN ('pending', 'confirmed')
+                WHERE booking_id = $1 AND status IN ('pending', 'confirmed')
                 ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
                 LIMIT 1
                 """,
-                call_id,
+                row["id"],
             )
             if order_row:
                 attached_order = await self._order_summary_with_conn(conn, order_row["id"])
@@ -1061,6 +1299,35 @@ class RestaurantService:
             )
 
             if changing_slot or location_changed:
+                proposed_at = self._parse_booking_datetime(new_date, new_time)
+                slot_changed = (
+                    proposed_at.date() != booked_at.date()
+                    or proposed_at.strftime("%H:%M") != booked_at.strftime("%H:%M")
+                )
+                if slot_changed:
+                    attached_items = await conn.fetch(
+                        """
+                        SELECT oi.item_name, mi.service_periods,
+                               mi.available AS inventory_available,
+                               mi.availability_status,
+                               mi.effective_from, mi.effective_to
+                        FROM orders o
+                        JOIN order_items oi ON oi.order_id = o.id
+                        LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
+                        WHERE o.booking_id = $1
+                          AND o.status = 'confirmed'
+                          AND o.fulfillment_type = 'dine_in'
+                          AND COALESCE(oi.proposed, FALSE) IS FALSE
+                        """,
+                        booking_id,
+                    )
+                    for attached_item in attached_items:
+                        _ensure_order_item_available_at(
+                            attached_item,
+                            proposed_at,
+                            context="the proposed reservation time",
+                            require_current_inventory=False,
+                        )
                 tables = await self.get_available_tables(
                     new_date,
                     new_time,
@@ -1096,14 +1363,13 @@ class RestaurantService:
                 table_id = chosen["id"]
                 table_number = chosen["table_number"]
                 location = chosen["location"]
-                dt = self._parse_booking_datetime(new_date, new_time)
                 await conn.execute(
                     """
                     UPDATE bookings
                     SET booked_at = $1, party_size = $2, table_id = $3
                     WHERE id = $4
                     """,
-                    dt,
+                    proposed_at,
                     new_party,
                     table_id,
                     booking_id,
@@ -1140,10 +1406,7 @@ class RestaurantService:
                 require_approval_for_paid_items,
             )
             await conn.execute(
-                """
-                UPDATE orders SET notes = $1, customer_name = $2 WHERE booking_id = $3
-                """,
-                rebuilt_notes,
+                "UPDATE orders SET customer_name = $1 WHERE booking_id = $2",
                 updated_name,
                 booking_id,
             )
@@ -1200,7 +1463,7 @@ class RestaurantService:
         note: str,
         booking_id: int = 0,
     ) -> JsonDict:
-        """Save a caller instruction on the booking, order, and call session."""
+        """Save a caller instruction on its booking or order owner."""
         call_id = self._require_call_id(call_id)
         note = " ".join(note.split())
         if not 2 <= len(note) <= 500:
@@ -1237,7 +1500,10 @@ class RestaurantService:
                     target_booking = 0
 
             saved_on_booking = False
+            note_owner = "reservation_draft"
             combined = note
+            guest_notes = str(session_state.get("guest_notes") or "")
+            state_patch: JsonDict = {}
             if target_booking:
                 row = await conn.fetchrow(
                     """
@@ -1259,17 +1525,20 @@ class RestaurantService:
                     combined,
                     row["id"],
                 )
-                await conn.execute(
-                    "UPDATE orders SET notes = $1 WHERE booking_id = $2",
-                    combined,
-                    row["id"],
-                )
                 saved_on_booking = True
+                note_owner = "booking"
                 target_booking = int(row["id"])
+                guest_notes = merge_note_text(guest_notes, note)
+                state_patch = {
+                    "notes": combined,
+                    "guest_notes": guest_notes,
+                    "booking_id": target_booking,
+                }
             else:
                 order = await conn.fetchrow(
                     """
-                    SELECT id, notes FROM orders
+                    SELECT id, booking_id, notes, status, fulfillment_type
+                    FROM orders
                     WHERE session_id = $1 AND status IN ('pending', 'confirmed')
                     ORDER BY id DESC
                     LIMIT 1
@@ -1278,38 +1547,39 @@ class RestaurantService:
                     call_id,
                 )
                 if order:
-                    combined = _combine_notes(order["notes"] or "", note)
-                    await conn.execute(
-                        "UPDATE orders SET notes = $1 WHERE id = $2",
-                        combined,
-                        order["id"],
+                    self._ensure_order_mutation_allowed(
+                        order,
+                        caller_confirmed=False,
                     )
+                    combined = _combine_notes(order["notes"] or "", note)
+                    await self._update_order_notes_with_conn(
+                        conn,
+                        order_notes=combined,
+                        order_id=order["id"],
+                    )
+                    note_owner = "order"
                 else:
                     combined = _combine_notes(str(session_state.get("notes") or ""), note)
+                    guest_notes = merge_note_text(guest_notes, note)
+                    state_patch = {"notes": combined, "guest_notes": guest_notes}
 
-            session_state["notes"] = combined
-            guest_notes = merge_note_text(str(session_state.get("guest_notes") or ""), note)
-            session_state["guest_notes"] = guest_notes
-            if target_booking:
-                session_state["booking_id"] = target_booking
-            state_patch = {"notes": combined, "guest_notes": guest_notes}
-            if target_booking:
-                state_patch["booking_id"] = target_booking
-            await conn.execute(
-                """
-                INSERT INTO call_sessions (session_id, state)
-                VALUES ($1, $2::jsonb)
-                ON CONFLICT (session_id) DO UPDATE
-                SET state = call_sessions.state || EXCLUDED.state,
-                    updated_at = NOW()
-                """,
-                call_id,
-                json.dumps(state_patch),
-            )
+            if state_patch:
+                await conn.execute(
+                    """
+                    INSERT INTO call_sessions (session_id, state)
+                    VALUES ($1, $2::jsonb)
+                    ON CONFLICT (session_id) DO UPDATE
+                    SET state = call_sessions.state || EXCLUDED.state,
+                        updated_at = NOW()
+                    """,
+                    call_id,
+                    json.dumps(state_patch),
+                )
             return {
                 "saved": True,
                 "booking_id": target_booking or 0,
                 "saved_on_booking": saved_on_booking,
+                "note_owner": note_owner,
                 "notes": combined,
                 "guest_notes": guest_notes,
             }
@@ -1420,6 +1690,55 @@ class RestaurantService:
         except RestaurantServiceError:
             pass
         return draft
+
+    async def reverse_pending_cancellation(self, call_id: str) -> JsonDict:
+        from app.call_memory import get_call_memory
+
+        call_id = self._require_call_id(call_id)
+        pending = get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
+        pending_payload = dict((pending or {}).get("payload") or {})
+        memory = get_call_memory(call_id)
+        if pending:
+            await self.invalidate_pending_cancellation(call_id)
+        try:
+            booking_id = int(
+                pending_payload.get("booking_id") or memory.get("booking_id") or 0
+            )
+        except (TypeError, ValueError):
+            booking_id = 0
+        if booking_id <= 0:
+            return {
+                "reversed": False,
+                "status": "unknown",
+                "message": (
+                    "I don't have a verified reservation or pending cancellation to change. "
+                    "No cancellation action was taken."
+                ),
+            }
+        booking = await self.lookup_booking(booking_id=booking_id)
+        if booking["status"] == "cancelled":
+            message = (
+                "That reservation is already cancelled, so I can't say it is unchanged. "
+                "No further cancellation action was taken."
+            )
+        elif pending:
+            message = (
+                "I stopped the pending cancellation. Your reservation remains "
+                f"{booking['status']}."
+            )
+        else:
+            message = f"Your reservation is {booking['status']} and no cancellation is pending."
+        return {
+            "reversed": bool(pending),
+            "booking_id": booking_id,
+            "status": booking["status"],
+            "message": message,
+        }
+
+    async def invalidate_pending_cancellation(self, call_id: str) -> None:
+        call_id = self._require_call_id(call_id)
+        clear_pending_confirmation(call_id, ACTION_CANCEL_BOOKING)
+        await self.persist_call_state(call_id, pending_state_patch(call_id))
 
     async def cancel_booking(
         self,
@@ -1564,77 +1883,167 @@ class RestaurantService:
                 pass
         return {**result, "idempotent_replay": replayed}
 
-    async def list_menu(self, *, available_only: bool = True) -> JsonDict:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT id, name, category, price, description, dietary, available,
-                       COALESCE(price_estimated, FALSE) AS price_estimated
-                FROM menu_items
-                WHERE ($1::boolean = FALSE OR available = TRUE)
-                ORDER BY category, name
-                """,
-                available_only,
+    async def list_menu(
+        self,
+        *,
+        available_only: bool = True,
+        at: datetime | None = None,
+        conn: Any | None = None,
+    ) -> JsonDict:
+        moment = at or _restaurant_now()
+        local_date = moment.date()
+        try:
+            knowledge = get_restaurant_knowledge()
+            canonical_source_id = knowledge.metadata["source_id"]
+            canonical_item_ids = [item["item_id"] for item in knowledge.menu_items]
+
+            async def fetch_rows(active_conn: Any) -> list[Any]:
+                return await active_conn.fetch(
+                    """
+                    SELECT id, canonical_id, name, aliases, category, price,
+                           description, dietary, ingredients, allergens,
+                           service_periods, availability_status,
+                           knowledge_metadata, source_id, data_version,
+                           effective_from, effective_to,
+                           COALESCE(price_estimated, FALSE) AS price_estimated,
+                           (
+                               available = TRUE
+                               AND availability_status = 'available'
+                               AND (effective_from IS NULL OR effective_from <= $4::date)
+                               AND (effective_to IS NULL OR effective_to >= $4::date)
+                           ) AS available
+                    FROM menu_items
+                    WHERE source_id = $2
+                      AND canonical_id = ANY($3::text[])
+                      AND (
+                          $1::boolean = FALSE
+                          OR (
+                              available = TRUE
+                              AND availability_status = 'available'
+                              AND (effective_from IS NULL OR effective_from <= $4::date)
+                              AND (effective_to IS NULL OR effective_to >= $4::date)
+                          )
+                    )
+                    ORDER BY category, name
+                    """,
+                    available_only,
+                    canonical_source_id,
+                    canonical_item_ids,
+                    local_date,
+                )
+            if conn is None:
+                pool = await get_pool()
+                async with pool.acquire() as active_conn:
+                    rows = await fetch_rows(active_conn)
+            else:
+                rows = await fetch_rows(conn)
+        except Exception as exc:
+            raise RestaurantServiceError(
+                "Current menu information is temporarily unavailable. I can take a callback message, but I cannot confirm menu availability.",
+                code="knowledge_unavailable",
+                status=503,
+            ) from exc
+
+        def _menu_payload(row: Any) -> JsonDict:
+            metadata = _json_value(row["knowledge_metadata"] or {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            modifier_options = [
+                deepcopy(knowledge.modifier_options[option_id])
+                for option_id in metadata.get("modifier_options") or []
+                if option_id in knowledge.modifier_options
+            ]
+            effective_from = row["effective_from"]
+            effective_to = row["effective_to"]
+            effective_status = (
+                "future"
+                if effective_from and local_date < effective_from
+                else (
+                    "expired"
+                    if effective_to and local_date > effective_to
+                    else "current"
+                )
             )
+            service_status = knowledge.menu_service_status(
+                row["service_periods"] or [], moment
+            )
+            available = bool(row["available"]) and bool(service_status["available"])
+            return {
+                **metadata,
+                "id": row["id"],
+                "item_id": row["canonical_id"] or "",
+                "name": row["name"],
+                "aliases": list(row["aliases"] or []),
+                "category": row["category"],
+                "category_id": f"category.{row['category']}",
+                "price": float(row["price"]),
+                "price_estimated": bool(row["price_estimated"]),
+                "description": row["description"] or "",
+                "dietary": list(row["dietary"] or []),
+                "dietary_tags": list(row["dietary"] or []),
+                "ingredients": list(row["ingredients"] or []),
+                "allergens": list(row["allergens"] or []),
+                "modifier_options": modifier_options,
+                "service_periods": list(row["service_periods"] or []),
+                "availability": row["availability_status"],
+                "available": available,
+                "effective_status": effective_status,
+                "service_status": service_status["status"],
+                "service_message": service_status["customer_message"],
+                "source_id": row["source_id"] or "",
+                "data_version": row["data_version"] or "",
+                "effective_from": str(effective_from or ""),
+                "effective_to": str(effective_to or ""),
+            }
+        canonical_rows = [
+            row
+            for row in rows
+            if row["source_id"] == canonical_source_id
+            and row["canonical_id"] in canonical_item_ids
+        ]
+        items = [_menu_payload(row) for row in canonical_rows]
+        if available_only:
+            items = [item for item in items if item["available"]]
         return {
-            "items": [
-                {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "category": row["category"],
-                    "price": float(row["price"]),
-                    "price_estimated": bool(row["price_estimated"]),
-                    "description": row["description"] or "",
-                    "dietary": list(row["dietary"] or []),
-                    "available": row["available"],
-                }
-                for row in rows
-            ],
+            "restaurant_name": knowledge.identity["name"],
+            "status": "current",
+            "items": items,
             "allergen_notice": (
-                "Menu descriptions cannot guarantee an allergen-free preparation or prevent "
-                "cross-contact. Transfer severe allergy questions to restaurant staff."
+                "Harbor & Hearth uses shared equipment and preparation areas. No item is "
+                "guaranteed allergen-free or free from cross-contact. For a severe allergy, "
+                "offer the configured kitchen/staff route or an honest callback message."
             ),
         }
 
-    async def find_menu_item(self, item_name: str) -> JsonDict:
-        requested = _normalized_text(item_name)
-        if not requested:
+    async def find_menu_item(
+        self,
+        item_name: str,
+        *,
+        at: datetime | None = None,
+        conn: Any | None = None,
+    ) -> JsonDict:
+        if not str(item_name or "").strip():
             raise RestaurantServiceError("An item_name is required.")
-        menu = await self.list_menu(available_only=False)
+        moment = at or _restaurant_now()
+        knowledge = get_restaurant_knowledge()
+        canonical_match = knowledge.find_menu_item(item_name, on_date=moment.date())
+        menu = await self.list_menu(available_only=False, at=moment, conn=conn)
         items: list[JsonDict] = menu["items"]
-        exact = [item for item in items if _normalized_text(item["name"]) == requested]
-        if len(exact) == 1:
-            return {"match": exact[0], "needs_confirmation": False, "candidates": []}
-
-        contained = [
-            item
-            for item in items
-            if requested in _normalized_text(item["name"])
-            or _normalized_text(item["name"]) in requested
-        ]
-        if len(contained) == 1:
-            return {
-                "match": None,
-                "needs_confirmation": True,
-                "candidates": contained,
-            }
-
-        ranked = sorted(
-            (
-                (
-                    SequenceMatcher(None, requested, _normalized_text(item["name"])).ratio(),
-                    item,
-                )
-                for item in items
-            ),
-            key=lambda pair: pair[0],
-            reverse=True,
+        items_by_id = {item["item_id"]: item for item in items}
+        matched = (
+            items_by_id.get(canonical_match.item["item_id"])
+            if canonical_match.item is not None
+            else None
         )
-        candidates = [item for score, item in ranked[:3] if score >= 0.45]
+        candidates = [
+            items_by_id[candidate["item_id"]]
+            for candidate in canonical_match.candidates
+            if candidate["item_id"] in items_by_id
+        ]
         return {
-            "match": None,
-            "needs_confirmation": bool(candidates),
+            "match": matched,
+            "status": canonical_match.status,
+            "needs_confirmation": canonical_match.status == "ambiguous",
             "candidates": candidates,
         }
 
@@ -1683,6 +2092,11 @@ class RestaurantService:
         item_name: str,
         quantity: int = 1,
         notes: str = "",
+        modifier_ids: tuple[str, ...] | list[str] = (),
+        removals: tuple[str, ...] | list[str] = (),
+        substitutions: tuple[str, ...] | list[str] = (),
+        order_notes: str = "",
+        allergy_notes: str = "",
         booking_id: int = 0,
         customer_name: str = "",
         customer_phone: str = "",
@@ -1693,29 +2107,21 @@ class RestaurantService:
             raise RestaurantServiceError(
                 "Quantity must be between 1 and 20.", code="invalid_quantity"
             )
-        match = await self.find_menu_item(item_name)
-        if not match["match"]:
-            return {
-                "added": False,
-                "needs_confirmation": match["needs_confirmation"],
-                "candidates": match["candidates"],
-            }
-        menu_item = match["match"]
-        if not menu_item["available"]:
-            return {
-                "added": False,
-                "unavailable": True,
-                "item": menu_item,
-                "candidates": [],
-            }
         name = self._validate_name(customer_name) if customer_name else ""
         phone = self._validate_phone(customer_phone) if customer_phone else ""
         notes = notes.strip()[:300]
+        order_notes = order_notes.strip()[:500]
+        allergy_notes = allergy_notes.strip()[:500]
         payload = {
             "call_id": call_id,
-            "menu_item_id": menu_item["id"],
+            "item_name": item_name,
             "quantity": quantity,
             "notes": notes,
+            "modifier_ids": list(modifier_ids),
+            "removals": list(removals),
+            "substitutions": list(substitutions),
+            "order_notes": order_notes,
+            "allergy_notes": allergy_notes,
             "booking_id": booking_id,
             "customer_name": name,
             "customer_phone": phone,
@@ -1723,9 +2129,99 @@ class RestaurantService:
         }
 
         async def operation(conn: Any) -> JsonDict:
-            resolved_booking = booking_id or await self._booking_id_from_session(
-                conn, call_id
+            existing_order = await conn.fetchrow(
+                """
+                SELECT booking_id, fulfillment_type, fulfillment_details
+                FROM orders
+                WHERE session_id = $1 AND status IN ('pending', 'confirmed')
+                ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, id DESC
+                LIMIT 1
+                """,
+                call_id,
             )
+            if existing_order:
+                stored_booking = int(existing_order["booking_id"] or 0)
+                fulfillment = str(
+                    existing_order["fulfillment_type"]
+                    or ("dine_in" if stored_booking else "pickup")
+                )
+                resolved_booking = 0
+                if fulfillment == "dine_in":
+                    resolved_booking = (
+                        stored_booking
+                        or booking_id
+                        or await self._booking_id_from_session(conn, call_id)
+                    )
+                fulfillment_details = dict(
+                    _json_value(existing_order["fulfillment_details"] or {})
+                )
+            else:
+                resolved_booking = booking_id or await self._booking_id_from_session(
+                    conn, call_id
+                )
+                fulfillment = "dine_in" if resolved_booking else "pickup"
+                fulfillment_details = {}
+            operation_now = _restaurant_now()
+            service_at = operation_now
+            if resolved_booking:
+                booked_at = await conn.fetchval(
+                    "SELECT booked_at FROM bookings WHERE id = $1 AND status = 'confirmed'",
+                    resolved_booking,
+                )
+                if booked_at is not None:
+                    service_at = booked_at
+            else:
+                service_at = _future_fulfillment_at(
+                    fulfillment, fulfillment_details, now=operation_now
+                )
+                fulfillment_details["fulfillment_at"] = service_at.isoformat()
+            match = await self.find_menu_item(item_name, at=service_at, conn=conn)
+            if not match["match"]:
+                return {
+                    "added": False,
+                    "status": match.get("status", "unknown"),
+                    "needs_confirmation": match["needs_confirmation"],
+                    "candidates": match["candidates"],
+                }
+            menu_item = match["match"]
+            if not menu_item["available"]:
+                alternatives = {
+                    item.get("item_id"): item
+                    for item in (await self.list_menu(at=service_at, conn=conn))["items"]
+                }
+                return {
+                    "added": False,
+                    "unavailable": True,
+                    "item": menu_item,
+                    "candidates": [
+                        alternatives[item_id]
+                        for item_id in menu_item.get("alternative_item_ids") or []
+                        if item_id in alternatives
+                    ],
+                }
+            if menu_item.get("item_id", "").startswith(
+                "menu.alcohol."
+            ) or "alcohol" in (menu_item.get("dietary_tags") or []):
+                raise RestaurantServiceError(
+                    "Alcohol is available as read-only synthetic menu information and cannot be added to an order.",
+                    code="alcohol_transaction_unsupported",
+                    status=409,
+                )
+            customization = get_restaurant_knowledge().resolve_customization(
+                menu_item,
+                modifier_ids=modifier_ids,
+                removals=removals,
+                substitutions=substitutions,
+            )
+            if customization["status"] != "valid":
+                return {
+                    "added": False,
+                    "needs_confirmation": customization["status"] == "clarification_required",
+                    "customization_status": customization["status"],
+                    "message": customization["message"],
+                    "choices": customization.get("choices", []),
+                    "candidates": [],
+                }
             order = await self._lock_order_for_mutation(
                 conn,
                 call_id=call_id,
@@ -1736,6 +2232,12 @@ class RestaurantService:
                 customer_phone=phone,
             )
             order_id = order["id"]
+            if not resolved_booking:
+                await conn.execute(
+                    "UPDATE orders SET fulfillment_details = $1::jsonb WHERE id = $2",
+                    json.dumps(fulfillment_details, sort_keys=True),
+                    order_id,
+                )
             if order.get("existing"):
                 await conn.execute(
                     """
@@ -1743,12 +2245,28 @@ class RestaurantService:
                     SET booking_id = COALESCE(booking_id, $1),
                         customer_name = CASE WHEN customer_name = '' THEN $2 ELSE customer_name END,
                         customer_phone = CASE WHEN customer_phone = '' THEN $3 ELSE customer_phone END,
+                        notes = CASE WHEN $4 = '' THEN notes ELSE $4 END,
+                        allergy_notes = CASE WHEN $5 = '' THEN allergy_notes ELSE $5 END,
                         draft_version = draft_version + 1
-                    WHERE id = $4
+                    WHERE id = $6
                     """,
                     resolved_booking or None,
                     name,
                     phone,
+                    order_notes,
+                    allergy_notes,
+                    order_id,
+                )
+            elif order_notes or allergy_notes:
+                await conn.execute(
+                    """
+                    UPDATE orders
+                    SET notes = $1, allergy_notes = $2,
+                        draft_version = draft_version + 1
+                    WHERE id = $3
+                    """,
+                    order_notes,
+                    allergy_notes,
                     order_id,
                 )
             approval_required = await self._paid_item_approval_required(
@@ -1756,7 +2274,7 @@ class RestaurantService:
                 call_id,
                 resolved_booking or int(order.get("booking_id") or 0),
             )
-            unit_price = float(menu_item["price"])
+            unit_price = float(menu_item["price"]) + float(customization["price_delta"])
             propose = (
                 approval_required
                 and unit_price > 0
@@ -1777,11 +2295,17 @@ class RestaurantService:
                     await conn.execute(
                         """
                         UPDATE order_items
-                        SET proposed = FALSE, quantity = $1, notes = $2
-                        WHERE id = $3
+                        SET proposed = FALSE, quantity = $1, notes = $2,
+                            unit_price = $3, modifiers = $4::jsonb,
+                            removals = $5, substitutions = $6::jsonb
+                        WHERE id = $7
                         """,
                         quantity,
                         notes,
+                        unit_price,
+                        json.dumps(customization["modifiers"], sort_keys=True),
+                        customization["removals"],
+                        json.dumps(customization["substitutions"], sort_keys=True),
                         existing_proposed["id"],
                     )
                     summary = await self._order_summary_with_conn(conn, order_id)
@@ -1800,16 +2324,20 @@ class RestaurantService:
             item = await conn.fetchrow(
                 """
                 INSERT INTO order_items
-                    (order_id, menu_item_id, item_name, quantity, unit_price, notes, proposed)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (order_id, menu_item_id, item_name, quantity, unit_price, notes,
+                     modifiers, removals, substitutions, proposed)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb, $10)
                 RETURNING id
                 """,
                 order_id,
                 menu_item["id"],
                 menu_item["name"],
                 quantity,
-                menu_item["price"],
+                unit_price,
                 notes,
+                json.dumps(customization["modifiers"], sort_keys=True),
+                customization["removals"],
+                json.dumps(customization["substitutions"], sort_keys=True),
                 propose,
             )
             summary = await self._order_summary_with_conn(conn, order_id)
@@ -1843,6 +2371,31 @@ class RestaurantService:
         )
         return {**result, "idempotent_replay": replayed}
 
+    @staticmethod
+    def _ensure_order_mutation_allowed(
+        order: Mapping[str, Any],
+        *,
+        caller_confirmed: bool,
+    ) -> None:
+        fulfillment = order["fulfillment_type"] or (
+            "dine_in" if order["booking_id"] else "pickup"
+        )
+        if order["status"] == "confirmed" and fulfillment in {
+            "pickup",
+            "delivery",
+        }:
+            raise RestaurantServiceError(
+                "Confirmed pickup and delivery changes require staff to verify preparation status. Request staff help or take a callback message; the order was not changed.",
+                code="confirmed_fulfillment_change_requires_staff",
+                status=409,
+            )
+        if order["status"] == "confirmed" and caller_confirmed is not True:
+            raise RestaurantServiceError(
+                "The caller must explicitly confirm changing the existing order.",
+                code="confirmation_required",
+                status=409,
+            )
+
     async def _lock_order_for_mutation(
         self,
         conn: Any,
@@ -1860,7 +2413,8 @@ class RestaurantService:
             order = await conn.fetchrow(
                 """
                 SELECT o.id, o.booking_id, o.customer_name, o.customer_phone,
-                       o.draft_version, o.status, TRUE AS existing
+                       o.draft_version, o.status, o.fulfillment_type,
+                       TRUE AS existing
                 FROM order_items oi
                 JOIN orders o ON o.id = oi.order_id
                 WHERE oi.id = $1
@@ -1875,7 +2429,7 @@ class RestaurantService:
             order = await conn.fetchrow(
                 """
                 SELECT id, booking_id, customer_name, customer_phone,
-                       draft_version, status, TRUE AS existing
+                       draft_version, status, fulfillment_type, TRUE AS existing
                 FROM orders
                 WHERE session_id = $1
                   AND status IN ('pending', 'confirmed')
@@ -1889,7 +2443,7 @@ class RestaurantService:
             order = await conn.fetchrow(
                 """
                 SELECT id, booking_id, customer_name, customer_phone,
-                       draft_version, status, TRUE AS existing
+                       draft_version, status, fulfillment_type, TRUE AS existing
                 FROM orders
                 WHERE booking_id = $1
                   AND status IN ('pending', 'confirmed')
@@ -1900,7 +2454,7 @@ class RestaurantService:
                 booking_id,
             )
         if not order and create_if_missing:
-            fulfillment = "dine_in" if booking_id else "pickup"
+            fulfillment = "dine_in" if booking_id else None
             created = await conn.fetchrow(
                 """
                 INSERT INTO orders
@@ -1925,19 +2479,45 @@ class RestaurantService:
                 code="order_item_not_found" if order_item_id else "order_not_found",
                 status=404,
             )
-        if order["status"] == "confirmed" and caller_confirmed is not True:
-            raise RestaurantServiceError(
-                "The caller must explicitly confirm changing the existing order.",
-                code="confirmation_required",
-                status=409,
-            )
+        self._ensure_order_mutation_allowed(
+            order,
+            caller_confirmed=caller_confirmed,
+        )
         return dict(order)
+
+    async def _ensure_order_items_valid_at(
+        self,
+        conn: Any,
+        order_id: int,
+        service_at: datetime,
+        *,
+        context: str,
+    ) -> None:
+        items = await conn.fetch(
+            """
+            SELECT oi.item_name, mi.service_periods,
+                   mi.effective_from, mi.effective_to
+            FROM order_items oi
+            LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
+            WHERE oi.order_id = $1
+              AND COALESCE(oi.proposed, FALSE) IS FALSE
+            """,
+            order_id,
+        )
+        for item in items:
+            _ensure_order_item_available_at(
+                item,
+                service_at,
+                context=context,
+                require_current_inventory=False,
+            )
 
     async def _order_summary_with_conn(self, conn: Any, order_id: int) -> JsonDict:
         order = await conn.fetchrow(
             """
             SELECT id, session_id, booking_id, customer_name, customer_phone,
-                   status, total_amount, draft_version, created_at, fulfillment_type
+                   status, total_amount, draft_version, created_at, fulfillment_type,
+                   fulfillment_details, notes, allergy_notes
             FROM orders WHERE id = $1
             """,
             order_id,
@@ -1946,32 +2526,61 @@ class RestaurantService:
             raise RestaurantServiceError("Order not found.", code="order_not_found", status=404)
         items = await conn.fetch(
             """
-            SELECT id, item_name, quantity, unit_price, subtotal, notes,
-                   COALESCE(proposed, FALSE) AS proposed
-            FROM order_items WHERE order_id = $1 ORDER BY id
+            SELECT oi.id, oi.item_name, oi.quantity, oi.unit_price, oi.subtotal,
+                   oi.notes, oi.modifiers, oi.removals, oi.substitutions,
+                   mi.canonical_id, mi.dietary, mi.service_periods,
+                   mi.available AS inventory_available, mi.availability_status,
+                   mi.effective_from, mi.effective_to,
+                   COALESCE(oi.proposed, FALSE) AS proposed
+            FROM order_items oi
+            LEFT JOIN menu_items mi ON mi.id = oi.menu_item_id
+            WHERE oi.order_id = $1 ORDER BY oi.id
             """,
             order_id,
         )
         committed = [item for item in items if not item["proposed"]]
         proposed = [item for item in items if item["proposed"]]
-        calculated_total = sum(float(item["subtotal"]) for item in committed)
+        item_total = sum(float(item["subtotal"]) for item in committed)
 
         def _item_payload(item: Any) -> JsonDict:
             return {
                 "order_item_id": item["id"],
                 "item_name": item["item_name"],
+                "item_id": item["canonical_id"] or "",
                 "quantity": item["quantity"],
                 "unit_price": float(item["unit_price"]),
                 "subtotal": float(item["subtotal"]),
                 "notes": item["notes"] or "",
+                "modifiers": _json_value(item["modifiers"] or []),
+                "removals": list(item["removals"] or []),
+                "substitutions": _json_value(item["substitutions"] or []),
+                "dietary_tags": list(item["dietary"] or []),
+                "service_periods": list(item["service_periods"] or []),
+                "inventory_available": bool(item["inventory_available"]),
+                "availability_status": item["availability_status"] or "unavailable",
+                "effective_from": str(item["effective_from"] or ""),
+                "effective_to": str(item["effective_to"] or ""),
                 "proposed": bool(item["proposed"]),
             }
 
         stored = order["fulfillment_type"]
-        if stored in {"dine_in", "pickup"}:
+        if stored in {"dine_in", "pickup", "delivery"}:
             fulfillment = stored
         else:
             fulfillment = "dine_in" if order["booking_id"] else "pickup"
+        fulfillment_details = dict(_json_value(order["fulfillment_details"] or {}))
+        delivery_fee = 0.0
+        if fulfillment == "delivery":
+            stored_fee = fulfillment_details.get("delivery_fee")
+            if stored_fee is not None:
+                delivery_fee = float(stored_fee)
+            elif order["status"] == "confirmed":
+                delivery_fee = max(
+                    0.0, round(float(order["total_amount"] or 0) - item_total, 2)
+                )
+            else:
+                delivery_fee = float(_delivery_rule().get("delivery_fee") or 0)
+        calculated_total = round(item_total + delivery_fee, 2)
         return {
             "order_id": order["id"],
             "call_id": order["session_id"],
@@ -1979,11 +2588,16 @@ class RestaurantService:
             "customer_name": order["customer_name"] or "",
             "status": order["status"],
             "draft_version": order["draft_version"],
+            "item_total": item_total,
+            "fees": ([{"fee_id": "fee.delivery", "name": "delivery fee", "amount": delivery_fee}] if delivery_fee else []),
             "total": calculated_total,
             "items": [_item_payload(item) for item in committed],
             "proposed_items": [_item_payload(item) for item in proposed],
             "fulfillment": fulfillment,
             "fulfillment_type": fulfillment,
+            "fulfillment_details": fulfillment_details,
+            "order_notes": order["notes"] or "",
+            "allergy_notes": order["allergy_notes"] or "",
         }
 
     async def get_order_summary(self, *, call_id: str) -> JsonDict:
@@ -2007,6 +2621,12 @@ class RestaurantService:
                 )
             result = await self._order_summary_with_conn(conn, order["id"])
             if result.get("status") == "pending" and result.get("items"):
+                if result.get("fulfillment") in {"pickup", "delivery"}:
+                    _future_fulfillment_at(
+                        str(result["fulfillment"]),
+                        result.get("fulfillment_details") or {},
+                        now=_restaurant_now(),
+                    )
                 digest = register_pending_confirmation(
                     call_id,
                     ACTION_CONFIRM_ORDER,
@@ -2028,13 +2648,15 @@ class RestaurantService:
         idempotency_key: str,
         fulfillment_type: str,
         booking_id: int | None = None,
+        delivery_address: str = "",
+        delivery_instructions: str = "",
     ) -> JsonDict:
         """Replace fulfillment on the existing pending order; never creates a second order."""
         call_id = self._require_call_id(call_id)
         fulfillment = str(fulfillment_type or "").strip().casefold()
-        if fulfillment not in {"dine_in", "pickup"}:
+        if fulfillment not in {"dine_in", "pickup", "delivery"}:
             raise RestaurantServiceError(
-                "fulfillment_type must be dine_in or pickup.",
+                "fulfillment_type must be dine_in, pickup, or delivery.",
                 code="invalid_fulfillment",
                 status=400,
             )
@@ -2059,12 +2681,48 @@ class RestaurantService:
                     code="booking_required",
                     status=409,
                 )
-        if fulfillment == "pickup":
+        if fulfillment in {"pickup", "delivery"}:
             resolved_booking = None
+        fulfillment_details_base: JsonDict = {}
+        address = ""
+        instructions = ""
+        if fulfillment == "delivery":
+            address = " ".join(delivery_address.split())[:300]
+            instructions = " ".join(delivery_instructions.split())[:300]
+            delivery_rule = _delivery_rule()
+            postal_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", address)
+            if not address or not postal_match:
+                raise RestaurantServiceError(
+                    "A complete delivery address with a five-digit postal code is required.",
+                    code="delivery_postal_code_required",
+                    status=409,
+                )
+            postal_code = postal_match.group(1)
+            eligible_postal_codes = {
+                str(value) for value in delivery_rule.get("eligible_postal_codes") or []
+            }
+            if postal_code not in eligible_postal_codes:
+                raise RestaurantServiceError(
+                    "That postal code is outside the configured synthetic local delivery zone. The order was not changed.",
+                    code="delivery_outside_zone",
+                    status=409,
+                )
+            fulfillment_details_base = {
+                "address": address,
+                "instructions": instructions,
+                "zone_id": str(delivery_rule.get("delivery_zone_id") or ""),
+                "postal_code": postal_code,
+                "zone_status": "eligible",
+                "provider": "synthetic_local",
+                "live_integration": False,
+                "delivery_fee": float(delivery_rule.get("delivery_fee") or 0),
+            }
         payload = {
             "call_id": call_id,
             "fulfillment_type": fulfillment,
             "booking_id": resolved_booking or 0,
+            "delivery_address": address,
+            "delivery_instructions": instructions,
         }
 
         async def operation(conn: Any) -> JsonDict:
@@ -2090,10 +2748,11 @@ class RestaurantService:
                     code="order_already_confirmed",
                     status=409,
                 )
+            service_at: datetime
             if fulfillment == "dine_in" and resolved_booking:
                 booking = await conn.fetchrow(
                     """
-                    SELECT id FROM bookings
+                    SELECT id, booked_at FROM bookings
                     WHERE id = $1 AND status = 'confirmed'
                     """,
                     resolved_booking,
@@ -2104,16 +2763,33 @@ class RestaurantService:
                         code="booking_not_found",
                         status=404,
                     )
+                service_at = booking["booked_at"]
+            fulfillment_details = dict(fulfillment_details_base)
+            if fulfillment in {"pickup", "delivery"}:
+                service_at = _fulfillment_at(
+                    fulfillment,
+                    {},
+                    now=_restaurant_now(),
+                )
+                fulfillment_details["fulfillment_at"] = service_at.isoformat()
+            await self._ensure_order_items_valid_at(
+                conn,
+                int(order["id"]),
+                service_at,
+                context="that fulfillment time",
+            )
             await conn.execute(
                 """
                 UPDATE orders
                 SET fulfillment_type = $1,
                     booking_id = $2,
+                    fulfillment_details = $3::jsonb,
                     draft_version = draft_version + 1
-                WHERE id = $3
+                WHERE id = $4
                 """,
                 fulfillment,
                 resolved_booking,
+                json.dumps(fulfillment_details, sort_keys=True),
                 order["id"],
             )
             summary = await self._order_summary_with_conn(conn, order["id"])
@@ -2128,6 +2804,53 @@ class RestaurantService:
         )
         return {**result, "idempotent_replay": replayed}
 
+    async def set_order_notes(
+        self,
+        *,
+        call_id: str,
+        idempotency_key: str,
+        order_notes: str | None = None,
+        allergy_notes: str | None = None,
+        caller_confirmed: bool = False,
+    ) -> JsonDict:
+        """Replace explicit order-level notes and advance confirmation integrity."""
+        call_id = self._require_call_id(call_id)
+        if order_notes is None and allergy_notes is None:
+            raise RestaurantServiceError(
+                "Provide order_notes or allergy_notes.", code="missing_order_notes"
+            )
+        cleaned_order_notes = None if order_notes is None else order_notes.strip()[:500]
+        cleaned_allergy_notes = None if allergy_notes is None else allergy_notes.strip()[:500]
+        payload = {
+            "call_id": call_id,
+            "order_notes": cleaned_order_notes,
+            "allergy_notes": cleaned_allergy_notes,
+            "caller_confirmed": bool(caller_confirmed),
+        }
+
+        async def operation(conn: Any) -> JsonDict:
+            order = await self._lock_order_for_mutation(
+                conn,
+                call_id=call_id,
+                caller_confirmed=caller_confirmed,
+            )
+            await self._update_order_notes_with_conn(
+                conn,
+                order_notes=cleaned_order_notes,
+                allergy_notes=cleaned_allergy_notes,
+                order_id=order["id"],
+            )
+            return {"updated": True, **await self._order_summary_with_conn(conn, order["id"])}
+
+        result, replayed = await self._idempotent_write(
+            action="set_order_notes",
+            idempotency_key=idempotency_key,
+            call_id=call_id,
+            payload=payload,
+            operation=operation,
+        )
+        return {**result, "idempotent_replay": replayed}
+
     async def update_order_item(
         self,
         *,
@@ -2135,18 +2858,18 @@ class RestaurantService:
         idempotency_key: str,
         order_item_id: int,
         quantity: int,
-        notes: str = "",
+        notes: str | None = None,
         caller_confirmed: bool = False,
     ) -> JsonDict:
         call_id = self._require_call_id(call_id)
         if not 1 <= quantity <= 20:
             raise RestaurantServiceError("Quantity must be between 1 and 20.")
-        notes = notes.strip()[:300]
+        cleaned_notes = None if notes is None else notes.strip()[:300]
         payload = {
             "call_id": call_id,
             "order_item_id": order_item_id,
             "quantity": quantity,
-            "notes": notes,
+            "notes": cleaned_notes,
             "caller_confirmed": bool(caller_confirmed),
         }
 
@@ -2158,9 +2881,14 @@ class RestaurantService:
                 order_item_id=order_item_id,
             )
             await conn.execute(
-                "UPDATE order_items SET quantity = $1, notes = $2 WHERE id = $3",
+                """
+                UPDATE order_items
+                SET quantity = $1,
+                    notes = CASE WHEN $2::text IS NULL THEN notes ELSE $2 END
+                WHERE id = $3
+                """,
                 quantity,
-                notes,
+                cleaned_notes,
                 order_item_id,
             )
             await conn.execute(
@@ -2274,18 +3002,80 @@ class RestaurantService:
                     status=409,
                 )
             summary = await self._order_summary_with_conn(conn, order["id"])
-            if summary.get("fulfillment") == "pickup" and (
+            if summary.get("fulfillment") in {"pickup", "delivery"} and (
                 not (order["customer_name"] or "").strip()
                 or not (order["customer_phone"] or "").strip()
             ):
                 raise RestaurantServiceError(
-                    "Pickup orders require a verified name and callback phone before confirmation.",
-                    code="pickup_contact_required",
+                    "Pickup and delivery orders require a verified name and callback phone before confirmation.",
+                    code="fulfillment_contact_required",
                     status=409,
                 )
+            if summary.get("fulfillment") == "delivery":
+                fulfillment_details = summary.get("fulfillment_details", {})
+                address = str(fulfillment_details.get("address") or "").strip()
+                if not address or fulfillment_details.get("zone_status") != "eligible":
+                    raise RestaurantServiceError(
+                        "A delivery address in the configured synthetic local zone is required before confirmation.",
+                        code="delivery_zone_required",
+                        status=409,
+                    )
+                delivery_minimum = float(_delivery_rule().get("delivery_minimum") or 0)
+                if float(summary.get("item_total") or 0) < delivery_minimum:
+                    raise RestaurantServiceError(
+                        f"Delivery requires a ${delivery_minimum:.2f} food-and-beverage minimum before the delivery fee.",
+                        code="delivery_minimum_not_met",
+                        status=409,
+                    )
+            operation_now = _restaurant_now()
+            service_at = operation_now
+            if summary.get("fulfillment") in {"pickup", "delivery"}:
+                service_at = _future_fulfillment_at(
+                    str(summary["fulfillment"]),
+                    summary.get("fulfillment_details") or {},
+                    now=operation_now,
+                )
+                fulfillment_status = get_restaurant_knowledge().schedule_status(
+                    str(summary["fulfillment"]),
+                    service_at,
+                    apply_cutoff=True,
+                )
+                if not fulfillment_status["available"]:
+                    raise RestaurantServiceError(
+                        fulfillment_status["customer_message"],
+                        code="fulfillment_unavailable",
+                        status=409,
+                    )
             if not summary["items"]:
                 raise RestaurantServiceError(
                     "The draft order is empty.", code="empty_order", status=409
+                )
+            if summary["fulfillment"] == "dine_in":
+                service_at = await conn.fetchval(
+                    "SELECT booked_at FROM bookings WHERE id = $1 AND status = 'confirmed'",
+                    order["booking_id"],
+                )
+                if service_at is None:
+                    raise RestaurantServiceError(
+                        "A confirmed reservation is required for a dine-in pre-order.",
+                        code="booking_required",
+                        status=409,
+                    )
+            for item in summary["items"]:
+                _ensure_order_item_available_at(
+                    item,
+                    service_at,
+                    context="that fulfillment time",
+                )
+            if any(
+                item.get("item_id", "").startswith("menu.alcohol.")
+                or "alcohol" in (item.get("dietary_tags") or [])
+                for item in summary["items"]
+            ):
+                raise RestaurantServiceError(
+                    "Alcohol is read-only synthetic menu information and cannot be confirmed as an order transaction.",
+                    code="alcohol_transaction_unsupported",
+                    status=409,
                 )
             require_pending_confirmation(
                 call_id,
@@ -2303,6 +3093,12 @@ class RestaurantService:
             )
             clear_pending_confirmation(call_id, ACTION_CONFIRM_ORDER)
             await self._merge_session_state(conn, call_id, pending_state_patch(call_id))
+            remaining_minutes = 0
+            if summary["fulfillment"] != "dine_in":
+                remaining_minutes = max(
+                    1,
+                    int((service_at - operation_now).total_seconds() + 59) // 60,
+                )
             return {
                 **summary,
                 "confirmed": True,
@@ -2310,8 +3106,13 @@ class RestaurantService:
                 "timing": (
                     "served at the reserved table on arrival"
                     if summary["fulfillment"] == "dine_in"
-                    else "ready for pickup in about 30 minutes"
+                    else (
+                        f"estimated for local synthetic delivery in about {remaining_minutes} minutes; no live courier is connected"
+                        if summary["fulfillment"] == "delivery"
+                        else f"ready for pickup in about {remaining_minutes} minutes"
+                    )
                 ),
+                "alcohol_verification": "",
             }
 
         result, replayed = await self._idempotent_write(
@@ -2396,51 +3197,95 @@ class RestaurantService:
         }
 
     async def restaurant_info(self, topic: str = "") -> JsonDict:
-        """Search markdown, operator FAQ, then structured settings. No embeddings."""
-        data = self._load_public_settings()
+        """Return one effective canonical topic with explicit unknown states."""
         query = (topic or "").strip()
-        normalized = _normalized_text(query)
-        hour_tokens = {
-            "hour",
-            "hours",
-            "open",
-            "opens",
-            "opened",
-            "opening",
-            "close",
-            "closes",
-            "closed",
-            "closing",
-            "schedule",
-        }
-        if query and hour_tokens & set(normalized.split()):
-            return self._hours_info(data)
-
-        capacity_tokens = {"capacity", "capacities", "seats", "largest"}
-        if query and capacity_tokens & set(normalized.split()):
-            limits = await self.seating_limits()
-            by_loc = limits.get("max_seats_by_location") or {}
-            parts = [
-                f"Phone bookings are for 1 to {limits.get('max_party_phone', 12)} guests."
-            ]
-            if by_loc:
-                loc_text = ", ".join(
-                    f"{name} up to {seats}" for name, seats in sorted(by_loc.items())
-                )
-                parts.append(f"Largest tables by room: {loc_text}.")
-            parts.append(
-                f"Largest table overall seats {limits.get('largest_table') or 0}."
-            )
+        try:
+            knowledge = get_restaurant_knowledge()
+        except KnowledgeFixtureError as exc:
+            raise RestaurantServiceError(
+                "Current restaurant information is temporarily unavailable. I can take a callback message, but I cannot confirm that policy.",
+                code="knowledge_unavailable",
+                status=503,
+            ) from exc
+        identity = knowledge.identity
+        metadata = knowledge.metadata
+        if not query:
             return {
-                "matched": True,
+                "matched": False,
+                "status": "missing",
                 "answers": [],
-                "formatted": " ".join(parts),
+                "formatted": "A restaurant information topic is required.",
                 "log_unknown": False,
-                "restaurant_name": data.get("restaurant_name") or "",
-                **limits,
+                **metadata,
             }
 
+        topic_match = knowledge.find_topic(query)
+        if topic_match.status == "known":
+            record = topic_match.records[0]
+            result: JsonDict = {
+                "matched": True,
+                "status": "known",
+                "answers": [
+                    {
+                        "kind": "canonical_topic",
+                        "heading": record["topic_id"],
+                        "content": record["answer"],
+                        "source": record["source_id"],
+                    }
+                ],
+                "formatted": record["answer"],
+                "log_unknown": False,
+                "restaurant_name": identity["name"],
+                "topic_id": record["topic_id"],
+                "category_id": record["category_id"],
+                "source_id": record["source_id"],
+                "schema_version": record["schema_version"],
+                "data_version": record["data_version"],
+                "effective_from": record["effective_from"],
+                "effective_to": record.get("effective_to"),
+                "rule": deepcopy(record.get("rule") or {}),
+                "escalation_owner": record.get("escalation_owner") or "",
+            }
+            if record["topic_id"] == "topic.hours":
+                result["hours"] = deepcopy(knowledge.raw["hours"])
+                resolved_hours = knowledge.resolve_hours_query(query)
+                if resolved_hours:
+                    result["formatted"] = resolved_hours["customer_message"]
+                    result["hours_resolution"] = resolved_hours
+                    if resolved_hours["status"] == "unavailable":
+                        result.update(
+                            {
+                                "matched": False,
+                                "status": "unavailable",
+                                "answers": [],
+                            }
+                        )
+                    else:
+                        result["answers"][0]["content"] = resolved_hours[
+                            "customer_message"
+                        ]
+            return result
+
+        if topic_match.status in {"ambiguous", "expired", "future"}:
+            return {
+                "matched": False,
+                "status": "stale" if topic_match.status in {"expired", "future"} else "ambiguous",
+                "answers": [],
+                "formatted": (
+                    "That restaurant information is not currently effective. I won't substitute an older or future policy."
+                    if topic_match.status in {"expired", "future"}
+                    else "That question could refer to more than one restaurant topic. Please clarify which one you mean."
+                ),
+                "log_unknown": topic_match.status in {"expired", "future"},
+                "restaurant_name": identity["name"],
+                "candidate_topic_ids": [record["topic_id"] for record in topic_match.records],
+                **metadata,
+            }
+
+        # Operator-resolved local FAQs remain an explicit secondary source. They
+        # cannot override a canonical topic and carry their own source marker.
         faq_rows: list[JsonDict] = []
+        faq_unavailable = False
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
@@ -2448,20 +3293,21 @@ class RestaurantService:
                     """
                     SELECT question, answer
                     FROM operator_knowledge
-                    WHERE active = TRUE
+                    WHERE active = TRUE AND restaurant_id = $1
                     ORDER BY updated_at DESC, id DESC
-                    """
+                    """,
+                    identity["restaurant_id"],
                 )
             faq_rows = [dict(row) for row in rows]
         except Exception:
-            faq_rows = []
+            faq_unavailable = True
 
-        hits = search_faq_rows(query, faq_rows) + search_static_knowledge(query)
-        hits.sort(key=lambda item: (-int(item.get("score") or 0), item.get("heading") or ""))
-        hits = hits[:4]
+        hits = search_faq_rows(query, faq_rows, limit=1)
         if hits:
+            hit = hits[0]
             return {
                 "matched": True,
+                "status": "known",
                 "answers": [
                     {
                         "kind": hit.get("kind"),
@@ -2469,39 +3315,30 @@ class RestaurantService:
                         "content": hit.get("content") or "",
                         "source": hit.get("source") or "",
                     }
-                    for hit in hits
                 ],
                 "formatted": format_knowledge_hits(hits),
-                "restaurant_name": data.get("restaurant_name") or "",
-            }
-
-        normalized = _normalized_text(query)
-        settings_hit: JsonDict = {}
-        if not query:
-            settings_hit = dict(data)
-        elif hour_tokens & set(normalized.split()):
-            return self._hours_info(data)
-        elif any(word in normalized for word in ("where", "address", "location", "phone")):
-            settings_hit = {
-                "restaurant_name": data["restaurant_name"],
-                "street_address": data["street_address"],
-                "city": data["city"],
-                "phone_number": data["phone_number"],
-            }
-        if settings_hit:
-            return {
-                "matched": True,
-                "answers": [],
-                "formatted": "",
                 "log_unknown": False,
-                **settings_hit,
+                "restaurant_name": identity["name"],
+                "source_id": "operator_knowledge",
             }
+        transfer_available = bool(current_staff_transfer_number())
         return {
             "matched": False,
+            "status": "unknown",
             "answers": [],
-            "formatted": "",
+            "formatted": (
+                "That answer is not in the current Harbor & Hearth information. "
+                + (
+                    "A configured staff transfer can be requested, or I can take a callback message."
+                    if transfer_available
+                    else "I cannot transfer right now, but I can take a callback message."
+                )
+            ),
             "log_unknown": True,
-            "restaurant_name": data.get("restaurant_name") or "",
+            "restaurant_name": identity["name"],
+            "transfer_available": transfer_available,
+            "operator_source_status": "unavailable" if faq_unavailable else "available",
+            **metadata,
         }
 
     async def log_unknown_question(
@@ -2522,20 +3359,23 @@ class RestaurantService:
         normalized = normalize_question(question)
         excerpt = " ".join(context_excerpt.split())[:500]
         reply = " ".join(agent_response.split())[:500]
+        restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO knowledge_gaps
-                    (session_id, question, question_normalized, context_excerpt, agent_response)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (session_id, question_normalized) DO UPDATE
+                    (restaurant_id, session_id, question, question_normalized,
+                     context_excerpt, agent_response)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (restaurant_id, session_id, question_normalized) DO UPDATE
                 SET context_excerpt = CASE
                         WHEN knowledge_gaps.context_excerpt = '' THEN EXCLUDED.context_excerpt
                         ELSE knowledge_gaps.context_excerpt
                     END
                 RETURNING id, status, created_at
                 """,
+                restaurant_id,
                 call_id,
                 question,
                 normalized,
@@ -2551,6 +3391,7 @@ class RestaurantService:
         }
 
     async def list_knowledge_gaps(self) -> JsonDict:
+        restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
         pool = await get_pool()
         async with pool.acquire() as conn:
             gaps = await conn.fetch(
@@ -2558,16 +3399,21 @@ class RestaurantService:
                 SELECT id, session_id, question, context_excerpt, agent_response,
                        status, resolved_answer, resolved_by, created_at, resolved_at
                 FROM knowledge_gaps
+                WHERE restaurant_id = $1
                 ORDER BY CASE status WHEN 'unresolved' THEN 0 ELSE 1 END,
                          created_at DESC
-                """
+                """,
+                restaurant_id,
             )
             faq = await conn.fetch(
                 """
-                SELECT id, question, answer, source_gap_id, active, created_at, updated_at
+                SELECT id, restaurant_id, question, answer, source_gap_id, active,
+                       created_at, updated_at
                 FROM operator_knowledge
+                WHERE restaurant_id = $1
                 ORDER BY active DESC, updated_at DESC, id DESC
-                """
+                """,
+                restaurant_id,
             )
         return {
             "gaps": [
@@ -2613,16 +3459,18 @@ class RestaurantService:
                 code="invalid_answer",
             )
         resolved_by = " ".join(resolved_by.split())[:80] or "admin"
+        restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 gap = await conn.fetchrow(
                     """
                     SELECT id, question FROM knowledge_gaps
-                    WHERE id = $1
+                    WHERE id = $1 AND restaurant_id = $2
                     FOR UPDATE
                     """,
                     gap_id,
+                    restaurant_id,
                 )
                 if not gap:
                     raise RestaurantServiceError(
@@ -2633,9 +3481,10 @@ class RestaurantService:
                 existing = await conn.fetchrow(
                     """
                     SELECT id FROM operator_knowledge
-                    WHERE LOWER(question) = LOWER($1)
+                    WHERE restaurant_id = $1 AND LOWER(question) = LOWER($2)
                     FOR UPDATE
                     """,
+                    restaurant_id,
                     gap["question"],
                 )
                 if existing:
@@ -2656,10 +3505,12 @@ class RestaurantService:
                 else:
                     faq = await conn.fetchrow(
                         """
-                        INSERT INTO operator_knowledge (question, answer, source_gap_id, active)
-                        VALUES ($1, $2, $3, TRUE)
+                        INSERT INTO operator_knowledge
+                            (restaurant_id, question, answer, source_gap_id, active)
+                        VALUES ($1, $2, $3, $4, TRUE)
                         RETURNING id, question, answer
                         """,
+                        restaurant_id,
                         gap["question"],
                         answer,
                         gap["id"],
@@ -2671,11 +3522,12 @@ class RestaurantService:
                         resolved_answer = $2,
                         resolved_by = $3,
                         resolved_at = NOW()
-                    WHERE id = $1
+                    WHERE id = $1 AND restaurant_id = $4
                     """,
                     gap["id"],
                     answer,
                     resolved_by,
+                    restaurant_id,
                 )
         return {
             "resolved": True,

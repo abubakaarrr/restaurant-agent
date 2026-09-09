@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -9,7 +10,16 @@ from fastapi import WebSocketDisconnect
 import app.retell_handler as handler
 from app.behavior import BehaviorState
 from app.call_flags import CallControl
+from app.call_memory import clear_call_memory
 from app.config import settings
+from app.pending_confirmation import (
+    ACTION_CANCEL_BOOKING,
+    cancel_booking_confirmation_payload,
+    clear_pending_confirmation,
+    get_pending_confirmation,
+    register_pending_confirmation,
+)
+from app.services.restaurant import restaurant_service
 
 
 class FakeWebSocket:
@@ -39,6 +49,10 @@ def isolated_behavior_store(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(handler, "load_behavior_state", fake_load)
     monkeypatch.setattr(handler, "save_behavior_state", fake_save)
+    monkeypatch.setattr(
+        "app.transfer_availability._now",
+        lambda timezone_info: datetime(2026, 9, 8, 12, tzinfo=timezone_info),
+    )
 
 
 @pytest.mark.asyncio
@@ -87,8 +101,11 @@ async def test_transfer_uses_only_server_configured_number(
     monkeypatch.setattr(
         handler,
         "consume_call_control",
-        lambda call_id: CallControl("transfer", "human_requested"),
+        lambda call_id: CallControl(
+            "transfer", "human_requested", "+14155550123"
+        ),
     )
+    monkeypatch.setattr(handler, "current_staff_transfer_number", lambda: "")
     monkeypatch.setattr(settings, "staff_transfer_number", "+14155550123")
     websocket = FakeWebSocket(
         [
@@ -113,6 +130,42 @@ async def test_transfer_uses_only_server_configured_number(
     assert completion["transfer_number"] == "+14155550123"
     assert completion["transfer_caller_id"] is True
     assert completion["no_interruption_allowed"] is True
+
+
+@pytest.mark.asyncio
+async def test_behavior_transfer_carries_the_resolved_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(handler, "_record_background", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "app.behavior.resolve_handoff_destination",
+        lambda reason: {
+            "owner": "staff",
+            "channel": "voice_transfer",
+            "transfer_number": "+15035550149",
+            "can_transfer": True,
+        },
+    )
+    monkeypatch.setattr(handler, "current_staff_transfer_number", lambda: "")
+    websocket = FakeWebSocket(
+        [
+            {
+                "interaction_type": "response_required",
+                "response_id": 81,
+                "transcript": [
+                    {"role": "user", "content": "Connect me to a person"}
+                ],
+            }
+        ]
+    )
+    await handler.handle_retell_connection(websocket, "call-resolved-transfer")
+    completion = [
+        json.loads(item)
+        for item in websocket.sent
+        if json.loads(item).get("content_complete")
+    ][-1]
+    assert completion["transfer_number"] == "+15035550149"
+    assert "connect you" in completion["content"].casefold()
 
 
 @pytest.mark.asyncio
@@ -144,6 +197,69 @@ async def test_unintelligible_audio_is_repaired_without_llm(
     payloads = [json.loads(item) for item in websocket.sent]
     assert called is False
     assert any("say it one more time" in item.get("content", "") for item in payloads)
+
+
+@pytest.mark.asyncio
+async def test_direct_reply_reverses_pending_cancellation_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_id = "call-direct-cancellation-reversal"
+    clear_call_memory(call_id)
+    register_pending_confirmation(
+        call_id,
+        ACTION_CANCEL_BOOKING,
+        cancel_booking_confirmation_payload(booking_id=41),
+    )
+    streamed = False
+
+    async def reverse_pending_cancellation(session_id: str):
+        clear_pending_confirmation(session_id, ACTION_CANCEL_BOOKING)
+        return {
+            "reversed": True,
+            "booking_id": 41,
+            "status": "confirmed",
+            "message": "The cancellation was stopped.",
+        }
+
+    async def forbidden_stream(*args, **kwargs):
+        nonlocal streamed
+        streamed = True
+        if False:
+            yield ""
+
+    monkeypatch.setattr(
+        restaurant_service,
+        "reverse_pending_cancellation",
+        reverse_pending_cancellation,
+    )
+    monkeypatch.setattr(handler, "stream_agent_tokens", forbidden_stream)
+    monkeypatch.setattr(handler, "_record_background", lambda *args, **kwargs: None)
+    websocket = FakeWebSocket(
+        [
+            {
+                "interaction_type": "response_required",
+                "response_id": 91,
+                "transcript": [
+                    {
+                        "role": "user",
+                        "content": "Don't cancel it; are you a real person?",
+                    }
+                ],
+            }
+        ]
+    )
+    try:
+        await handler.handle_retell_connection(websocket, call_id)
+        assert get_pending_confirmation(call_id, ACTION_CANCEL_BOOKING) is None
+        assert streamed is False
+        responses = [
+            json.loads(item)
+            for item in websocket.sent
+            if json.loads(item).get("response_type") == "response"
+        ]
+        assert "virtual host" in responses[-1]["content"].casefold()
+    finally:
+        clear_call_memory(call_id)
 
 
 @pytest.mark.asyncio

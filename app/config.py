@@ -35,9 +35,7 @@ class Settings(BaseSettings):
     langchain_api_key: str = ""
     langchain_project: str = "restaurant-agent-poc"
 
-    # Restaurant identity
-    restaurant_name: str = "The Lamplighter Public House"
-    restaurant_timezone: str = "America/Vancouver"
+    # Restaurant runtime settings
     restaurant_settings_file: str = "restaurant_settings.json"
 
     # Voice Cloning / TTS
@@ -82,7 +80,7 @@ class Settings(BaseSettings):
     recaptcha_site_key: str = ""
 
     # Agent behavior and data policy.
-    ai_agent_name: str = "Clough"
+    ai_agent_name: str = "Avery"
     supported_locales: str = "en-US"
     call_data_retention_days: int = 30
     call_recording_enabled: bool = False

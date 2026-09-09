@@ -4,27 +4,33 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import AsyncIterator
 
 from app.agent.graph import restaurant_agent
 from app.call_memory import (
     clear_call_memory,
-    hydrate_call_memory,
     reset_current_action_scope,
     reset_current_session_id,
     set_current_action_scope,
     set_current_session_id,
 )
-from app.pending_confirmation import begin_caller_turn
+from app.caller_turn import process_caller_turn
 from app.turn_evidence import audit_assistant_speech, begin_turn, end_turn
 from app.reply_guard import is_clerk_inventory, is_repeated_reply
 from app.restaurant_settings import load_restaurant_settings
 from app.config import settings
-from app.call_flags import clear_call_control
+from app.call_flags import clear_call_control, request_end_call
 
 logger = logging.getLogger(__name__)
 
 _sessions: dict[str, list[dict]] = {}
+
+_FAREWELL_RE = re.compile(
+    r"^\s*(?:(?:thanks?|thank\s+you)(?:\s+you)?[,\s]*)?"
+    r"(?:bye|goodbye|see\s+you)(?:\s+(?:now|then))?[\s.!?]*$",
+    re.IGNORECASE,
+)
 
 # Re-export so callers can do: from app.agent.runner import consume_end_call
 from app.call_flags import consume_end_call as consume_end_call  # noqa: E402
@@ -123,7 +129,7 @@ def _save_turn(session_id: str, history: list[dict], user_message: str, reply: s
 
 def opening_greeting() -> str:
     runtime = load_restaurant_settings()
-    restaurant = str(runtime.get("restaurant_name") or settings.restaurant_name)
+    restaurant = str(runtime["restaurant_name"])
     agent = str(runtime.get("ai_agent_name") or settings.ai_agent_name)
     return (
         f"Hi, you've reached {restaurant}. This is {agent}. "
@@ -143,11 +149,16 @@ def _action_scope(session_id: str, history_length: int, user_message: str) -> st
     return f"{session_id}:{history_length}:{digest}"
 
 
+def _direct_safe_reply(session_id: str, user_message: str) -> str | None:
+    """Handle terminal farewells locally."""
+    if _FAREWELL_RE.fullmatch(user_message):
+        request_end_call(session_id)
+        return "You're welcome. Goodbye!"
+    return None
+
+
 async def run_agent(session_id: str, user_message: str, caller_phone: str = "") -> str:
     """Run one agent turn and return the full text reply."""
-    await hydrate_call_memory(session_id)
-    # Server-owned affirmation fact — tools must not invent caller_confirmed.
-    begin_caller_turn(session_id, user_message)
     history = seed_opening_history(list(_sessions.get(session_id, [])))
     history.append({"role": "user", "content": user_message})
     previous_reply = ""
@@ -173,6 +184,17 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
         _history_digest(history),
     )
     try:
+        caller_turn = await process_caller_turn(session_id, user_message)
+        direct_reply = (
+            str(caller_turn.get("message") or "")
+            if caller_turn.get("handled")
+            else _direct_safe_reply(session_id, user_message)
+        )
+        if direct_reply is not None:
+            audit_assistant_speech(direct_reply)
+            history.append({"role": "assistant", "content": direct_reply})
+            _sessions[session_id] = history[-40:]
+            return direct_reply
         payload = {
             "messages": history,
             "session_id": session_id,
@@ -183,7 +205,7 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
         }
         result = await restaurant_agent.ainvoke(
             payload,
-            config={"configurable": {"restaurant_name": settings.restaurant_name}},
+            config={"configurable": {}},
         )
         raw_messages = result.get("messages", [])
         reply = _extract_reply(raw_messages) or "I'm sorry, could you repeat that?"
@@ -220,7 +242,7 @@ async def run_agent(session_id: str, user_message: str, caller_phone: str = "") 
             payload["behavior_directive"] = retry_reason
             result = await restaurant_agent.ainvoke(
                 payload,
-                config={"configurable": {"restaurant_name": settings.restaurant_name}},
+                config={"configurable": {}},
             )
             raw_messages = result.get("messages", [])
             retried = _extract_reply(raw_messages)
@@ -264,6 +286,8 @@ async def stream_agent_tokens(
     user_message: str,
     caller_phone: str = "",
     behavior_directive: str = "",
+    *,
+    prepared_caller_turn: dict[str, object] | None = None,
 ) -> AsyncIterator[str]:
     """Stream speakable tokens from the agent for Vapi / Retell.
 
@@ -275,16 +299,13 @@ async def stream_agent_tokens(
     start generation so that a CancelledError mid-stream never erases it from
     conversation history.  The assistant reply is appended only on success.
     """
-    await hydrate_call_memory(session_id)
-    # Server-owned affirmation fact — tools must not invent caller_confirmed.
-    begin_caller_turn(session_id, user_message)
     history = seed_opening_history(list(_sessions.get(session_id, [])))
     history.append({"role": "user", "content": user_message})
     # Persist the user turn immediately — if this coroutine is cancelled
     # (Retell barge-in), the caller's utterance survives in history.
     _sessions[session_id] = history[-40:]
 
-    config = {"configurable": {"restaurant_name": settings.restaurant_name}}
+    config = {"configurable": {}}
     input_state = {
         "messages": history,
         "session_id": session_id,
@@ -304,6 +325,18 @@ async def stream_agent_tokens(
     action_token = set_current_action_scope(scope)
     begin_turn(session_id, scope)
     try:
+        caller_turn = prepared_caller_turn
+        if caller_turn is None:
+            caller_turn = await process_caller_turn(session_id, user_message)
+        if caller_turn.get("handled"):
+            reply = str(caller_turn.get("message") or "")
+            audit_assistant_speech(reply)
+            current = list(_sessions.get(session_id, []))
+            current.append({"role": "assistant", "content": reply})
+            _sessions[session_id] = current[-40:]
+            end_turn()
+            yield reply
+            return
         async for event in restaurant_agent.astream_events(
             input_state,
             config=config,
