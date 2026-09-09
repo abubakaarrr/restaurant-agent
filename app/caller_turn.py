@@ -33,6 +33,11 @@ _CANCELLATION_ONLY_TAIL_RE = re.compile(
     r"[.!?]*\s*$",
     re.IGNORECASE,
 )
+_CANCELLATION_ONLY_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:actually|no|wait|please)[,;:.!?\s]*)*"
+    r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:.!?\s]*)?$",
+    re.IGNORECASE,
+)
 
 
 async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]:
@@ -61,8 +66,12 @@ async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]
 
     from app.services.restaurant import restaurant_service
 
+    leading_text = text[: reversal_match.start()] if reversal_match else ""
     remaining_text = text[reversal_match.end() :] if reversal_match else text
-    remaining_intent = not bool(_CANCELLATION_ONLY_TAIL_RE.fullmatch(remaining_text))
+    leading_intent = not bool(_CANCELLATION_ONLY_PREFIX_RE.fullmatch(leading_text))
+    remaining_intent = leading_intent or not bool(
+        _CANCELLATION_ONLY_TAIL_RE.fullmatch(remaining_text)
+    )
     try:
         result = await restaurant_service.reverse_pending_cancellation(sid)
     except Exception:

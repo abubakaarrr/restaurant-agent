@@ -176,6 +176,14 @@ def test_topic_matching_uses_word_boundaries(query: str, topic_id: str) -> None:
     assert [record["topic_id"] for record in match.records] == [topic_id]
 
 
+def test_open_hours_with_table_request_preserves_hours_intent() -> None:
+    match = get_restaurant_knowledge().find_topic(
+        "Are you open tonight, and do you have a table?"
+    )
+    assert match.status == "known"
+    assert [record["topic_id"] for record in match.records] == ["topic.hours"]
+
+
 def test_unknown_topic_never_borrows_unrelated_fact() -> None:
     match = get_restaurant_knowledge().find_topic("rooftop telescope policy")
     assert match.status == "unknown"
@@ -655,10 +663,28 @@ async def test_conversation_inputs_execute_grounded_menu_tool(
 
 
 @pytest.mark.asyncio
-async def test_menu_search_normalizes_plural_allergen_terms(
+@pytest.mark.parametrize(
+    ("item_name", "query", "expected_name"),
+    [
+        (
+            "Chilled Peanut Noodles",
+            "Which dishes contain peanuts?",
+            "chilled peanut noodles",
+        ),
+        (
+            "Tomato Fennel Soup",
+            "Which dishes contain tomatoes?",
+            "tomato fennel soup",
+        ),
+    ],
+)
+async def test_menu_search_normalizes_plural_terms(
     monkeypatch: pytest.MonkeyPatch,
+    item_name: str,
+    query: str,
+    expected_name: str,
 ) -> None:
-    item = get_restaurant_knowledge().find_menu_item("Chilled Peanut Noodles").item
+    item = get_restaurant_knowledge().find_menu_item(item_name).item
 
     async def canonical_menu(*, available_only: bool = True) -> dict:
         return {
@@ -682,10 +708,8 @@ async def test_menu_search_normalizes_plural_allergen_terms(
     }
 
     monkeypatch.setattr(restaurant_service, "list_menu", canonical_menu)
-    result = (
-        await search_menu.ainvoke({"query": "Which dishes contain peanuts?"})
-    ).casefold()
-    assert "chilled peanut noodles" in result
+    result = (await search_menu.ainvoke({"query": query})).casefold()
+    assert expected_name in result
     assert "allergy safety" in result
 
 

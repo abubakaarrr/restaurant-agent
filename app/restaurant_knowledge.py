@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_FIXTURE_PATH = ROOT / "db" / "fixtures" / "harbor_and_hearth.v1.json"
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_OPEN_TABLE_RE = re.compile(r"\bopen\s+tables?\b")
 _MONTHS = {
     name: index
     for index, names in enumerate(
@@ -410,7 +411,7 @@ class RestaurantKnowledge:
         if not query_tokens:
             return TopicMatch("missing")
         today = on_date or self.local_date()
-        if "open" in query_tokens and query_tokens & {"table", "tables"}:
+        if _OPEN_TABLE_RE.search(normalized):
             seating = next(
                 topic for topic in self.topics if topic["topic_id"] == "topic.seating"
             )
@@ -778,15 +779,6 @@ class RestaurantKnowledge:
         if alias == "open" and re.search(r"\bopen\s+to\b", normalized_query):
             return False
         if alias == "close" and re.search(r"\bclose\s+to\b", normalized_query):
-            return False
-        if query_tokens & {
-            "table",
-            "tables",
-            "reservation",
-            "reservations",
-            "booking",
-            "book",
-        }:
             return False
         temporal_tokens = {
             "when",

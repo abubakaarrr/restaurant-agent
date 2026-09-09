@@ -307,6 +307,7 @@ async def test_compound_reversal_accepts_yet_after_reservation_pronoun() -> None
         "No, don't cancel my booking; move it to seven.",
         "Wait, don't cancel my booking; move it to seven.",
         "Wait, move my booking to seven.",
+        "Move it to seven, but don't cancel my booking.",
     ],
 )
 async def test_compound_reversal_accepts_leading_correction(utterance: str) -> None:
