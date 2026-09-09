@@ -318,7 +318,24 @@ async def test_order_confirmation_rejects_closed_fulfillment_schedule(
         customer_name="Jordan",
         customer_phone="+14155550124",
     )
-    summary = await restaurant_service.get_order_summary(call_id)
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        await connection.execute(
+            """
+            UPDATE orders
+            SET fulfillment_details = jsonb_set(
+                fulfillment_details,
+                '{fulfillment_at}',
+                to_jsonb($1::text)
+            )
+            WHERE id = $2
+            """,
+            "2026-09-14T12:30:00-07:00",
+            added["order_id"],
+        )
+    finally:
+        await connection.close()
+    summary = await restaurant_service.get_order_summary(call_id=call_id)
     begin_caller_turn(call_id, "yes")
     timezone_info = ZoneInfo("America/Los_Angeles")
     monkeypatch.setattr(
@@ -1076,7 +1093,8 @@ async def test_booking_creation_does_not_rewrite_confirmed_delivery() -> None:
         await connection.close()
     assert order["booking_id"] is None
     assert order["fulfillment_type"] == "delivery"
-    assert dict(order["fulfillment_details"])["delivery_fee"] == 5
+    fulfillment_details = json.loads(order["fulfillment_details"])
+    assert fulfillment_details["delivery_fee"] == 5
 
 
 async def test_booking_creation_attaches_only_unselected_draft_order() -> None:
@@ -1485,6 +1503,15 @@ async def test_fulfillment_changes_reject_expired_seasonal_item() -> None:
             booking_id=booking_id,
         )
     assert fulfillment_error.value.code == "menu_item_unavailable"
+
+    connection = await asyncpg.connect(settings.database_url)
+    try:
+        await connection.execute(
+            "UPDATE bookings SET status = 'cancelled' WHERE id = $1",
+            booking_id,
+        )
+    finally:
+        await connection.close()
 
     call_id = "expired-auto-attachment"
     connection = await asyncpg.connect(settings.database_url)

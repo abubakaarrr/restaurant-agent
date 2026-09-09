@@ -377,6 +377,27 @@ def test_modifier_semantics_cover_free_paid_removal_unavailable_and_clarificatio
     ]
     assert substituted["price_delta"] == 4
 
+    hydrated_burger = deepcopy(burger)
+    hydrated_burger["modifier_options"] = [
+        deepcopy(knowledge.modifier_options[option_id])
+        for option_id in burger["modifier_options"]
+    ]
+    hydrated = knowledge.resolve_customization(
+        hydrated_burger,
+        modifier_ids=["modifier.extra-cheddar"],
+        removals=["onion jam"],
+        substitutions=["modifier.side-salad"],
+    )
+    assert hydrated["status"] == "valid"
+    assert hydrated["removals"] == ["onion jam"]
+    assert [row["option_id"] for row in hydrated["modifiers"]] == [
+        "modifier.extra-cheddar"
+    ]
+    assert [row["option_id"] for row in hydrated["substitutions"]] == [
+        "modifier.side-salad"
+    ]
+    assert hydrated["price_delta"] == 4
+
     duplicate_readback = _format_order(
         {
             "order_id": 18,

@@ -478,7 +478,13 @@ class RestaurantKnowledge:
         removals: Iterable[str] = (),
         substitutions: Iterable[str] = (),
     ) -> dict[str, Any]:
-        allowed = set(item.get("modifier_options") or [])
+        allowed = {
+            str(value.get("option_id") or "")
+            if isinstance(value, dict)
+            else str(value)
+            for value in item.get("modifier_options") or []
+        }
+        allowed.discard("")
         selected: list[dict[str, Any]] = []
         selected_substitutions: list[dict[str, Any]] = []
         selected_ids: set[str] = set()
