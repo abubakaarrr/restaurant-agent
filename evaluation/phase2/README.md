@@ -51,10 +51,15 @@ Starting SHA: `b34211f0b1b6f570c8612daa3e69dc36d084d0be`.
 
 Submitted implementation SHA: `094bebac38c0eccdf4ebb595fb4b55a4070def70`.
 
+Frozen implementation candidate SHA after the authorized no-mistakes fix
+rounds: `b394dc3764efcdf9a1ee7ba8ef76143867a7e6b8`.
+
 The focused Phase 2 speech command was:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q -p no:cacheprovider \
+  -p pytest_asyncio.plugin \
   tests/test_phase2_voice_humanization.py
 ```
 
@@ -65,7 +70,9 @@ The regenerated evaluation and affected-suite command was:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/phase2_voice_evaluation.py \
   --output-dir evaluation/phase2 >/dev/null && \
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q -p no:cacheprovider \
+  -p pytest_asyncio.plugin \
   tests/test_phase2_voice_humanization.py \
   tests/test_retell_protocol.py \
   tests/test_behavior.py \
@@ -84,7 +91,9 @@ missing or `null`.
 The full local suite command was:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q -p no:cacheprovider \
+  -p pytest_asyncio.plugin
 ```
 
 It passed 255 tests and skipped 43 in 22.29 seconds, with one upstream
@@ -93,12 +102,19 @@ Starlette/AnyIO deprecation warning.
 Compilation and whitespace validation used:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m compileall -q app scripts tests
+PYTHONPYCACHEPREFIX=/tmp/restaurant-agent-phase2-pycache-r56-r57 \
+  .venv/bin/python -m compileall -q app scripts \
+  tests/test_phase2_voice_humanization.py
 git diff --check
 ```
 
 Both commands passed with exit status 0. Standalone `ruff`, `flake8`, `pylint`,
 and `pyflakes` were unavailable, so no standalone Python lint pass is claimed.
+These exact local results were produced at submitted SHA `094bebac`; the
+subsequent authorized no-mistakes fixes added focused executable regressions,
+but the run was frozen during fix-review before its formal test, document,
+lint, push, PR, and CI stages. No unproduced result is attributed to frozen
+candidate `b394dc3`.
 
 Changed files relative to the Phase 2 starting commit:
 
@@ -129,3 +145,25 @@ provider or phone, use credentials or recordings, or upload, clone, synthesize,
 select, assign, mutate, or delete any voice. The limitation is unchanged: local
 text and handler traces provide no authorized acoustic or provider-performance
 evidence, so the recommendation remains to retain the baseline.
+
+## Captain-deferred findings
+
+The Captain froze candidate `b394dc3` and explicitly deferred these review
+findings rather than authorizing another fix/review cycle:
+
+- `r66` — error, spoken-delivery scope: streaming list lookahead can lose an
+  earlier recommendation context before an incomplete trailing sequence marker.
+- `r67` — error, spoken-delivery scope: currency-decorated numeric ranges can
+  be mistaken for unordered-list separators.
+- `r68` — error, Retell rollback-adapter scope: greeting state is
+  connection-local and can repeat after an automatic reconnect before speech.
+- `r69` — warning, Retell rollback-adapter scope: completed
+  `process_interaction` task exceptions are not supervised at the shared entry
+  boundary.
+- `r70` — error, spoken-delivery scope: a single line-start numbered item is
+  intentionally ambiguous with legitimate standalone numeric speech and can
+  retain its list marker.
+
+These known limitations mean the offline evidence does not justify adopting a
+clone or merging without review. The recommendation remains to retain the
+current baseline fallback.
