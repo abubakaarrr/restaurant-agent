@@ -17,21 +17,24 @@ INCOMPLETE_INPUT_REPLY = "Sorry, I didn't catch that. What can I help with?"
 FRUSTRATION_REPLY = "You're right—I missed that. What should I fix?"
 
 _MARKDOWN_LINE = re.compile(r"(?m)^\s*(?:#{1,6}\s|>\s|```)")
-_MARKDOWN_LINK = re.compile(r"!?\[[^\]]+\]\([^)]+\)")
+_MARKDOWN_LINK = re.compile(r"!?\[([^\]]+)\]\([^)]+\)")
+_MARKDOWN_INLINE = re.compile(
+    r"(?:\*\*|__|~~)(?=\S)|(?<=\S)(?:\*\*|__|~~)|"
+    r"(?<!\*)\*(?=\S)|(?<=\S)\*(?!\*)|`"
+)
 _URL = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
 _UNORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)([-*+])[ \t]+")
 _ORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)(\d+)([.)])[ \t]+")
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
 
 
 def _unordered_list_matches(value: str) -> list[re.Match[str]]:
     matches = list(_UNORDERED_LIST_MARKER.finditer(value))
-    if len(matches) > 1:
-        return matches
     if not matches:
         return []
     match = matches[0]
     before = value[: match.start(2)].rstrip()
-    if not before or before.endswith(":"):
+    if not before or before.endswith(":") or not match.group(1):
         return matches
     return []
 
@@ -42,18 +45,31 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
         return []
     first = matches[0]
     before = value[: first.start(2)].rstrip()
-    starts_like_list = not before or before.endswith(":")
-    labels = [int(match.group(2)) for match in matches]
-    sequential = len(labels) > 1 and all(
-        current == previous + 1
-        for previous, current in zip(labels, labels[1:])
+    first_label = int(first.group(2))
+    starts_like_list = (
+        not before
+        or not first.group(1)
+        or (before.endswith(":") and first_label == 1)
     )
-    return matches if starts_like_list or sequential else []
+    if not starts_like_list:
+        return []
+    accepted = [first]
+    expected = first_label + 1
+    for match in matches[1:]:
+        label = int(match.group(2))
+        if label != expected:
+            break
+        accepted.append(match)
+        expected += 1
+    return accepted
 
 
 def sanitize_spoken_text(text: str) -> str:
-    """Remove written list markers without deleting grounded numeric values."""
+    """Remove written formatting without deleting grounded numeric values."""
     value = str(text or "")
+    value = _MARKDOWN_LINK.sub(lambda match: match.group(1), value)
+    value = _MARKDOWN_LINE.sub("", value)
+    value = _MARKDOWN_INLINE.sub("", value)
     unordered = _unordered_list_matches(value)
     if unordered:
         allowed = {match.start() for match in unordered}
@@ -90,6 +106,7 @@ def spoken_text_violations(text: str, *, max_words: int = 60) -> tuple[str, ...]
     if (
         _MARKDOWN_LINE.search(value)
         or _MARKDOWN_LINK.search(value)
+        or _MARKDOWN_INLINE.search(value)
         or _unordered_list_matches(value)
         or _ordered_list_matches(value)
     ):
@@ -99,6 +116,59 @@ def spoken_text_violations(text: str, *, max_words: int = 60) -> tuple[str, ...]
     if len(value.split()) > max_words:
         violations.append("too_long")
     return tuple(violations)
+
+
+@dataclass
+class SpokenTextBuffer:
+    """Sanitize complete spoken segments without exposing split markup."""
+
+    pending: str = ""
+
+    def feed(self, text: str) -> tuple[str, ...]:
+        self.pending += str(text or "")
+        end = self._safe_prefix_end()
+        if end == 0:
+            return ()
+        raw = self.pending[:end]
+        self.pending = self.pending[end:]
+        spoken = sanitize_spoken_text(raw)
+        return (spoken,) if spoken else ()
+
+    def flush(self) -> tuple[str, ...]:
+        raw = self.pending
+        self.pending = ""
+        spoken = sanitize_spoken_text(raw)
+        return (spoken,) if spoken else ()
+
+    def _safe_prefix_end(self) -> int:
+        if self._has_open_markdown_construct():
+            return 0
+        ordered_markers = {
+            match.start(3) for match in _ORDERED_LIST_MARKER.finditer(self.pending)
+        }
+        matches = [
+            match
+            for match in _SENTENCE_END.finditer(self.pending)
+            if match.start() not in ordered_markers
+        ]
+        if not matches:
+            return 0
+        return matches[-1].end()
+
+    def _has_open_markdown_construct(self) -> bool:
+        value = self.pending
+        bracket = value.rfind("[")
+        if bracket > value.rfind("]"):
+            return True
+        link = value.rfind("](")
+        if link >= 0 and link > value.rfind(")"):
+            return True
+        if value.count("`") % 2:
+            return True
+        for marker in ("**", "__", "~~"):
+            if value.count(marker) % 2:
+                return True
+        return False
 
 
 @dataclass

@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.config import settings
 from app.restaurant_knowledge import KnowledgeFixtureError, get_restaurant_knowledge
 
 
@@ -14,6 +13,8 @@ def _now(timezone_info: ZoneInfo) -> datetime:
 
 
 def current_staff_transfer_number(at: datetime | None = None) -> str:
+    from app.config import settings
+
     number = str(settings.staff_transfer_number or "").strip()
     if not number:
         return ""

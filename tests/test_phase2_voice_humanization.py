@@ -13,6 +13,7 @@ from app.behavior import BehaviorState, TurnObservation, reduce_behavior
 from app.call_flags import clear_call_control, request_end_call, request_transfer
 from app.spoken_delivery import (
     ResponseGenerationGate,
+    SpokenTextBuffer,
     sanitize_spoken_text,
     spoken_text_violations,
 )
@@ -53,6 +54,10 @@ def test_all_phase2_scenarios_execute_as_plain_concise_grounded_speech() -> None
             assert output.count("?") <= 1
 
     by_id = {row["scenario_id"]: row for row in results}
+    assert by_id["greeting"]["outputs"] == [
+        "Hi, you've reached Harbor & Hearth Kitchen. This is Avery. "
+        "How can I help you today?"
+    ]
     assert "1842 Market Street" in by_id["simple_faq"]["outputs"][0]
     assert "Which one did you mean?" in by_id["menu_clarification"]["outputs"][0]
     allergy = by_id["allergy_question"]["outputs"][0].casefold()
@@ -68,6 +73,20 @@ def test_all_phase2_scenarios_execute_as_plain_concise_grounded_speech() -> None
     unknown = by_id["unknown_request"]["outputs"][0].casefold()
     assert "don't have that answer" in unknown
     assert "transfer" not in unknown and "connect" not in unknown
+    interruption = by_id["interruption"]
+    trace = interruption["handler_delivery_trace"]
+    new_turn = next(
+        index
+        for index, event in enumerate(trace)
+        if event == {"event": "customer_turn", "response_id": 71}
+    )
+    deliveries = [
+        event for event in trace[new_turn + 1 :] if event["event"] == "assistant_delivery"
+    ]
+    assert deliveries
+    assert all(event["response_id"] == 71 for event in deliveries)
+    assert all(not event["end_call"] for event in deliveries)
+    assert all(event["transfer_number"] is None for event in deliveries)
 
 
 def test_first_interruption_immediately_raises_sensitivity_and_invalidates_old_id() -> None:
@@ -146,14 +165,14 @@ async def test_protocol_delivers_no_old_content_after_customer_interruption(
 
     async def fake_stream(_call_id: str, user_text: str, *_args, **_kwargs):
         if "old answer" in user_text.casefold():
-            yield "Old answer started"
+            yield "Old answer started."
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
                 # Model an upstream iterator that mishandles cancellation. The
                 # handler's generation gate must still block its next chunk.
                 pass
-            yield "STALE CONTENT"
+            yield "STALE CONTENT."
         else:
             yield "You want seven o'clock instead."
 
@@ -216,7 +235,7 @@ async def test_cancelled_turn_control_cannot_leak_into_next_response(
                 request_transfer(call_id, "human_requested", "+14155550123")
             else:
                 request_end_call(call_id)
-            yield "Old answer started"
+            yield "Old answer started."
             await asyncio.Event().wait()
         else:
             yield "The new answer."
@@ -256,6 +275,14 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     assert "1." not in sanitized and "2." not in sanitized
     assert spoken_text_violations(sanitized) == ()
 
+    order = "Order: 1. Burger. 2. Salad. Confirmation 123. Please keep it."
+    cleaned_order = sanitize_spoken_text(order)
+    assert "1, Burger" in cleaned_order and "2, Salad" in cleaned_order
+    assert "Confirmation 123." in cleaned_order
+
+    hours = "We're open Tuesday - Thursday, 5 - 10 p.m."
+    assert sanitize_spoken_text(hours) == hours
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -267,6 +294,25 @@ def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     )
     assert event["content"] == "Your sides are: fries. salad"
     assert spoken_text_violations(event["content"]) == ()
+
+
+def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
+    buffer = SpokenTextBuffer()
+    chunks = [
+        "Options:",
+        " -",
+        " Fries",
+        " -",
+        " Salad.",
+        " **Special**.",
+        " See [our menu]",
+        "(https://example.com).",
+    ]
+    delivered = [part for chunk in chunks for part in buffer.feed(chunk)]
+    delivered.extend(buffer.flush())
+
+    assert "".join(delivered) == "Options: Fries. Salad. Special. See our menu."
+    assert all(spoken_text_violations(part) == () for part in delivered)
 
 
 class ListWebSocket:
@@ -342,8 +388,12 @@ def test_offline_evaluation_is_reproducible_and_missing_metrics_stay_null(
     assert result["human_preference"]["rater_count"] == 0
     assert result["baseline_vs_clone"]["clone_score"] is None
     assert result["baseline_vs_clone"]["baseline_score"] is None
-    for arm in result["arms"].values():
+    for arm_id, arm in result["arms"].items():
         assert arm["provider_audio_score"] is None
+        assert arm["clone_audio_artifact_ref"] is None
+        assert result["human_preference"]["arm_scores"][arm_id][
+            "preference_wins"
+        ] is None
         assert arm["event_counts"]["timeout_count"] is None
         for metric in arm["latency_ms"].values():
             assert metric["availability"] == "missing"

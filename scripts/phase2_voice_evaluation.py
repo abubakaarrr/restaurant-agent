@@ -10,6 +10,7 @@ import json
 import math
 import random
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,19 +19,18 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.agent.runner import opening_greeting
 from app.behavior import BehaviorState, TurnObservation, reduce_behavior
-from app.restaurant_knowledge import get_restaurant_knowledge
+from app.restaurant_knowledge import RestaurantKnowledge
 from app.spoken_delivery import (
     FRUSTRATION_REPLY,
     INCOMPLETE_INPUT_REPLY,
     TRANSFER_UNAVAILABLE_REPLY,
-    ResponseGenerationGate,
     spoken_text_violations,
 )
 
 
 DEFAULT_PLAN = ROOT / "config" / "phase2-voice-evaluation.v1.json"
+HANDLER_TRACE = ROOT / "scripts" / "phase2_handler_delivery_trace.py"
 PROVIDER_UNAVAILABLE_REASON = (
     "Explicit voice-sample and provider-action authorization was not supplied."
 )
@@ -88,16 +88,41 @@ def _join_spoken(values: list[str], *, conjunction: str) -> str:
     return ", ".join(values[:-1]) + f", {conjunction} {values[-1]}"
 
 
-def _local_scenario_result(scenario: dict[str, Any]) -> dict[str, Any]:
-    knowledge = get_restaurant_knowledge()
+def _handler_interruption_trace(scenario: dict[str, Any]) -> dict[str, Any]:
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(HANDLER_TRACE),
+            str(scenario["old_response_id"]),
+            str(scenario["new_response_id"]),
+        ],
+        cwd=ROOT / "db" / "fixtures",
+        env={"PYTHONDONTWRITEBYTECODE": "1"},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(process.stdout)
+
+
+def _local_scenario_result(
+    scenario: dict[str, Any],
+    *,
+    knowledge: RestaurantKnowledge,
+    interruption_trace: dict[str, Any] | None,
+) -> dict[str, Any]:
     kind = str(scenario["kind"])
     source_refs: list[str] = []
     outputs: list[str] = []
     stale_incidents = 0
     interruption_failures = 0
+    delivery_trace = None
 
     if kind == "greeting":
-        outputs = [opening_greeting()]
+        outputs = [
+            f"Hi, you've reached {knowledge.identity['name']}. "
+            f"This is {scenario['agent_name']}. How can I help you today?"
+        ]
         source_refs = [knowledge.metadata["fixture_id"]]
     elif kind == "faq":
         topic = knowledge.find_topic(str(scenario["customer_input"]))
@@ -159,12 +184,10 @@ def _local_scenario_result(scenario: dict[str, Any]) -> dict[str, Any]:
         outputs = [FRUSTRATION_REPLY]
         source_refs = ["behavior:explicit_complaint"]
     elif kind == "interruption":
-        old_id = int(scenario["old_response_id"])
-        new_id = int(scenario["new_response_id"])
-        gate = ResponseGenerationGate()
-        gate.begin(old_id)
-        gate.begin(new_id)
-        stale_incidents = int(gate.allows(old_id))
+        if interruption_trace is None:
+            raise ValueError("Interruption scenario requires a handler delivery trace")
+        delivery_trace = interruption_trace["trace"]
+        stale_incidents = int(interruption_trace["stale_response_incidents"])
         reduction = reduce_behavior(
             BehaviorState(),
             TurnObservation(text=str(scenario["customer_input"]), interrupted=True),
@@ -172,9 +195,10 @@ def _local_scenario_result(scenario: dict[str, Any]) -> dict[str, Any]:
         interruption_failures = int(
             "interrupted" not in reduction.directive.reasons
             or reduction.directive.interruption_sensitivity < 0.9
+            or int(interruption_trace["cancelled_control_leaks"]) != 0
         )
         outputs = ["You want seven o'clock instead. Is that the only correction?"]
-        source_refs = ["response-generation-gate", "behavior:interrupted"]
+        source_refs = ["retell-handler-delivery-trace", "behavior:interrupted"]
     elif kind == "silence_incomplete":
         state = BehaviorState()
         for _ in range(3):
@@ -230,12 +254,30 @@ def _local_scenario_result(scenario: dict[str, Any]) -> dict[str, Any]:
         "outputs_with_multiple_questions": too_many_questions,
         "interruption_recovery_failures": interruption_failures,
         "stale_response_incidents": stale_incidents,
+        "handler_delivery_trace": delivery_trace,
         "passed": passed,
     }
 
 
 def run_local_scenarios(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    return [_local_scenario_result(row) for row in plan["scenarios"]]
+    fixture_path = ROOT / str(plan["restaurant_fixture_path"])
+    knowledge = RestaurantKnowledge.from_path(fixture_path)
+    if knowledge.metadata["fixture_id"] != plan["restaurant_fixture_id"]:
+        raise ValueError("Evaluation plan and restaurant fixture do not match")
+    interruption_scenario = next(
+        row for row in plan["scenarios"] if row["kind"] == "interruption"
+    )
+    interruption_trace = _handler_interruption_trace(interruption_scenario)
+    return [
+        _local_scenario_result(
+            row,
+            knowledge=knowledge,
+            interruption_trace=(
+                interruption_trace if row["kind"] == "interruption" else None
+            ),
+        )
+        for row in plan["scenarios"]
+    ]
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -421,6 +463,7 @@ def summarize(
             "latency_ms": latency,
             "event_counts": event_counts,
             "provider_audio_score": None,
+            "clone_audio_artifact_ref": None,
             "missing_reason": missing_reason if not completed else None,
         }
 
@@ -480,7 +523,7 @@ def summarize(
             }
         arm_preference_scores[arm] = {
             "overall_mean": statistics.fmean(all_values) if all_values else None,
-            "preference_wins": preference_wins[arm],
+            "preference_wins": preference_wins[arm] if complete_ratings else None,
             "dimensions": dimension_scores,
         }
 

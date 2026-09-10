@@ -2,6 +2,7 @@
   "schema_version": "restaurant-voice-evaluation.v1",
   "evaluation_id": "phase2-voice-humanization-2026-09-09",
   "restaurant_fixture_id": "fixture.harbor-and-hearth.phase1",
+  "restaurant_fixture_path": "db/fixtures/harbor_and_hearth.v1.json",
   "scenario_repeats_per_arm": 10,
   "randomization_seed": 20260909,
   "arms": [
@@ -42,6 +43,7 @@
     {
       "id": "greeting",
       "kind": "greeting",
+      "agent_name": "Avery",
       "customer_input": "",
       "required": ["restaurant_name", "agent_identity", "one_opening_question"]
     },

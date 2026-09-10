@@ -44,3 +44,51 @@ scenarios and zero raters. Provider audio scores, preference scores, and all
 provider latency values are explicit `null` values with a missing reason. The
 offline result recommends retaining the baseline fallback because there is no
 authorized clone evidence to justify adoption.
+
+## Run evidence
+
+The focused validation command for this run was:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/phase2_voice_evaluation.py \
+  --output-dir evaluation/phase2 >/dev/null && \
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
+  tests/test_phase2_voice_humanization.py
+```
+
+It regenerated all five evaluation artifacts successfully and completed with
+11 passing focused tests. The run prepared 12 local scenarios, 120 turns per
+provider arm, and 120 blinded comparisons. All 12 local scenarios passed with
+zero stale-response incidents. Provider scenario completions, raters, and
+ratings remained zero; clone-audio references, audio and preference results,
+provider latency, errors, timeouts, and fallbacks remained explicitly missing
+or `null`.
+
+Changed files relative to the Phase 2 starting commit:
+
+- `README.md`
+- `app/behavior.py`
+- `app/call_flags.py`
+- `app/prompts/retell/global.md`
+- `app/prompts/retell/handoff.md`
+- `app/prompts/system.md`
+- `app/retell_handler.py`
+- `app/services/restaurant.py`
+- `app/spoken_delivery.py`
+- `app/transfer_availability.py`
+- `config/phase2-voice-evaluation.v1.json`
+- `evaluation/phase2/README.md`
+- `evaluation/phase2/blind-rating-form.csv`
+- `evaluation/phase2/local-scenario-results.jsonl`
+- `evaluation/phase2/provider-measurements.csv`
+- `evaluation/phase2/randomization-key.csv`
+- `evaluation/phase2/results.json`
+- `scripts/phase2_handler_delivery_trace.py`
+- `scripts/phase2_voice_evaluation.py`
+- `tests/test_phase2_voice_humanization.py`
+
+This run did not access staging or production, enable live writes, call a
+provider or phone, use credentials or recordings, or upload, clone, synthesize,
+select, assign, mutate, or delete any voice. The limitation is unchanged: local
+text and handler traces provide no authorized acoustic or provider-performance
+evidence, so the recommendation remains to retain the baseline.
