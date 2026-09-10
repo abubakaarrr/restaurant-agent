@@ -130,24 +130,55 @@ def _unordered_list_matches(value: str) -> list[re.Match[str]]:
     return []
 
 
-def _ordered_list_starts_at(value: str, match: re.Match[str]) -> bool:
+def _ordered_list_has_context(value: str, match: re.Match[str]) -> bool:
     before = value[: match.start(2)].rstrip()
     if _CONFIRMATION_CONTEXT.search(before):
         return False
-    if not before or not match.group(1):
-        return True
     clause = re.split(r"(?:[.!?][ \t]+|\n)", before)[-1].strip()
     return clause.endswith(":") or bool(_ORDERED_LIST_CONTEXT.search(clause))
 
 
-def _possible_ordered_list(value: str) -> bool:
-    clause = re.split(r"(?:[.!?][ \t]+|\n)", value)[-1].strip()
-    if _ORDERED_LIST_CONTEXT.search(clause):
-        return True
-    return any(
-        _ordered_list_starts_at(value, match)
-        for match in _ORDERED_LIST_LOOKAHEAD_MARKER.finditer(value)
+def _ordered_item_fragment(
+    value: str,
+    match: re.Match[str],
+    following: re.Match[str] | None = None,
+) -> str:
+    end = following.start(2) if following else len(value)
+    return value[match.end() : end].strip()
+
+
+def _ordered_item_has_transition(fragment: str) -> bool:
+    return bool(re.search(r"[.!?](?:[\"')\]]*)\s+\S", fragment))
+
+
+def _looks_like_ordered_item(fragment: str) -> bool:
+    item = fragment.strip().rstrip(".!?").strip()
+    if not item or _ordered_item_has_transition(item):
+        return False
+    words = re.findall(r"[A-Za-z]+", item)
+    if not words:
+        return False
+    first_alpha = re.search(r"[A-Za-z]", item)
+    return bool(
+        first_alpha
+        and (
+            first_alpha.group().islower()
+            or all(word[0].isupper() for word in words)
+        )
     )
+
+
+def _ordered_pair_has_item_structure(
+    value: str,
+    first: re.Match[str],
+    following: re.Match[str],
+) -> bool:
+    if int(following.group(2)) != int(first.group(2)) + 1:
+        return False
+    fragment = _ordered_item_fragment(value, first, following)
+    if not fragment or _ordered_item_has_transition(fragment):
+        return False
+    return not following.group(1) or _looks_like_ordered_item(fragment)
 
 
 def _ordered_list_matches(value: str) -> list[re.Match[str]]:
@@ -156,11 +187,20 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
     index = 0
     while index < len(candidates):
         first = candidates[index]
-        if not _ordered_list_starts_at(value, first):
+        has_context = _ordered_list_has_context(value, first)
+        has_structured_pair = index + 1 < len(candidates) and (
+            _ordered_pair_has_item_structure(
+                value,
+                first,
+                candidates[index + 1],
+            )
+        )
+        if not has_context and not has_structured_pair:
             index += 1
             continue
         accepted.append(first)
         expected = int(first.group(2)) + 1
+        previous = first
         index += 1
         while index < len(candidates):
             match = candidates[index]
@@ -169,10 +209,33 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
                 break
             if int(match.group(2)) != expected:
                 break
+            fragment = _ordered_item_fragment(value, previous, match)
+            if not fragment or _ordered_item_has_transition(fragment):
+                break
             accepted.append(match)
             expected += 1
+            previous = match
             index += 1
     return accepted
+
+
+def _possible_ordered_list(value: str) -> bool:
+    if _ordered_list_matches(value):
+        return True
+    candidates = list(_ORDERED_LIST_LOOKAHEAD_MARKER.finditer(value))
+    if not candidates:
+        clause = re.split(r"(?:[.!?][ \t]+|\n)", value)[-1].strip()
+        return bool(_ORDERED_LIST_CONTEXT.search(clause))
+    match = candidates[-1]
+    if _ordered_list_has_context(value, match):
+        return True
+    before = value[: match.start(2)].rstrip()
+    if _CONFIRMATION_CONTEXT.search(before):
+        return False
+    fragment = _ordered_item_fragment(value, match)
+    if not before and not match.group(1):
+        return _looks_like_ordered_item(fragment)
+    return not fragment or _looks_like_ordered_item(fragment)
 
 
 def sanitize_spoken_text(text: str) -> str:
@@ -262,7 +325,6 @@ class SpokenTextBuffer:
     def _safe_prefix_end(self) -> int:
         unordered_candidates = _unordered_list_candidates(self.pending)
         unordered_matches = _unordered_list_matches(self.pending)
-        ordered_candidates = list(_ORDERED_LIST_MARKER.finditer(self.pending))
         possible_ordered_list = _possible_ordered_list(self.pending)
         ordered_matches = _ordered_list_matches(self.pending)
         if (unordered_candidates and not unordered_matches) or (

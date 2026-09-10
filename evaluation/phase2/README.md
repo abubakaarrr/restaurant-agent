@@ -49,7 +49,18 @@ authorized clone evidence to justify adoption.
 
 Starting SHA: `b34211f0b1b6f570c8612daa3e69dc36d084d0be`.
 
-The combined focused and affected-suite validation command for this run was:
+Submitted implementation SHA: `094bebac38c0eccdf4ebb595fb4b55a4070def70`.
+
+The focused Phase 2 speech command was:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
+  tests/test_phase2_voice_humanization.py
+```
+
+It passed 12 tests in 18.57 seconds.
+
+The regenerated evaluation and affected-suite command was:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/phase2_voice_evaluation.py \
@@ -63,12 +74,31 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
 
 It regenerated all five evaluation artifacts successfully. The focused Phase 2
 tests and the existing Retell protocol, behavior, and stale-reply suites all
-passed: 67 tests in 17.55 seconds. The run prepared 12 local scenarios, 120
+passed: 67 tests in 19.65 seconds. The run prepared 12 local scenarios, 120
 turns per provider arm, and 120 blinded comparisons. All 12 local scenarios
 passed with zero stale-response incidents. Provider scenario completions,
 raters, and ratings remained zero; clone-audio references, audio and preference
 results, provider latency, errors, timeouts, and fallbacks remained explicitly
 missing or `null`.
+
+The full local suite command was:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q
+```
+
+It passed 255 tests and skipped 43 in 22.29 seconds, with one upstream
+Starlette/AnyIO deprecation warning.
+
+Compilation and whitespace validation used:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m compileall -q app scripts tests
+git diff --check
+```
+
+Both commands passed with exit status 0. Standalone `ruff`, `flake8`, `pylint`,
+and `pyflakes` were unavailable, so no standalone Python lint pass is claimed.
 
 Changed files relative to the Phase 2 starting commit:
 

@@ -444,6 +444,22 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     )
     assert sanitize_spoken_text(numeric_sentences) == numeric_sentences
 
+    standalone_numeric = "7. That's your pickup time."
+    assert sanitize_spoken_text(standalone_numeric) == standalone_numeric
+
+    list_then_pickup = (
+        "Options: 1. Burger. 2. Salad. Pickup is at 3. Please arrive early."
+    )
+    assert sanitize_spoken_text(list_then_pickup) == (
+        "Options: 1, Burger. 2, Salad. Pickup is at 3. Please arrive early."
+    )
+
+    recommendation = "I recommend 3. soup 4. salad."
+    assert sanitize_spoken_text(recommendation) == (
+        "I recommend 3, soup 4, salad."
+    )
+    assert spoken_text_violations(recommendation) == ("markdown",)
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -593,6 +609,29 @@ def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
     assert "".join(numeric_delivery) == (
         "We open at 3. Dinner begins at 4. Happy hour ends at 5. "
         "Please arrive early."
+    )
+
+    standalone_numeric = SpokenTextBuffer()
+    pickup_delivery = standalone_numeric.feed("7. That's your pickup time.")
+    assert pickup_delivery
+    assert "".join((*pickup_delivery, *standalone_numeric.flush())) == (
+        "7. That's your pickup time."
+    )
+
+    list_then_pickup = SpokenTextBuffer()
+    transition_delivery = list_then_pickup.feed(
+        "Options: 1. Burger. 2. Salad. Pickup is at 3. Please arrive early."
+    )
+    assert "".join((*transition_delivery, *list_then_pickup.flush())) == (
+        "Options: 1, Burger. 2, Salad. Pickup is at 3. Please arrive early."
+    )
+
+    recommendation = SpokenTextBuffer()
+    assert recommendation.feed("I recommend 3.") == ()
+    assert recommendation.feed(" soup ") == ()
+    recommendation_delivery = recommendation.feed("4. salad.")
+    assert "".join((*recommendation_delivery, *recommendation.flush())) == (
+        "I recommend 3, soup 4, salad."
     )
 
 
