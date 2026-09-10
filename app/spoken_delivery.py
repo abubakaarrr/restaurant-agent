@@ -16,11 +16,16 @@ MANAGER_TRANSFER_UNAVAILABLE_REPLY = (
 INCOMPLETE_INPUT_REPLY = "Sorry, I didn't catch that. What can I help with?"
 FRUSTRATION_REPLY = "You're right—I missed that. What should I fix?"
 
-_MARKDOWN_LINE = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?|```)")
+_MARKDOWN_LINE = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+|(?:>[ \t]?)+)")
+_MARKDOWN_FENCE = re.compile(
+    r"(?m)^[ \t]*(?:`{3,}|~{3,})[^\n]*(?:\n|$)"
+)
 _MARKDOWN_THEMATIC_BREAK = re.compile(
     r"(?m)^[ \t]*(?:[-*_][ \t]*){3,}[ \t]*(?:\n|$)"
 )
-_MARKDOWN_SETEXT_UNDERLINE = re.compile(r"(?m)^[ \t]*=+[ \t]*(?:\n|$)")
+_MARKDOWN_SETEXT_UNDERLINE = re.compile(
+    r"(?m)^[ \t]*(?:=+|-{1,2})[ \t]*(?:\n|$)"
+)
 _MARKDOWN_LINK = re.compile(r"!?\[([^\]]+)\]\([^)]+\)")
 _MARKDOWN_INLINE = re.compile(
     r"(?:\*\*|__|~~)(?=\S)|(?<=\S)(?:\*\*|__|~~)|"
@@ -39,6 +44,9 @@ _MERIDIEM_TIME_LEFT = re.compile(
 _TIME_RIGHT = re.compile(
     r"^\s*\d{1,2}(?::\d{2})?(?:\s*[ap]\.?m\.?)?(?=\s|$|[,.;])",
     re.IGNORECASE,
+)
+_CONFIRMATION_CONTEXT = re.compile(
+    r"\bconfirmation(?:\s+(?:number|code))?\s*:?\s*$", re.IGNORECASE
 )
 _RANGE_WORDS = {
     "monday",
@@ -96,7 +104,13 @@ def _unordered_list_matches(value: str) -> list[re.Match[str]]:
         return []
     match = candidates[0]
     before = value[: match.start(2)].rstrip()
-    if len(candidates) >= 2 or not before or before.endswith(":") or not match.group(1):
+    if (
+        len(candidates) >= 2
+        or not before
+        or before.endswith(":")
+        or not match.group(1)
+        or match.group(2) in "•◦‣"
+    ):
         return candidates
     return []
 
@@ -116,11 +130,13 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
             break
         accepted.append(match)
         expected += 1
+    if _CONFIRMATION_CONTEXT.search(before):
+        return []
     starts_like_list = (
         not before
         or not first.group(1)
-        or (before.endswith(":") and first_label == 1)
-        or (first_label == 1 and len(accepted) >= 2)
+        or before.endswith(":")
+        or len(accepted) >= 2
     )
     return accepted if starts_like_list else []
 
@@ -129,6 +145,7 @@ def sanitize_spoken_text(text: str) -> str:
     """Remove written formatting without deleting grounded numeric values."""
     value = str(text or "")
     value = _MARKDOWN_LINK.sub(lambda match: match.group(1), value)
+    value = _MARKDOWN_FENCE.sub("", value)
     value = _MARKDOWN_THEMATIC_BREAK.sub("", value)
     value = _MARKDOWN_SETEXT_UNDERLINE.sub("", value)
     value = _MARKDOWN_LINE.sub("", value)
@@ -143,6 +160,8 @@ def sanitize_spoken_text(text: str) -> str:
             before = value[: match.start(2)].rstrip()
             if not before or not match.group(1):
                 return ""
+            if len(unordered) == 1 and match.group(2) in "•◦‣":
+                return " "
             return " " if before.endswith((":", ".", ",", ";")) else ". "
 
         value = _UNORDERED_LIST_MARKER.sub(replace_unordered, value)
@@ -168,6 +187,7 @@ def spoken_text_violations(text: str, *, max_words: int = 60) -> tuple[str, ...]
         violations.append("empty")
     if (
         _MARKDOWN_LINE.search(value)
+        or _MARKDOWN_FENCE.search(value)
         or _MARKDOWN_THEMATIC_BREAK.search(value)
         or _MARKDOWN_SETEXT_UNDERLINE.search(value)
         or _MARKDOWN_LINK.search(value)

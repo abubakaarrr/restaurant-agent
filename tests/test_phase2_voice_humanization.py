@@ -420,6 +420,17 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
         "Confirmation 123. Please keep it."
     )
 
+    later_sequence = sanitize_spoken_text(
+        "Remaining choices: 3. soup 4. salad."
+    )
+    assert later_sequence == "Remaining choices: 3, soup 4, salad."
+    assert spoken_text_violations(later_sequence) == ()
+
+    grounded_numbers = (
+        "Confirmation 123. Pickup is 7:00. We're open 5 - 10 p.m."
+    )
+    assert sanitize_spoken_text(grounded_numbers) == grounded_numbers
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -467,6 +478,37 @@ def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     setext = json.loads(handler._response_event(78, setext_text, complete=True))
     assert setext["content"] == "Today's specials\nHearth Burger."
     assert spoken_text_violations(setext["content"]) == ()
+
+    for response_id, marker in enumerate(("-", "--"), start=79):
+        short_setext_text = f"Today's specials\n{marker}\nHearth Burger."
+        assert "markdown" in spoken_text_violations(short_setext_text)
+        short_setext = json.loads(
+            handler._response_event(response_id, short_setext_text, complete=True)
+        )
+        assert short_setext["content"] == "Today's specials\nHearth Burger."
+        assert spoken_text_violations(short_setext["content"]) == ()
+
+    nested_quote_text = ">>Today's special is Hearth Burger."
+    assert "markdown" in spoken_text_violations(nested_quote_text)
+    nested_quote = json.loads(
+        handler._response_event(81, nested_quote_text, complete=True)
+    )
+    assert nested_quote["content"] == "Today's special is Hearth Burger."
+    assert spoken_text_violations(nested_quote["content"]) == ()
+
+    fenced_text = "~~~menu\nToday's special is Hearth Burger.\n~~~"
+    assert "markdown" in spoken_text_violations(fenced_text)
+    fenced = json.loads(handler._response_event(82, fenced_text, complete=True))
+    assert fenced["content"] == "Today's special is Hearth Burger.\n"
+    assert spoken_text_violations(fenced["content"]) == ()
+
+    single_glyph_text = "Today's side is • fries."
+    assert "markdown" in spoken_text_violations(single_glyph_text)
+    single_glyph = json.loads(
+        handler._response_event(83, single_glyph_text, complete=True)
+    )
+    assert single_glyph["content"] == "Today's side is fries."
+    assert spoken_text_violations(single_glyph["content"]) == ()
 
 
 def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
