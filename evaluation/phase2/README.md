@@ -47,6 +47,8 @@ authorized clone evidence to justify adoption.
 
 ## Run evidence
 
+Starting SHA: `b34211f0b1b6f570c8612daa3e69dc36d084d0be`.
+
 The combined focused and affected-suite validation command for this run was:
 
 ```sh

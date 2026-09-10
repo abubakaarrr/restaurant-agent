@@ -456,6 +456,18 @@ def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     assert blockquote["content"] == "Today's special"
     assert spoken_text_violations(blockquote["content"]) == ()
 
+    glyph_text = "Options: • fries • salad."
+    assert "markdown" in spoken_text_violations(glyph_text)
+    glyphs = json.loads(handler._response_event(77, glyph_text, complete=True))
+    assert glyphs["content"] == "Options: fries. salad."
+    assert spoken_text_violations(glyphs["content"]) == ()
+
+    setext_text = "Today's specials\n===\nHearth Burger."
+    assert "markdown" in spoken_text_violations(setext_text)
+    setext = json.loads(handler._response_event(78, setext_text, complete=True))
+    assert setext["content"] == "Today's specials\nHearth Burger."
+    assert spoken_text_violations(setext["content"]) == ()
+
 
 def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
     plain = SpokenTextBuffer()
@@ -483,17 +495,17 @@ def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
     assert all(spoken_text_violations(part) == () for part in delivered)
 
     inline = SpokenTextBuffer()
-    assert inline.feed("You can choose - crispy fries") == ()
+    assert inline.feed("You can choose - crispy fries.") == ()
     inline_delivery = inline.feed(" - salad.")
     assert "".join((*inline_delivery, *inline.flush())) == (
         "You can choose. crispy fries. salad."
     )
 
     ordered = SpokenTextBuffer()
-    assert ordered.feed("You can choose 1. burger") == ()
+    assert ordered.feed("You can choose 1. burger.") == ()
     ordered_delivery = ordered.feed(" 2. salad.")
     assert "".join((*ordered_delivery, *ordered.flush())) == (
-        "You can choose 1, burger 2, salad."
+        "You can choose 1, burger. 2, salad."
     )
 
 

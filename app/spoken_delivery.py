@@ -20,6 +20,7 @@ _MARKDOWN_LINE = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?|```)")
 _MARKDOWN_THEMATIC_BREAK = re.compile(
     r"(?m)^[ \t]*(?:[-*_][ \t]*){3,}[ \t]*(?:\n|$)"
 )
+_MARKDOWN_SETEXT_UNDERLINE = re.compile(r"(?m)^[ \t]*=+[ \t]*(?:\n|$)")
 _MARKDOWN_LINK = re.compile(r"!?\[([^\]]+)\]\([^)]+\)")
 _MARKDOWN_INLINE = re.compile(
     r"(?:\*\*|__|~~)(?=\S)|(?<=\S)(?:\*\*|__|~~)|"
@@ -27,7 +28,7 @@ _MARKDOWN_INLINE = re.compile(
     r"(?<![\w_])_(?=\S)|(?<=\S)_(?![\w_])|`"
 )
 _URL = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
-_UNORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)([-*+])[ \t]+")
+_UNORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)([-*+•◦‣])[ \t]+")
 _ORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)(\d+)([.)])[ \t]+")
 _STREAM_BOUNDARY = re.compile(r"\s+")
 _COMPLETE_SEGMENT = re.compile(r"[.!?][\s]*$")
@@ -129,6 +130,7 @@ def sanitize_spoken_text(text: str) -> str:
     value = str(text or "")
     value = _MARKDOWN_LINK.sub(lambda match: match.group(1), value)
     value = _MARKDOWN_THEMATIC_BREAK.sub("", value)
+    value = _MARKDOWN_SETEXT_UNDERLINE.sub("", value)
     value = _MARKDOWN_LINE.sub("", value)
     value = _MARKDOWN_INLINE.sub("", value)
     unordered = _unordered_list_matches(value)
@@ -167,6 +169,7 @@ def spoken_text_violations(text: str, *, max_words: int = 60) -> tuple[str, ...]
     if (
         _MARKDOWN_LINE.search(value)
         or _MARKDOWN_THEMATIC_BREAK.search(value)
+        or _MARKDOWN_SETEXT_UNDERLINE.search(value)
         or _MARKDOWN_LINK.search(value)
         or _MARKDOWN_INLINE.search(value)
         or _unordered_list_matches(value)
@@ -203,22 +206,25 @@ class SpokenTextBuffer:
         return (spoken,) if spoken else ()
 
     def _safe_prefix_end(self) -> int:
+        unordered_candidates = _unordered_list_candidates(self.pending)
+        unordered_matches = _unordered_list_matches(self.pending)
         ordered_candidates = list(_ORDERED_LIST_MARKER.finditer(self.pending))
         possible_ordered_list = bool(
             ordered_candidates and int(ordered_candidates[0].group(2)) == 1
         )
-        if (
-            _unordered_list_candidates(self.pending)
-            or _ordered_list_matches(self.pending)
-            or possible_ordered_list
+        ordered_matches = _ordered_list_matches(self.pending)
+        if (unordered_candidates and not unordered_matches) or (
+            possible_ordered_list and not ordered_matches
         ):
+            return 0
+        if unordered_matches or ordered_matches:
             return len(self.pending) if _COMPLETE_SEGMENT.search(self.pending) else 0
         boundaries = list(_STREAM_BOUNDARY.finditer(self.pending))
         if len(boundaries) < 2:
             return 0
         end = boundaries[-2].end()
         remainder = self.pending[end:].lstrip()
-        if re.match(r"(?:[-*+]\s|\d+[.)]\s|[*_~`]|\[)", remainder):
+        if re.match(r"(?:[-*+•◦‣]\s|\d+[.)]\s|[*_~`]|\[)", remainder):
             return 0
         prefix = self.pending[:end]
         open_positions: list[int] = []
