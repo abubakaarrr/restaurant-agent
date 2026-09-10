@@ -56,11 +56,13 @@ _ORDERED_LIST_CONTEXT = re.compile(
     r"\b(?:"
     r"(?:can\s+)?choose|"
     r"choices?(?:\s+are)?|"
+    r"(?:i\s+)?recommend|"
+    r"order|"
     r"options?(?:\s+are)?|"
     r"remaining(?:\s+(?:choices?|options?|items?))?(?:\s+are)?|"
     r"sides?(?:\s+are)?|"
     r"selections?(?:\s+are)?"
-    r")\s*$",
+    r")\s*:?\s*$",
     re.IGNORECASE,
 )
 _RANGE_WORDS = {
@@ -135,7 +137,7 @@ def _ordered_list_has_context(value: str, match: re.Match[str]) -> bool:
     if _CONFIRMATION_CONTEXT.search(before):
         return False
     clause = re.split(r"(?:[.!?][ \t]+|\n)", before)[-1].strip()
-    return clause.endswith(":") or bool(_ORDERED_LIST_CONTEXT.search(clause))
+    return bool(_ORDERED_LIST_CONTEXT.search(clause))
 
 
 def _ordered_item_fragment(
@@ -151,24 +153,7 @@ def _ordered_item_has_transition(fragment: str) -> bool:
     return bool(re.search(r"[.!?](?:[\"')\]]*)\s+\S", fragment))
 
 
-def _looks_like_ordered_item(fragment: str) -> bool:
-    item = fragment.strip().rstrip(".!?").strip()
-    if not item or _ordered_item_has_transition(item):
-        return False
-    words = re.findall(r"[A-Za-z]+", item)
-    if not words:
-        return False
-    first_alpha = re.search(r"[A-Za-z]", item)
-    return bool(
-        first_alpha
-        and (
-            first_alpha.group().islower()
-            or all(word[0].isupper() for word in words)
-        )
-    )
-
-
-def _ordered_pair_has_item_structure(
+def _ordered_pair_has_line_structure(
     value: str,
     first: re.Match[str],
     following: re.Match[str],
@@ -178,7 +163,7 @@ def _ordered_pair_has_item_structure(
     fragment = _ordered_item_fragment(value, first, following)
     if not fragment or _ordered_item_has_transition(fragment):
         return False
-    return not following.group(1) or _looks_like_ordered_item(fragment)
+    return not following.group(1)
 
 
 def _ordered_list_matches(value: str) -> list[re.Match[str]]:
@@ -189,7 +174,7 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
         first = candidates[index]
         has_context = _ordered_list_has_context(value, first)
         has_structured_pair = index + 1 < len(candidates) and (
-            _ordered_pair_has_item_structure(
+            _ordered_pair_has_line_structure(
                 value,
                 first,
                 candidates[index + 1],
@@ -226,16 +211,7 @@ def _possible_ordered_list(value: str) -> bool:
     if not candidates:
         clause = re.split(r"(?:[.!?][ \t]+|\n)", value)[-1].strip()
         return bool(_ORDERED_LIST_CONTEXT.search(clause))
-    match = candidates[-1]
-    if _ordered_list_has_context(value, match):
-        return True
-    before = value[: match.start(2)].rstrip()
-    if _CONFIRMATION_CONTEXT.search(before):
-        return False
-    fragment = _ordered_item_fragment(value, match)
-    if not before and not match.group(1):
-        return _looks_like_ordered_item(fragment)
-    return not fragment or _looks_like_ordered_item(fragment)
+    return _ordered_list_has_context(value, candidates[-1])
 
 
 def sanitize_spoken_text(text: str) -> str:
@@ -338,7 +314,7 @@ class SpokenTextBuffer:
             return 0
         end = boundaries[-2].end()
         remainder = self.pending[end:].lstrip()
-        if re.match(r"(?:[-*+•◦‣]\s|\d+[.)]\s|[*_~`]|\[)", remainder):
+        if re.match(r"(?:[-*+•◦‣]\s|[*_~`]|\[)", remainder):
             return 0
         prefix = self.pending[:end]
         open_positions: list[int] = []

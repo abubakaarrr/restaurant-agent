@@ -460,6 +460,20 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     )
     assert spoken_text_violations(recommendation) == ("markdown",)
 
+    pickup_time = "Pickup time: 7. Please arrive early."
+    assert sanitize_spoken_text(pickup_time) == pickup_time
+
+    table_seats = "Table 3. seats more than 4. comfortably."
+    assert sanitize_spoken_text(table_seats) == table_seats
+
+    multiword_recommendation = (
+        "I recommend 3. Tomato soup 4. Caesar salad."
+    )
+    assert sanitize_spoken_text(multiword_recommendation) == (
+        "I recommend 3, Tomato soup 4, Caesar salad."
+    )
+    assert spoken_text_violations(multiword_recommendation) == ("markdown",)
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -633,6 +647,39 @@ def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
     assert "".join((*recommendation_delivery, *recommendation.flush())) == (
         "I recommend 3, soup 4, salad."
     )
+
+    pickup_time = SpokenTextBuffer()
+    pickup_time_delivery = pickup_time.feed(
+        "Pickup time: 7. Please arrive early."
+    )
+    assert pickup_time_delivery
+    assert "".join((*pickup_time_delivery, *pickup_time.flush())) == (
+        "Pickup time: 7. Please arrive early."
+    )
+
+    table_seats = SpokenTextBuffer()
+    table_delivery = table_seats.feed(
+        "Table 3. seats more than 4. comfortably."
+    )
+    assert table_delivery
+    assert "".join((*table_delivery, *table_seats.flush())) == (
+        "Table 3. seats more than 4. comfortably."
+    )
+
+    ordinary_quantity = SpokenTextBuffer()
+    quantity_delivery = ordinary_quantity.feed("We need 3. more chairs.")
+    assert quantity_delivery
+    assert "".join((*quantity_delivery, *ordinary_quantity.flush())) == (
+        "We need 3. more chairs."
+    )
+
+    multiword_recommendation = SpokenTextBuffer()
+    assert multiword_recommendation.feed("I recommend 3.") == ()
+    assert multiword_recommendation.feed(" Tomato soup ") == ()
+    recommendation_delivery = multiword_recommendation.feed("4. Caesar salad.")
+    assert "".join(
+        (*recommendation_delivery, *multiword_recommendation.flush())
+    ) == "I recommend 3, Tomato soup 4, Caesar salad."
 
 
 class ListWebSocket:
