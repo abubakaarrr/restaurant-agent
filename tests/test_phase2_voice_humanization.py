@@ -474,6 +474,20 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     )
     assert spoken_text_violations(multiword_recommendation) == ("markdown",)
 
+    standalone_recommendation = (
+        "I recommend 3. That is enough for your party."
+    )
+    assert sanitize_spoken_text(standalone_recommendation) == (
+        standalone_recommendation
+    )
+    contracted_recommendation = "I recommend 3. That's enough for your party."
+    assert sanitize_spoken_text(contracted_recommendation) == (
+        contracted_recommendation
+    )
+
+    order_number = "Order 3. is ready."
+    assert sanitize_spoken_text(order_number) == order_number
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -680,6 +694,22 @@ def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
     assert "".join(
         (*recommendation_delivery, *multiword_recommendation.flush())
     ) == "I recommend 3, Tomato soup 4, Caesar salad."
+
+    standalone_recommendation = SpokenTextBuffer()
+    standalone_delivery = standalone_recommendation.feed(
+        "I recommend 3. That is enough for your party."
+    )
+    assert "3. That is" in "".join(standalone_delivery)
+    assert "".join(
+        (*standalone_delivery, *standalone_recommendation.flush())
+    ) == "I recommend 3. That is enough for your party."
+
+    order_number = SpokenTextBuffer()
+    order_delivery = order_number.feed("Order 3. is ready.")
+    assert "Order 3. " in "".join(order_delivery)
+    assert "".join((*order_delivery, *order_number.flush())) == (
+        "Order 3. is ready."
+    )
 
 
 class ListWebSocket:

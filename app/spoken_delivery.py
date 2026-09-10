@@ -57,12 +57,20 @@ _ORDERED_LIST_CONTEXT = re.compile(
     r"(?:can\s+)?choose|"
     r"choices?(?:\s+are)?|"
     r"(?:i\s+)?recommend|"
-    r"order|"
     r"options?(?:\s+are)?|"
     r"remaining(?:\s+(?:choices?|options?|items?))?(?:\s+are)?|"
     r"sides?(?:\s+are)?|"
     r"selections?(?:\s+are)?"
     r")\s*:?\s*$",
+    re.IGNORECASE,
+)
+_ORDERED_LIST_ORDER_CONTEXT = re.compile(r"\border\s*:\s*$", re.IGNORECASE)
+_STANDALONE_NUMERIC_SENTENCE = re.compile(
+    r"^(?:"
+    r"(?:that|this|it)(?:'s|\s+(?:is|was|will|has|does))|"
+    r"(?:these|those|they|we|you|i)"
+    r"(?:'(?:re|ll|ve|d)|\s+(?:am|are|were|will|have|do|can|could|should|would))"
+    r")\b.*[.!?]\s*$",
     re.IGNORECASE,
 )
 _RANGE_WORDS = {
@@ -140,6 +148,20 @@ def _ordered_list_has_context(value: str, match: re.Match[str]) -> bool:
     return bool(_ORDERED_LIST_CONTEXT.search(clause))
 
 
+def _ordered_list_has_colon_context(
+    value: str,
+    match: re.Match[str],
+) -> bool:
+    before = value[: match.start(2)].rstrip()
+    if _CONFIRMATION_CONTEXT.search(before):
+        return False
+    clause = re.split(r"(?:[.!?][ \t]+|\n)", before)[-1].strip()
+    return clause.endswith(":") and bool(
+        _ORDERED_LIST_CONTEXT.search(clause)
+        or _ORDERED_LIST_ORDER_CONTEXT.search(clause)
+    )
+
+
 def _ordered_item_fragment(
     value: str,
     match: re.Match[str],
@@ -153,7 +175,7 @@ def _ordered_item_has_transition(fragment: str) -> bool:
     return bool(re.search(r"[.!?](?:[\"')\]]*)\s+\S", fragment))
 
 
-def _ordered_pair_has_line_structure(
+def _ordered_pair_is_sequential(
     value: str,
     first: re.Match[str],
     following: re.Match[str],
@@ -163,7 +185,7 @@ def _ordered_pair_has_line_structure(
     fragment = _ordered_item_fragment(value, first, following)
     if not fragment or _ordered_item_has_transition(fragment):
         return False
-    return not following.group(1)
+    return True
 
 
 def _ordered_list_matches(value: str) -> list[re.Match[str]]:
@@ -173,14 +195,23 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
     while index < len(candidates):
         first = candidates[index]
         has_context = _ordered_list_has_context(value, first)
-        has_structured_pair = index + 1 < len(candidates) and (
-            _ordered_pair_has_line_structure(
+        following = candidates[index + 1] if index + 1 < len(candidates) else None
+        has_sequential_pair = following is not None and (
+            _ordered_pair_is_sequential(
                 value,
                 first,
-                candidates[index + 1],
+                following,
             )
         )
-        if not has_context and not has_structured_pair:
+        starts_inline_list = bool(has_context and has_sequential_pair)
+        starts_line_list = bool(
+            has_sequential_pair and following and not following.group(1)
+        )
+        if not (
+            _ordered_list_has_colon_context(value, first)
+            or starts_inline_list
+            or starts_line_list
+        ):
             index += 1
             continue
         accepted.append(first)
@@ -210,8 +241,17 @@ def _possible_ordered_list(value: str) -> bool:
     candidates = list(_ORDERED_LIST_LOOKAHEAD_MARKER.finditer(value))
     if not candidates:
         clause = re.split(r"(?:[.!?][ \t]+|\n)", value)[-1].strip()
-        return bool(_ORDERED_LIST_CONTEXT.search(clause))
-    return _ordered_list_has_context(value, candidates[-1])
+        return bool(
+            _ORDERED_LIST_CONTEXT.search(clause)
+            or _ORDERED_LIST_ORDER_CONTEXT.search(clause)
+        )
+    match = candidates[-1]
+    if _ordered_list_has_colon_context(value, match):
+        return True
+    if not _ordered_list_has_context(value, match):
+        return False
+    fragment = _ordered_item_fragment(value, match)
+    return not _STANDALONE_NUMERIC_SENTENCE.match(fragment)
 
 
 def sanitize_spoken_text(text: str) -> str:
