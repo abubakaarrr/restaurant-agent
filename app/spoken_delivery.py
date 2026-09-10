@@ -35,6 +35,9 @@ _MARKDOWN_INLINE = re.compile(
 _URL = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
 _UNORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)([-*+•◦‣])[ \t]+")
 _ORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)(\d+)([.)])[ \t]+")
+_ORDERED_LIST_LOOKAHEAD_MARKER = re.compile(
+    r"(?m)(^|[ \t]+)(\d+)(?:[.)](?:[ \t]+|$)|(?=[ \t]*$))"
+)
 _STREAM_BOUNDARY = re.compile(r"\s+")
 _COMPLETE_SEGMENT = re.compile(r"[.!?][\s]*$")
 _RANGE_VALUE = re.compile(r"\d+(?::\d+)?(?:\.\d+)?$")
@@ -46,7 +49,19 @@ _TIME_RIGHT = re.compile(
     re.IGNORECASE,
 )
 _CONFIRMATION_CONTEXT = re.compile(
-    r"\bconfirmation(?:\s+(?:number|code))?\s*:?\s*$", re.IGNORECASE
+    r"\bconfirmation(?:\s+(?:number|code))?(?:\s+is)?\s*:?\s*$",
+    re.IGNORECASE,
+)
+_ORDERED_LIST_CONTEXT = re.compile(
+    r"\b(?:"
+    r"(?:can\s+)?choose|"
+    r"choices?(?:\s+are)?|"
+    r"options?(?:\s+are)?|"
+    r"remaining(?:\s+(?:choices?|options?|items?))?(?:\s+are)?|"
+    r"sides?(?:\s+are)?|"
+    r"selections?(?:\s+are)?"
+    r")\s*$",
+    re.IGNORECASE,
 )
 _RANGE_WORDS = {
     "monday",
@@ -115,30 +130,49 @@ def _unordered_list_matches(value: str) -> list[re.Match[str]]:
     return []
 
 
-def _ordered_list_matches(value: str) -> list[re.Match[str]]:
-    matches = list(_ORDERED_LIST_MARKER.finditer(value))
-    if not matches:
-        return []
-    first = matches[0]
-    before = value[: first.start(2)].rstrip()
-    first_label = int(first.group(2))
-    accepted = [first]
-    expected = first_label + 1
-    for match in matches[1:]:
-        label = int(match.group(2))
-        if label != expected:
-            break
-        accepted.append(match)
-        expected += 1
+def _ordered_list_starts_at(value: str, match: re.Match[str]) -> bool:
+    before = value[: match.start(2)].rstrip()
     if _CONFIRMATION_CONTEXT.search(before):
-        return []
-    starts_like_list = (
-        not before
-        or not first.group(1)
-        or before.endswith(":")
-        or len(accepted) >= 2
+        return False
+    if not before or not match.group(1):
+        return True
+    clause = re.split(r"(?:[.!?][ \t]+|\n)", before)[-1].strip()
+    return clause.endswith(":") or bool(_ORDERED_LIST_CONTEXT.search(clause))
+
+
+def _possible_ordered_list(value: str) -> bool:
+    clause = re.split(r"(?:[.!?][ \t]+|\n)", value)[-1].strip()
+    if _ORDERED_LIST_CONTEXT.search(clause):
+        return True
+    return any(
+        _ordered_list_starts_at(value, match)
+        for match in _ORDERED_LIST_LOOKAHEAD_MARKER.finditer(value)
     )
-    return accepted if starts_like_list else []
+
+
+def _ordered_list_matches(value: str) -> list[re.Match[str]]:
+    candidates = list(_ORDERED_LIST_MARKER.finditer(value))
+    accepted: list[re.Match[str]] = []
+    index = 0
+    while index < len(candidates):
+        first = candidates[index]
+        if not _ordered_list_starts_at(value, first):
+            index += 1
+            continue
+        accepted.append(first)
+        expected = int(first.group(2)) + 1
+        index += 1
+        while index < len(candidates):
+            match = candidates[index]
+            before = value[: match.start(2)].rstrip()
+            if _CONFIRMATION_CONTEXT.search(before):
+                break
+            if int(match.group(2)) != expected:
+                break
+            accepted.append(match)
+            expected += 1
+            index += 1
+    return accepted
 
 
 def sanitize_spoken_text(text: str) -> str:
@@ -229,12 +263,10 @@ class SpokenTextBuffer:
         unordered_candidates = _unordered_list_candidates(self.pending)
         unordered_matches = _unordered_list_matches(self.pending)
         ordered_candidates = list(_ORDERED_LIST_MARKER.finditer(self.pending))
-        possible_ordered_list = bool(
-            ordered_candidates and int(ordered_candidates[0].group(2)) == 1
-        )
+        possible_ordered_list = _possible_ordered_list(self.pending)
         ordered_matches = _ordered_list_matches(self.pending)
         if (unordered_candidates and not unordered_matches) or (
-            possible_ordered_list and not ordered_matches
+            possible_ordered_list and len(ordered_matches) < 2
         ):
             return 0
         if unordered_matches or ordered_matches:

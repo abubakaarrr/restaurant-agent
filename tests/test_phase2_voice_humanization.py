@@ -431,6 +431,19 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     )
     assert sanitize_spoken_text(grounded_numbers) == grounded_numbers
 
+    confirmation_then_list = (
+        "Confirmation 123. Remaining choices are 3. soup 4. salad."
+    )
+    assert sanitize_spoken_text(confirmation_then_list) == (
+        "Confirmation 123. Remaining choices are 3, soup 4, salad."
+    )
+
+    numeric_sentences = (
+        "We open at 3. Dinner begins at 4. Happy hour ends at 5. "
+        "Please arrive early."
+    )
+    assert sanitize_spoken_text(numeric_sentences) == numeric_sentences
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -548,6 +561,38 @@ def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
     ordered_delivery = ordered.feed(" 2. salad.")
     assert "".join((*ordered_delivery, *ordered.flush())) == (
         "You can choose 1, burger. 2, salad."
+    )
+
+    later_ordered = SpokenTextBuffer()
+    assert later_ordered.feed("Remaining choices are ") == ()
+    assert later_ordered.feed("3.") == ()
+    assert later_ordered.feed(" soup ") == ()
+    later_delivery = later_ordered.feed("4. salad.")
+    assert "".join((*later_delivery, *later_ordered.flush())) == (
+        "Remaining choices are 3, soup 4, salad."
+    )
+
+    confirmation_then_ordered = SpokenTextBuffer()
+    assert confirmation_then_ordered.feed(
+        "Confirmation 123. Remaining choices are 3. soup "
+    ) == ()
+    confirmation_delivery = confirmation_then_ordered.feed("4. salad.")
+    assert "".join(
+        (*confirmation_delivery, *confirmation_then_ordered.flush())
+    ) == "Confirmation 123. Remaining choices are 3, soup 4, salad."
+
+    numeric_speech = SpokenTextBuffer()
+    numeric_chunks = (
+        "We open at 3. Dinner begins at 4. ",
+        "Happy hour ends at 5. Please arrive early.",
+    )
+    numeric_delivery = [
+        part for chunk in numeric_chunks for part in numeric_speech.feed(chunk)
+    ]
+    numeric_delivery.extend(numeric_speech.flush())
+    assert "".join(numeric_delivery) == (
+        "We open at 3. Dinner begins at 4. Happy hour ends at 5. "
+        "Please arrive early."
     )
 
 
