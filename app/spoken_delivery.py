@@ -17,6 +17,9 @@ INCOMPLETE_INPUT_REPLY = "Sorry, I didn't catch that. What can I help with?"
 FRUSTRATION_REPLY = "You're right—I missed that. What should I fix?"
 
 _MARKDOWN_LINE = re.compile(r"(?m)^\s*(?:#{1,6}\s|>\s|```)")
+_MARKDOWN_THEMATIC_BREAK = re.compile(
+    r"(?m)^[ \t]*(?:[-*_][ \t]*){3,}[ \t]*(?:\n|$)"
+)
 _MARKDOWN_LINK = re.compile(r"!?\[([^\]]+)\]\([^)]+\)")
 _MARKDOWN_INLINE = re.compile(
     r"(?:\*\*|__|~~)(?=\S)|(?<=\S)(?:\*\*|__|~~)|"
@@ -64,6 +67,14 @@ def _range_separator(value: str, match: re.Match[str]) -> bool:
     return bool(
         (_RANGE_VALUE.fullmatch(left) and _RANGE_VALUE.fullmatch(right))
         or (left in _RANGE_WORDS and right in _RANGE_WORDS)
+        or (
+            re.search(
+                r"\b\d{1,2}(?::\d{2})?\s*[ap]\.m\.$",
+                value[: match.start(2)].rstrip(),
+                re.IGNORECASE,
+            )
+            and _RANGE_VALUE.fullmatch(right)
+        )
     )
 
 
@@ -71,14 +82,13 @@ def _unordered_list_matches(value: str) -> list[re.Match[str]]:
     matches = list(_UNORDERED_LIST_MARKER.finditer(value))
     if not matches:
         return []
-    match = matches[0]
+    candidates = [match for match in matches if not _range_separator(value, match)]
+    if not candidates:
+        return []
+    match = candidates[0]
     before = value[: match.start(2)].rstrip()
-    if not before or before.endswith(":") or not match.group(1):
-        return [
-            candidate
-            for candidate in matches
-            if not _range_separator(value, candidate)
-        ]
+    if len(candidates) >= 2 or not before or before.endswith(":") or not match.group(1):
+        return candidates
     return []
 
 
@@ -111,6 +121,7 @@ def sanitize_spoken_text(text: str) -> str:
     """Remove written formatting without deleting grounded numeric values."""
     value = str(text or "")
     value = _MARKDOWN_LINK.sub(lambda match: match.group(1), value)
+    value = _MARKDOWN_THEMATIC_BREAK.sub("", value)
     value = _MARKDOWN_LINE.sub("", value)
     value = _MARKDOWN_INLINE.sub("", value)
     unordered = _unordered_list_matches(value)
@@ -148,6 +159,7 @@ def spoken_text_violations(text: str, *, max_words: int = 60) -> tuple[str, ...]
         violations.append("empty")
     if (
         _MARKDOWN_LINE.search(value)
+        or _MARKDOWN_THEMATIC_BREAK.search(value)
         or _MARKDOWN_LINK.search(value)
         or _MARKDOWN_INLINE.search(value)
         or _unordered_list_matches(value)

@@ -395,6 +395,17 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     assert "5. 10" not in cleaned_mixed
     assert spoken_text_violations(cleaned_mixed) == ()
 
+    inline = sanitize_spoken_text("You can choose - fries - salad.")
+    assert inline == "You can choose. fries. salad."
+    assert spoken_text_violations(inline) == ()
+
+    meal_periods = sanitize_spoken_text(
+        "Hours: - lunch, 11 a.m. - 2 p.m. - dinner."
+    )
+    assert meal_periods == "Hours: lunch, 11 a.m. - 2 p.m. dinner."
+    assert ".." not in meal_periods
+    assert spoken_text_violations(meal_periods) == ()
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -410,6 +421,18 @@ def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     emphasis = json.loads(handler._response_event(73, "_Special_", complete=True))
     assert emphasis["content"] == "Special"
     assert spoken_text_violations(emphasis["content"]) == ()
+
+    inline = json.loads(
+        handler._response_event(74, "You can choose - fries - salad.", complete=True)
+    )
+    assert inline["content"] == "You can choose. fries. salad."
+    assert spoken_text_violations(inline["content"]) == ()
+
+    thematic_text = "Today's specials\n---\nHearth Burger."
+    assert "markdown" in spoken_text_violations(thematic_text)
+    thematic = json.loads(handler._response_event(75, thematic_text, complete=True))
+    assert thematic["content"] == "Today's specials\nHearth Burger."
+    assert spoken_text_violations(thematic["content"]) == ()
 
 
 def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
