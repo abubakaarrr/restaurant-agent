@@ -406,6 +406,20 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     assert ".." not in meal_periods
     assert spoken_text_violations(meal_periods) == ()
 
+    uppercase_hours = sanitize_spoken_text(
+        "Hours: - Tuesday, 11:30 AM - 10 PM - Friday."
+    )
+    assert "11:30 AM - 10 PM" in uppercase_hours
+    assert "11:30 AM. 10 PM" not in uppercase_hours
+    assert spoken_text_violations(uppercase_hours) == ()
+
+    inline_ordered = sanitize_spoken_text("You can choose 1. burger 2. salad.")
+    assert inline_ordered == "You can choose 1, burger 2, salad."
+    assert spoken_text_violations(inline_ordered) == ()
+    assert "Confirmation 123." in sanitize_spoken_text(
+        "Confirmation 123. Please keep it."
+    )
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -434,6 +448,14 @@ def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     assert thematic["content"] == "Today's specials\nHearth Burger."
     assert spoken_text_violations(thematic["content"]) == ()
 
+    blockquote_text = ">Today's special"
+    assert "markdown" in spoken_text_violations(blockquote_text)
+    blockquote = json.loads(
+        handler._response_event(76, blockquote_text, complete=True)
+    )
+    assert blockquote["content"] == "Today's special"
+    assert spoken_text_violations(blockquote["content"]) == ()
+
 
 def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
     plain = SpokenTextBuffer()
@@ -459,6 +481,20 @@ def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
 
     assert "".join(delivered) == "Options: Fries. Salad. Special. See our menu."
     assert all(spoken_text_violations(part) == () for part in delivered)
+
+    inline = SpokenTextBuffer()
+    assert inline.feed("You can choose - crispy fries") == ()
+    inline_delivery = inline.feed(" - salad.")
+    assert "".join((*inline_delivery, *inline.flush())) == (
+        "You can choose. crispy fries. salad."
+    )
+
+    ordered = SpokenTextBuffer()
+    assert ordered.feed("You can choose 1. burger") == ()
+    ordered_delivery = ordered.feed(" 2. salad.")
+    assert "".join((*ordered_delivery, *ordered.flush())) == (
+        "You can choose 1, burger 2, salad."
+    )
 
 
 class ListWebSocket:

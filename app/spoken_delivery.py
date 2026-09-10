@@ -16,7 +16,7 @@ MANAGER_TRANSFER_UNAVAILABLE_REPLY = (
 INCOMPLETE_INPUT_REPLY = "Sorry, I didn't catch that. What can I help with?"
 FRUSTRATION_REPLY = "You're right—I missed that. What should I fix?"
 
-_MARKDOWN_LINE = re.compile(r"(?m)^\s*(?:#{1,6}\s|>\s|```)")
+_MARKDOWN_LINE = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?|```)")
 _MARKDOWN_THEMATIC_BREAK = re.compile(
     r"(?m)^[ \t]*(?:[-*_][ \t]*){3,}[ \t]*(?:\n|$)"
 )
@@ -32,6 +32,13 @@ _ORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)(\d+)([.)])[ \t]+")
 _STREAM_BOUNDARY = re.compile(r"\s+")
 _COMPLETE_SEGMENT = re.compile(r"[.!?][\s]*$")
 _RANGE_VALUE = re.compile(r"\d+(?::\d+)?(?:\.\d+)?$")
+_MERIDIEM_TIME_LEFT = re.compile(
+    r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?m\.?$", re.IGNORECASE
+)
+_TIME_RIGHT = re.compile(
+    r"^\s*\d{1,2}(?::\d{2})?(?:\s*[ap]\.?m\.?)?(?=\s|$|[,.;])",
+    re.IGNORECASE,
+)
 _RANGE_WORDS = {
     "monday",
     "tuesday",
@@ -68,21 +75,22 @@ def _range_separator(value: str, match: re.Match[str]) -> bool:
         (_RANGE_VALUE.fullmatch(left) and _RANGE_VALUE.fullmatch(right))
         or (left in _RANGE_WORDS and right in _RANGE_WORDS)
         or (
-            re.search(
-                r"\b\d{1,2}(?::\d{2})?\s*[ap]\.m\.$",
-                value[: match.start(2)].rstrip(),
-                re.IGNORECASE,
-            )
-            and _RANGE_VALUE.fullmatch(right)
+            _MERIDIEM_TIME_LEFT.search(value[: match.start(2)].rstrip())
+            and _TIME_RIGHT.match(value[match.end(2) :])
         )
     )
 
 
+def _unordered_list_candidates(value: str) -> list[re.Match[str]]:
+    return [
+        match
+        for match in _UNORDERED_LIST_MARKER.finditer(value)
+        if not _range_separator(value, match)
+    ]
+
+
 def _unordered_list_matches(value: str) -> list[re.Match[str]]:
-    matches = list(_UNORDERED_LIST_MARKER.finditer(value))
-    if not matches:
-        return []
-    candidates = [match for match in matches if not _range_separator(value, match)]
+    candidates = _unordered_list_candidates(value)
     if not candidates:
         return []
     match = candidates[0]
@@ -99,13 +107,6 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
     first = matches[0]
     before = value[: first.start(2)].rstrip()
     first_label = int(first.group(2))
-    starts_like_list = (
-        not before
-        or not first.group(1)
-        or (before.endswith(":") and first_label == 1)
-    )
-    if not starts_like_list:
-        return []
     accepted = [first]
     expected = first_label + 1
     for match in matches[1:]:
@@ -114,7 +115,13 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
             break
         accepted.append(match)
         expected += 1
-    return accepted
+    starts_like_list = (
+        not before
+        or not first.group(1)
+        or (before.endswith(":") and first_label == 1)
+        or (first_label == 1 and len(accepted) >= 2)
+    )
+    return accepted if starts_like_list else []
 
 
 def sanitize_spoken_text(text: str) -> str:
@@ -196,7 +203,15 @@ class SpokenTextBuffer:
         return (spoken,) if spoken else ()
 
     def _safe_prefix_end(self) -> int:
-        if _unordered_list_matches(self.pending) or _ordered_list_matches(self.pending):
+        ordered_candidates = list(_ORDERED_LIST_MARKER.finditer(self.pending))
+        possible_ordered_list = bool(
+            ordered_candidates and int(ordered_candidates[0].group(2)) == 1
+        )
+        if (
+            _unordered_list_candidates(self.pending)
+            or _ordered_list_matches(self.pending)
+            or possible_ordered_list
+        ):
             return len(self.pending) if _COMPLETE_SEGMENT.search(self.pending) else 0
         boundaries = list(_STREAM_BOUNDARY.finditer(self.pending))
         if len(boundaries) < 2:
