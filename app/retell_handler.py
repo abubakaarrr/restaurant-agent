@@ -19,6 +19,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from app.agent.runner import stream_agent_tokens
 from app.behavior import (
     BehaviorControl,
+    BehaviorReduction,
     BehaviorState,
     TurnObservation,
     reduce_behavior,
@@ -149,15 +150,14 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
     latest_transcript: list[dict[str, Any]] = []
     greeting_sent = False
 
-    async def apply_behavior(
+    def stage_behavior(
         turn: dict[str, Any],
         *,
         reminder: bool = False,
         interrupted: bool = False,
-    ):
-        nonlocal behavior_state, last_agent_controls
+    ) -> BehaviorReduction:
         words = tuple(turn.get("words") or ())
-        reduction = reduce_behavior(
+        return reduce_behavior(
             behavior_state,
             TurnObservation(
                 text=str(turn.get("content") or ""),
@@ -166,10 +166,21 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 interrupted=interrupted,
             ),
         )
+
+    async def commit_behavior(
+        response_id: int, reduction: BehaviorReduction
+    ) -> bool:
+        nonlocal behavior_state, last_agent_controls
+        if not response_allowed(response_id, "behavior_commit"):
+            return False
         behavior_state = reduction.state
         asyncio.create_task(save_behavior_state(call_id, behavior_state))
         controls = reduction.directive.to_retell_controls()
-        if controls != last_agent_controls and reduction.directive.control is BehaviorControl.CONTINUE:
+        if (
+            controls != last_agent_controls
+            and reduction.directive.control is BehaviorControl.CONTINUE
+            and response_gate.allows(response_id)
+        ):
             await send(
                 _agent_update_event(
                     responsiveness=float(controls["responsiveness"]),
@@ -179,8 +190,9 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     reminder_trigger_ms=int(controls["reminder_trigger_ms"]),
                 )
             )
-            last_agent_controls = controls
-        return reduction.directive
+            if response_gate.allows(response_id):
+                last_agent_controls = controls
+        return True
 
     async def cancel_current(reason: str) -> None:
         nonlocal current_task, current_response_id
@@ -242,14 +254,14 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     no_interruption_allowed=no_interruption_allowed,
                 )
             )
-        return True
+        return response_allowed(response_id, f"{stage}_post_send")
 
     async def run_turn(
         response_id: int,
         user_text: str,
         behavior_directive: str = "",
         caller_turn: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         started = time.monotonic()
         first_chunk_sent = False
         completed = False
@@ -272,7 +284,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                         stage="stream_chunk",
                     )
                     if not delivered:
-                        return
+                        return False
                     if not first_chunk_sent:
                         first_chunk_sent = True
                         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -291,7 +303,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     stage="stream_flush",
                 )
                 if not delivered:
-                    return
+                    return False
                 if not first_chunk_sent:
                     first_chunk_sent = True
                     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -303,7 +315,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     )
 
             if not response_allowed(response_id, "completion"):
-                return
+                return False
             control = consume_call_control(call_id)
             end_call = bool(control and control.action == "end")
             transfer_number = ""
@@ -325,7 +337,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 stage="completion",
             )
             if not completed:
-                return
+                return False
             _record_background(
                 call_id,
                 "response_complete",
@@ -378,6 +390,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                         complete=True,
                         stage="finalizer",
                     )
+        return completed
 
     async def process_interaction(
         message: dict[str, Any],
@@ -391,24 +404,28 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
         try:
             interaction = message.get("interaction_type")
             if interaction == "reminder_required":
-                reminder_count += 1
-                directive = await apply_behavior(
+                next_reminder_count = reminder_count + 1
+                reduction = stage_behavior(
                     {"content": "", "words": []},
                     reminder=True,
                     interrupted=was_interrupted,
                 )
-                await send_response(
+                directive = reduction.directive
+                delivered = await send_response(
                     response_id,
                     directive.direct_reply or "Are you still there?",
                     complete=True,
                     end_call=directive.control is BehaviorControl.END_CALL,
                     stage="reminder",
                 )
+                if not delivered or not await commit_behavior(response_id, reduction):
+                    return
+                reminder_count = next_reminder_count
                 _record_background(
                     call_id,
                     "silence_reminder",
                     response_id=response_id,
-                    payload={"count": reminder_count},
+                    payload={"count": next_reminder_count},
                 )
                 return
 
@@ -455,16 +472,17 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 )
                 return
 
-            directive = await apply_behavior(
+            reduction = stage_behavior(
                 user_turn,
                 interrupted=was_interrupted,
             )
+            directive = reduction.directive
             if not response_allowed(response_id, "behavior"):
                 return
             if directive.locale and not _locale_supported(directive.locale):
                 transfer_number = current_staff_transfer_number()
                 can_transfer = bool(transfer_number)
-                await send_response(
+                delivered = await send_response(
                     response_id,
                     (
                         "I'm sorry, I don't support that language reliably yet. "
@@ -479,11 +497,13 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     no_interruption_allowed=can_transfer,
                     stage="locale_reply",
                 )
+                if delivered:
+                    await commit_behavior(response_id, reduction)
                 return
 
             if directive.direct_reply is not None:
                 transfer_number = directive.transfer_number
-                await send_response(
+                delivered = await send_response(
                     response_id,
                     directive.direct_reply,
                     complete=True,
@@ -492,6 +512,8 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     no_interruption_allowed=bool(transfer_number),
                     stage="behavior_reply",
                 )
+                if delivered:
+                    await commit_behavior(response_id, reduction)
                 return
 
             _record_background(
@@ -499,12 +521,14 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 "response_requested",
                 response_id=response_id,
             )
-            await run_turn(
+            completed = await run_turn(
                 response_id,
                 user_text,
                 directive.prompt_instruction,
                 caller_turn,
             )
+            if completed:
+                await commit_behavior(response_id, reduction)
         finally:
             if not response_gate.allows(response_id):
                 clear_call_control(call_id, str(response_id))

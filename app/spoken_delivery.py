@@ -20,12 +20,51 @@ _MARKDOWN_LINE = re.compile(r"(?m)^\s*(?:#{1,6}\s|>\s|```)")
 _MARKDOWN_LINK = re.compile(r"!?\[([^\]]+)\]\([^)]+\)")
 _MARKDOWN_INLINE = re.compile(
     r"(?:\*\*|__|~~)(?=\S)|(?<=\S)(?:\*\*|__|~~)|"
-    r"(?<!\*)\*(?=\S)|(?<=\S)\*(?!\*)|`"
+    r"(?<!\*)\*(?=\S)|(?<=\S)\*(?!\*)|"
+    r"(?<![\w_])_(?=\S)|(?<=\S)_(?![\w_])|`"
 )
 _URL = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
 _UNORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)([-*+])[ \t]+")
 _ORDERED_LIST_MARKER = re.compile(r"(?m)(^|[ \t]+)(\d+)([.)])[ \t]+")
-_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+_STREAM_BOUNDARY = re.compile(r"\s+")
+_COMPLETE_SEGMENT = re.compile(r"[.!?][\s]*$")
+_RANGE_VALUE = re.compile(r"\d+(?::\d+)?(?:\.\d+)?$")
+_RANGE_WORDS = {
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+}
+
+
+def _range_separator(value: str, match: re.Match[str]) -> bool:
+    if match.group(2) != "-":
+        return False
+    left_match = re.search(r"([\w:.]+)\s*$", value[: match.start(2)])
+    right_match = re.match(r"\s*([\w:.]+)", value[match.end(2) :])
+    if not left_match or not right_match:
+        return False
+    left = left_match.group(1).casefold()
+    right = right_match.group(1).casefold()
+    return bool(
+        (_RANGE_VALUE.fullmatch(left) and _RANGE_VALUE.fullmatch(right))
+        or (left in _RANGE_WORDS and right in _RANGE_WORDS)
+    )
 
 
 def _unordered_list_matches(value: str) -> list[re.Match[str]]:
@@ -35,7 +74,11 @@ def _unordered_list_matches(value: str) -> list[re.Match[str]]:
     match = matches[0]
     before = value[: match.start(2)].rstrip()
     if not before or before.endswith(":") or not match.group(1):
-        return matches
+        return [
+            candidate
+            for candidate in matches
+            if not _range_separator(value, candidate)
+        ]
     return []
 
 
@@ -80,7 +123,7 @@ def sanitize_spoken_text(text: str) -> str:
             before = value[: match.start(2)].rstrip()
             if not before or not match.group(1):
                 return ""
-            return " " if before.endswith(":") else ". "
+            return " " if before.endswith((":", ".", ",", ";")) else ". "
 
         value = _UNORDERED_LIST_MARKER.sub(replace_unordered, value)
 
@@ -141,34 +184,30 @@ class SpokenTextBuffer:
         return (spoken,) if spoken else ()
 
     def _safe_prefix_end(self) -> int:
-        if self._has_open_markdown_construct():
+        if _unordered_list_matches(self.pending) or _ordered_list_matches(self.pending):
+            return len(self.pending) if _COMPLETE_SEGMENT.search(self.pending) else 0
+        boundaries = list(_STREAM_BOUNDARY.finditer(self.pending))
+        if len(boundaries) < 2:
             return 0
-        ordered_markers = {
-            match.start(3) for match in _ORDERED_LIST_MARKER.finditer(self.pending)
-        }
-        matches = [
-            match
-            for match in _SENTENCE_END.finditer(self.pending)
-            if match.start() not in ordered_markers
-        ]
-        if not matches:
+        end = boundaries[-2].end()
+        remainder = self.pending[end:].lstrip()
+        if re.match(r"(?:[-*+]\s|\d+[.)]\s|[*_~`]|\[)", remainder):
             return 0
-        return matches[-1].end()
-
-    def _has_open_markdown_construct(self) -> bool:
-        value = self.pending
-        bracket = value.rfind("[")
-        if bracket > value.rfind("]"):
-            return True
-        link = value.rfind("](")
-        if link >= 0 and link > value.rfind(")"):
-            return True
-        if value.count("`") % 2:
-            return True
-        for marker in ("**", "__", "~~"):
-            if value.count(marker) % 2:
-                return True
-        return False
+        prefix = self.pending[:end]
+        open_positions: list[int] = []
+        bracket = prefix.rfind("[")
+        if bracket > prefix.rfind("]"):
+            open_positions.append(bracket)
+        link = prefix.rfind("](")
+        if link >= 0 and link > prefix.rfind(")"):
+            open_positions.append(link)
+        for marker in ("`", "**", "__", "~~"):
+            if prefix.count(marker) % 2:
+                open_positions.append(prefix.rfind(marker))
+        emphasis = re.search(r"(?<![\w_])_(?=\S)[^_]*$", prefix)
+        if emphasis:
+            open_positions.append(emphasis.start())
+        return min(open_positions, default=end)
 
 
 @dataclass

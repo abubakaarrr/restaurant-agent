@@ -47,22 +47,26 @@ authorized clone evidence to justify adoption.
 
 ## Run evidence
 
-The focused validation command for this run was:
+The combined focused and affected-suite validation command for this run was:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/phase2_voice_evaluation.py \
   --output-dir evaluation/phase2 >/dev/null && \
 PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q \
-  tests/test_phase2_voice_humanization.py
+  tests/test_phase2_voice_humanization.py \
+  tests/test_retell_protocol.py \
+  tests/test_behavior.py \
+  tests/test_stale_reply_extraction.py
 ```
 
-It regenerated all five evaluation artifacts successfully and completed with
-11 passing focused tests. The run prepared 12 local scenarios, 120 turns per
-provider arm, and 120 blinded comparisons. All 12 local scenarios passed with
-zero stale-response incidents. Provider scenario completions, raters, and
-ratings remained zero; clone-audio references, audio and preference results,
-provider latency, errors, timeouts, and fallbacks remained explicitly missing
-or `null`.
+It regenerated all five evaluation artifacts successfully. The focused Phase 2
+tests and the existing Retell protocol, behavior, and stale-reply suites all
+passed: 67 tests in 17.55 seconds. The run prepared 12 local scenarios, 120
+turns per provider arm, and 120 blinded comparisons. All 12 local scenarios
+passed with zero stale-response incidents. Provider scenario completions,
+raters, and ratings remained zero; clone-audio references, audio and preference
+results, provider latency, errors, timeouts, and fallbacks remained explicitly
+missing or `null`.
 
 Changed files relative to the Phase 2 starting commit:
 
@@ -86,6 +90,7 @@ Changed files relative to the Phase 2 starting commit:
 - `scripts/phase2_handler_delivery_trace.py`
 - `scripts/phase2_voice_evaluation.py`
 - `tests/test_phase2_voice_humanization.py`
+- `tests/test_retell_protocol.py`
 
 This run did not access staging or production, enable live writes, call a
 provider or phone, use credentials or recordings, or upload, clone, synthesize,

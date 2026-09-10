@@ -150,6 +150,57 @@ class InterruptingWebSocket:
             self.old_chunk_sent.set()
 
 
+class BehaviorStateInterruptWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.old_send_started = asyncio.Event()
+        self.new_response_complete = asyncio.Event()
+        self.receive_count = 0
+
+    async def receive_text(self) -> str:
+        self.receive_count += 1
+        if self.receive_count == 1:
+            return json.dumps(
+                {
+                    "interaction_type": "response_required",
+                    "response_id": 70,
+                    "transcript": [
+                        {"role": "user", "content": "Connect me to a person"}
+                    ],
+                }
+            )
+        if self.receive_count == 2:
+            await asyncio.wait_for(self.old_send_started.wait(), timeout=1)
+            return json.dumps(
+                {
+                    "interaction_type": "response_required",
+                    "response_id": 71,
+                    "transcript": [
+                        {"role": "user", "content": "Connect me to a person"},
+                        {"role": "user", "content": "What is your address?"},
+                    ],
+                }
+            )
+        await asyncio.wait_for(self.new_response_complete.wait(), timeout=1)
+        raise WebSocketDisconnect()
+
+    async def send_text(self, payload: str) -> None:
+        message = json.loads(payload)
+        if (
+            message.get("response_type") == "response"
+            and message.get("response_id") == 70
+        ):
+            self.old_send_started.set()
+            await asyncio.Event().wait()
+        self.sent.append(payload)
+        if (
+            message.get("response_type") == "response"
+            and message.get("response_id") == 71
+            and message.get("content_complete")
+        ):
+            self.new_response_complete.set()
+
+
 @pytest.mark.asyncio
 async def test_protocol_delivers_no_old_content_after_customer_interruption(
     monkeypatch: pytest.MonkeyPatch,
@@ -195,7 +246,9 @@ async def test_protocol_delivers_no_old_content_after_customer_interruption(
         if json.loads(payload).get("response_type") == "response"
     ]
 
-    first_new = next(index for index, row in enumerate(responses) if row["response_id"] == 71)
+    first_new = next(
+        index for index, row in enumerate(responses) if row["response_id"] == 71
+    )
     assert all(row["response_id"] != 70 for row in responses[first_new:])
     assert not any("STALE CONTENT" in row.get("content", "") for row in responses)
     assert responses[-1]["response_id"] == 71
@@ -210,6 +263,59 @@ async def test_protocol_delivers_no_old_content_after_customer_interruption(
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_behavior_state_does_not_control_the_new_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saved_states: list[BehaviorState] = []
+
+    async def fake_load(_call_id: str) -> BehaviorState:
+        return BehaviorState()
+
+    async def fake_save(_call_id: str, state: BehaviorState) -> None:
+        saved_states.append(state)
+
+    async def fake_caller_turn(*_args, **_kwargs):
+        return {"handled": False, "kind": "caller_turn", "affirmation": None}
+
+    async def fake_stream(*_args, **_kwargs):
+        yield "We're at 1842 Market Street."
+
+    monkeypatch.setattr(handler, "load_behavior_state", fake_load)
+    monkeypatch.setattr(handler, "save_behavior_state", fake_save)
+    monkeypatch.setattr(handler, "process_caller_turn", fake_caller_turn)
+    monkeypatch.setattr(handler, "stream_agent_tokens", fake_stream)
+    monkeypatch.setattr(handler, "_record_background", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "app.behavior.resolve_handoff_destination",
+        lambda _reason: {
+            "owner": "staff",
+            "channel": "voice_transfer",
+            "transfer_number": "+15035550149",
+            "can_transfer": True,
+        },
+    )
+
+    websocket = BehaviorStateInterruptWebSocket()
+    await handler.handle_retell_connection(websocket, "phase2-state-interruption")
+    await asyncio.sleep(0)
+    responses = [
+        json.loads(payload)
+        for payload in websocket.sent
+        if json.loads(payload).get("response_type") == "response"
+    ]
+
+    assert responses
+    assert all(row["response_id"] == 71 for row in responses)
+    assert "1842 Market Street" in "".join(
+        row.get("content", "") for row in responses
+    )
+    assert all("transfer_number" not in row for row in responses)
+    assert all("end_call" not in row for row in responses)
+    assert saved_states
+    assert all(state.terminal_control is None for state in saved_states)
 
 
 @pytest.mark.parametrize("control", ["transfer", "end"])
@@ -283,6 +389,12 @@ def test_spoken_list_sanitizer_preserves_grounded_numbers() -> None:
     hours = "We're open Tuesday - Thursday, 5 - 10 p.m."
     assert sanitize_spoken_text(hours) == hours
 
+    mixed = "Hours: - pickup, 5 - 10 p.m. - delivery"
+    cleaned_mixed = sanitize_spoken_text(mixed)
+    assert "5 - 10 p.m." in cleaned_mixed
+    assert "5. 10" not in cleaned_mixed
+    assert spoken_text_violations(cleaned_mixed) == ()
+
 
 def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     event = json.loads(
@@ -295,8 +407,19 @@ def test_response_transport_sanitizes_inline_unordered_lists() -> None:
     assert event["content"] == "Your sides are: fries. salad"
     assert spoken_text_violations(event["content"]) == ()
 
+    emphasis = json.loads(handler._response_event(73, "_Special_", complete=True))
+    assert emphasis["content"] == "Special"
+    assert spoken_text_violations(emphasis["content"]) == ()
+
 
 def test_stream_buffer_sanitizes_split_markdown_and_list_syntax() -> None:
+    plain = SpokenTextBuffer()
+    assert plain.feed("I") == ()
+    assert plain.feed(" can") == ()
+    early = plain.feed(" help")
+    assert early
+    assert "".join((*early, *plain.feed("."), *plain.flush())) == "I can help."
+
     buffer = SpokenTextBuffer()
     chunks = [
         "Options:",

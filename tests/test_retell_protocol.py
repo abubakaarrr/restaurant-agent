@@ -23,7 +23,7 @@ from app.services.restaurant import restaurant_service
 
 
 class FakeWebSocket:
-    def __init__(self, messages: list[dict], *, disconnect_delay: float = 0.0):
+    def __init__(self, messages: list[dict], *, disconnect_delay: float = 0.05):
         self.messages = [json.dumps(message) for message in messages]
         self.sent: list[str] = []
         self.disconnect_delay = disconnect_delay
