@@ -40,6 +40,7 @@ from app.services.restaurant import (
     format_availability_speech,
     format_menu_price,
     restaurant_service,
+    validate_standard_reservation_party_size,
 )
 from app.transfer_availability import resolve_handoff_destination
 
@@ -238,6 +239,11 @@ async def update_reservation_draft(
     """Save or correct reservation details before a booking exists. Once booking_id is set and status is confirmed, refuse — use update_confirmed_booking with read-back then yes. Pass only fields the caller just gave. Empty string clears that field."""
     session_id = resolve_session_id(session_id)
     await hydrate_call_memory(session_id)
+    if party_size is not None and party_size > 0:
+        try:
+            validate_standard_reservation_party_size(party_size)
+        except RestaurantServiceError as error:
+            return _error_text(error)
     updates: dict = {}
     mapping = {
         "customer_name": name,

@@ -12,6 +12,7 @@ import json
 import logging
 import time
 from contextlib import suppress
+from dataclasses import replace
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -148,7 +149,15 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
     response_gate = ResponseGenerationGate()
     reminder_count = 0
     latest_transcript: list[dict[str, Any]] = []
-    greeting_sent = False
+    greeting_sent = behavior_state.opening_greeting_sent
+
+    async def mark_greeting_sent() -> None:
+        nonlocal behavior_state, greeting_sent
+        greeting_sent = True
+        if behavior_state.opening_greeting_sent:
+            return
+        behavior_state = replace(behavior_state, opening_greeting_sent=True)
+        await save_behavior_state(call_id, behavior_state)
 
     def stage_behavior(
         turn: dict[str, Any],
@@ -362,7 +371,10 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                             + (
                                 "I can connect you with the restaurant team."
                                 if transfer_number
-                                else "I can't transfer right now, but I can take a callback message."
+                                else (
+                                    "I can't transfer right now, but I can take "
+                                    "a callback message."
+                                )
                             )
                         ),
                         complete=True,
@@ -447,7 +459,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     stage="greeting",
                 )
                 if delivered:
-                    greeting_sent = True
+                    await mark_greeting_sent()
                 return
 
             if not user_text:
@@ -459,7 +471,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 )
                 return
 
-            greeting_sent = True
+            await mark_greeting_sent()
             caller_turn = await process_caller_turn(call_id, user_text)
             if not response_allowed(response_id, "caller_turn"):
                 return
@@ -534,6 +546,62 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 clear_call_control(call_id, str(response_id))
             reset_call_control_scope(scope_token)
 
+    async def supervise_interaction(
+        message: dict[str, Any],
+        *,
+        response_id: int,
+        was_interrupted: bool,
+        transcript_snapshot: list[dict[str, Any]],
+    ) -> None:
+        started = time.monotonic()
+        try:
+            await process_interaction(
+                message,
+                response_id=response_id,
+                was_interrupted=was_interrupted,
+                transcript_snapshot=transcript_snapshot,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Retell interaction task error", exc_info=True)
+            completed = False
+            if response_allowed(response_id, "interaction_error_fallback"):
+                with suppress(Exception):
+                    transfer_number = current_staff_transfer_number()
+                    completed = await send_response(
+                        response_id,
+                        (
+                            "I'm sorry, I had a technical issue. "
+                            + (
+                                "I can connect you with the restaurant team."
+                                if transfer_number
+                                else (
+                                    "I can't transfer right now, but I can take "
+                                    "a callback message."
+                                )
+                            )
+                        ),
+                        complete=True,
+                        transfer_number=transfer_number,
+                        stage="interaction_error_fallback",
+                    )
+            _record_background(
+                call_id,
+                "generation_error",
+                response_id=response_id,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                payload={"stage": "interaction_task"},
+            )
+            if not completed and response_gate.allows(response_id):
+                with suppress(Exception):
+                    await send_response(
+                        response_id,
+                        "",
+                        complete=True,
+                        stage="interaction_error_finalizer",
+                    )
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -580,7 +648,7 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             if isinstance(transcript, list):
                 latest_transcript = transcript
             current_task = asyncio.create_task(
-                process_interaction(
+                supervise_interaction(
                     message,
                     response_id=response_id,
                     was_interrupted=was_interrupted,

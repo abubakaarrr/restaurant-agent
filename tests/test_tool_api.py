@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
@@ -66,6 +68,38 @@ def test_managed_caller_turn_endpoint_is_not_exposed(client: TestClient) -> None
         json={"call_id": "managed-call-1", "utterance": "Don't cancel it."},
     )
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("party_size", "expected_code"),
+    [
+        (11, "large_party_route_required"),
+        (25, "large_party_capacity_exceeded"),
+    ],
+)
+def test_managed_draft_rejects_large_party_before_persisting(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    party_size: int,
+    expected_code: str,
+) -> None:
+    hydrate = AsyncMock()
+    persist = AsyncMock(side_effect=AssertionError("large-party draft persisted"))
+    monkeypatch.setattr(tool_api, "hydrate_call_memory", hydrate)
+    monkeypatch.setattr(tool_api.restaurant_service, "persist_call_state", persist)
+
+    response = client.post(
+        "/api/voice-tools/reservations/draft",
+        headers={"X-Voice-Tool-Secret": "test-tool-secret"},
+        json={
+            "call_id": f"managed-large-{party_size}",
+            "party_size": party_size,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == expected_code
+    assert persist.await_count == 0
 
 
 def test_managed_order_notes_endpoint_is_not_exposed(client: TestClient) -> None:
