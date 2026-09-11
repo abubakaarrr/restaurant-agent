@@ -142,7 +142,10 @@ def build_staging_plan(
             f"cd {remote_dir} && "
             f"RESTAURANT_IMAGE_TAG={image_ref} docker compose up -d --no-build db web"
         ),
-        cmd(f"cd {remote_dir} && {migration_cmd}"),
+        cmd(
+            f"cd {remote_dir} && "
+            f"RESTAURANT_IMAGE_TAG={image_ref} docker compose run --rm web {migration_cmd}"
+        ),
         cmd(
             f"cd {remote_dir} && "
             f"RESTAURANT_IMAGE_TAG={image_ref} docker compose run --rm web python db/seed.py"
