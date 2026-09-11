@@ -204,3 +204,56 @@ Application rollback:
 Do not use `docker compose down -v` in production. Releasing a Retell number is
 also destructive and stops ownership/charges; the provisioning script
 intentionally cannot release numbers.
+
+## 10. Staging preparation (dry-run, no mutation by default)
+
+Use this scope after PR review, with explicit Captain approval:
+
+1. Ensure the SSH alias points to staging:
+
+```text
+Host staging
+  HostName 75.119.154.206
+  Port 717
+  User developer
+  # Add identity and hardening here
+```
+
+2. Generate a gated release plan only:
+
+```bash
+python scripts/staging_release.py \
+  --release \
+  --sha <deploy_sha> \
+  --env-file /path/to/.env.staging \
+  --remote-dir /opt/restaurant-agent
+```
+
+`--env-file` must contain concrete values (no placeholders), `APP_ENV=production`,
+`VOICE_LIVE_WRITES_ENABLED=false`, and safe values for CORS/retell fields.
+
+The generated plan:
+
+- captures the running web container image to `releases/<sha>/previous_image.txt`;
+- starts `db` then `web` with immutable image tag
+  `ghcr.io/abubakaarrr/restaurant-agent:<sha>`;
+- runs migrate (`scripts/migrate.py`) and synthetic seed (`db/seed.py`).
+
+To initialize a brand-new DB snapshot only, pass `--bootstrap-db` (normally avoid
+this on staging upgrades).
+
+Smoke checks include:
+
+- `https://agent.servicesground.com/health`
+- remote `docker compose ps web`
+
+Rollback is prepared by reusing `releases/<sha>/previous_image.txt`:
+
+```bash
+cat /opt/restaurant-agent/releases/<sha>/previous_image.txt
+RESTAURANT_IMAGE_TAG=<value> docker compose up -d --no-build db web
+```
+
+Do not run any of these steps before explicit release authorization. This script
+does not write to production environments and intentionally fails closed without
+`--release`.
