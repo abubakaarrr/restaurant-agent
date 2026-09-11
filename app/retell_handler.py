@@ -19,16 +19,29 @@ from fastapi import WebSocket, WebSocketDisconnect
 from app.agent.runner import stream_agent_tokens
 from app.behavior import (
     BehaviorControl,
+    BehaviorReduction,
     BehaviorState,
     TurnObservation,
     reduce_behavior,
 )
 from app.behavior_store import load_behavior_state, save_behavior_state
 from app.call_analytics import record_call_event
-from app.call_flags import consume_call_control
+from app.call_flags import (
+    clear_call_control,
+    consume_call_control,
+    reset_call_control_scope,
+    set_call_control_scope,
+)
 from app.caller_turn import process_caller_turn
 from app.config import settings
 from app.restaurant_settings import load_restaurant_settings
+from app.spoken_delivery import (
+    INCOMPLETE_INPUT_REPLY,
+    TRANSFER_UNAVAILABLE_REPLY,
+    ResponseGenerationGate,
+    SpokenTextBuffer,
+    sanitize_spoken_text,
+)
 from app.transfer_availability import current_staff_transfer_number
 
 
@@ -65,7 +78,7 @@ def _response_event(
     payload: dict[str, Any] = {
         "response_type": "response",
         "response_id": response_id,
-        "content": content,
+        "content": sanitize_spoken_text(content),
         "content_complete": complete,
     }
     if end_call:
@@ -131,19 +144,20 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
 
     caller_number = ""
     current_task: asyncio.Task[None] | None = None
-    active_response_id = -1
+    current_response_id: int | None = None
+    response_gate = ResponseGenerationGate()
     reminder_count = 0
     latest_transcript: list[dict[str, Any]] = []
+    greeting_sent = False
 
-    async def apply_behavior(
+    def stage_behavior(
         turn: dict[str, Any],
         *,
         reminder: bool = False,
         interrupted: bool = False,
-    ):
-        nonlocal behavior_state, last_agent_controls
+    ) -> BehaviorReduction:
         words = tuple(turn.get("words") or ())
-        reduction = reduce_behavior(
+        return reduce_behavior(
             behavior_state,
             TurnObservation(
                 text=str(turn.get("content") or ""),
@@ -152,10 +166,21 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 interrupted=interrupted,
             ),
         )
+
+    async def commit_behavior(
+        response_id: int, reduction: BehaviorReduction
+    ) -> bool:
+        nonlocal behavior_state, last_agent_controls
+        if not response_allowed(response_id, "behavior_commit"):
+            return False
         behavior_state = reduction.state
         asyncio.create_task(save_behavior_state(call_id, behavior_state))
         controls = reduction.directive.to_retell_controls()
-        if controls != last_agent_controls and reduction.directive.control is BehaviorControl.CONTINUE:
+        if (
+            controls != last_agent_controls
+            and reduction.directive.control is BehaviorControl.CONTINUE
+            and response_gate.allows(response_id)
+        ):
             await send(
                 _agent_update_event(
                     responsiveness=float(controls["responsiveness"]),
@@ -165,17 +190,23 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                     reminder_trigger_ms=int(controls["reminder_trigger_ms"]),
                 )
             )
-            last_agent_controls = controls
-        return reduction.directive
+            if response_gate.allows(response_id):
+                last_agent_controls = controls
+        return True
 
     async def cancel_current(reason: str) -> None:
-        nonlocal current_task
+        nonlocal current_task, current_response_id
         if not current_task or current_task.done():
+            current_task = None
+            current_response_id = None
             return
         started = time.monotonic()
+        cancelled_response_id = current_response_id
         current_task.cancel()
         with suppress(asyncio.CancelledError):
             await current_task
+        if cancelled_response_id is not None:
+            clear_call_control(call_id, str(cancelled_response_id))
         elapsed_ms = int((time.monotonic() - started) * 1000)
         _record_background(
             call_id,
@@ -184,17 +215,57 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             payload={"reason": reason},
         )
         current_task = None
+        current_response_id = None
+
+    def response_allowed(response_id: int, stage: str) -> bool:
+        if response_gate.allows(response_id):
+            return True
+        _record_background(
+            call_id,
+            "stale_response_suppressed",
+            response_id=response_id,
+            payload={
+                "active_response_id": response_gate.active_response_id,
+                "stage": stage,
+            },
+        )
+        return False
+
+    async def send_response(
+        response_id: int,
+        content: str,
+        *,
+        complete: bool,
+        end_call: bool = False,
+        transfer_number: str = "",
+        no_interruption_allowed: bool = False,
+        stage: str,
+    ) -> bool:
+        async with send_lock:
+            if not response_allowed(response_id, stage):
+                return False
+            await websocket.send_text(
+                _response_event(
+                    response_id,
+                    content,
+                    complete=complete,
+                    end_call=end_call,
+                    transfer_number=transfer_number,
+                    no_interruption_allowed=no_interruption_allowed,
+                )
+            )
+        return response_allowed(response_id, f"{stage}_post_send")
 
     async def run_turn(
         response_id: int,
         user_text: str,
         behavior_directive: str = "",
         caller_turn: dict[str, Any] | None = None,
-    ) -> None:
-        nonlocal current_task
+    ) -> bool:
         started = time.monotonic()
         first_chunk_sent = False
         completed = False
+        spoken = SpokenTextBuffer()
         try:
             async for token in stream_agent_tokens(
                 call_id,
@@ -203,11 +274,36 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 behavior_directive,
                 prepared_caller_turn=caller_turn,
             ):
-                if response_id != active_response_id:
-                    return
                 if not token:
                     continue
-                await send(_response_event(response_id, token, complete=False))
+                for spoken_token in spoken.feed(token):
+                    delivered = await send_response(
+                        response_id,
+                        spoken_token,
+                        complete=False,
+                        stage="stream_chunk",
+                    )
+                    if not delivered:
+                        return False
+                    if not first_chunk_sent:
+                        first_chunk_sent = True
+                        elapsed_ms = int((time.monotonic() - started) * 1000)
+                        _record_background(
+                            call_id,
+                            "first_response_chunk",
+                            response_id=response_id,
+                            duration_ms=elapsed_ms,
+                        )
+
+            for spoken_token in spoken.flush():
+                delivered = await send_response(
+                    response_id,
+                    spoken_token,
+                    complete=False,
+                    stage="stream_flush",
+                )
+                if not delivered:
+                    return False
                 if not first_chunk_sent:
                     first_chunk_sent = True
                     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -218,8 +314,8 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                         duration_ms=elapsed_ms,
                     )
 
-            if response_id != active_response_id:
-                return
+            if not response_allowed(response_id, "completion"):
+                return False
             control = consume_call_control(call_id)
             end_call = bool(control and control.action == "end")
             transfer_number = ""
@@ -230,21 +326,18 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 if transfer_number:
                     no_interruption = True
                 else:
-                    final_content = (
-                        "I'm sorry, I can't transfer the call right now. "
-                        "I can take a message and callback details for the restaurant team."
-                    )
-            await send(
-                _response_event(
-                    response_id,
-                    final_content,
-                    complete=True,
-                    end_call=end_call,
-                    transfer_number=transfer_number,
-                    no_interruption_allowed=no_interruption,
-                )
+                    final_content = TRANSFER_UNAVAILABLE_REPLY
+            completed = await send_response(
+                response_id,
+                final_content,
+                complete=True,
+                end_call=end_call,
+                transfer_number=transfer_number,
+                no_interruption_allowed=no_interruption,
+                stage="completion",
             )
-            completed = True
+            if not completed:
+                return False
             _record_background(
                 call_id,
                 "response_complete",
@@ -259,25 +352,23 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             raise
         except Exception:
             logger.error("Retell agent stream error", exc_info=True)
-            if response_id == active_response_id:
+            if response_allowed(response_id, "error_fallback"):
                 with suppress(Exception):
                     transfer_number = current_staff_transfer_number()
-                    await send(
-                        _response_event(
-                            response_id,
-                            (
-                                "I'm sorry, I had a technical issue. "
-                                + (
-                                    "I can connect you with the restaurant team."
-                                    if transfer_number
-                                    else "I can't transfer right now, but I can take a callback message."
-                                )
-                            ),
-                            complete=True,
-                            transfer_number=transfer_number,
-                        )
+                    completed = await send_response(
+                        response_id,
+                        (
+                            "I'm sorry, I had a technical issue. "
+                            + (
+                                "I can connect you with the restaurant team."
+                                if transfer_number
+                                else "I can't transfer right now, but I can take a callback message."
+                            )
+                        ),
+                        complete=True,
+                        transfer_number=transfer_number,
+                        stage="error_fallback",
                     )
-                    completed = True
             _record_background(
                 call_id,
                 "generation_error",
@@ -289,11 +380,159 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
             # close the current response so Retell never waits forever.
             if (
                 not completed
-                and response_id == active_response_id
+                and response_gate.allows(response_id)
                 and not asyncio.current_task().cancelled()
             ):
                 with suppress(Exception):
-                    await send(_response_event(response_id, "", complete=True))
+                    await send_response(
+                        response_id,
+                        "",
+                        complete=True,
+                        stage="finalizer",
+                    )
+        return completed
+
+    async def process_interaction(
+        message: dict[str, Any],
+        *,
+        response_id: int,
+        was_interrupted: bool,
+        transcript_snapshot: list[dict[str, Any]],
+    ) -> None:
+        nonlocal reminder_count, greeting_sent
+        scope_token = set_call_control_scope(str(response_id))
+        try:
+            interaction = message.get("interaction_type")
+            if interaction == "reminder_required":
+                next_reminder_count = reminder_count + 1
+                reduction = stage_behavior(
+                    {"content": "", "words": []},
+                    reminder=True,
+                    interrupted=was_interrupted,
+                )
+                directive = reduction.directive
+                delivered = await send_response(
+                    response_id,
+                    directive.direct_reply or "Are you still there?",
+                    complete=True,
+                    end_call=directive.control is BehaviorControl.END_CALL,
+                    stage="reminder",
+                )
+                if not delivered or not await commit_behavior(response_id, reduction):
+                    return
+                reminder_count = next_reminder_count
+                _record_background(
+                    call_id,
+                    "silence_reminder",
+                    response_id=response_id,
+                    payload={"count": next_reminder_count},
+                )
+                return
+
+            reminder_count = 0
+            user_turn = _latest_user_turn(transcript_snapshot)
+            user_text = str(user_turn.get("content") or "").strip()
+
+            if not user_text and not greeting_sent:
+                runtime = load_restaurant_settings()
+                restaurant = runtime["restaurant_name"]
+                agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
+                delivered = await send_response(
+                    response_id,
+                    (
+                        f"Hi, you've reached {restaurant}. This is {agent_name}. "
+                        "How can I help you today?"
+                    ),
+                    complete=True,
+                    stage="greeting",
+                )
+                if delivered:
+                    greeting_sent = True
+                return
+
+            if not user_text:
+                await send_response(
+                    response_id,
+                    INCOMPLETE_INPUT_REPLY,
+                    complete=True,
+                    stage="incomplete_input",
+                )
+                return
+
+            greeting_sent = True
+            caller_turn = await process_caller_turn(call_id, user_text)
+            if not response_allowed(response_id, "caller_turn"):
+                return
+            if caller_turn.get("handled"):
+                await send_response(
+                    response_id,
+                    str(caller_turn.get("message") or ""),
+                    complete=True,
+                    stage="caller_turn_reply",
+                )
+                return
+
+            reduction = stage_behavior(
+                user_turn,
+                interrupted=was_interrupted,
+            )
+            directive = reduction.directive
+            if not response_allowed(response_id, "behavior"):
+                return
+            if directive.locale and not _locale_supported(directive.locale):
+                transfer_number = current_staff_transfer_number()
+                can_transfer = bool(transfer_number)
+                delivered = await send_response(
+                    response_id,
+                    (
+                        "I'm sorry, I don't support that language reliably yet. "
+                        + (
+                            "I'll connect you with the restaurant team."
+                            if can_transfer
+                            else "I can't transfer right now, but I can take a callback message."
+                        )
+                    ),
+                    complete=True,
+                    transfer_number=transfer_number,
+                    no_interruption_allowed=can_transfer,
+                    stage="locale_reply",
+                )
+                if delivered:
+                    await commit_behavior(response_id, reduction)
+                return
+
+            if directive.direct_reply is not None:
+                transfer_number = directive.transfer_number
+                delivered = await send_response(
+                    response_id,
+                    directive.direct_reply,
+                    complete=True,
+                    end_call=directive.control is BehaviorControl.END_CALL,
+                    transfer_number=transfer_number,
+                    no_interruption_allowed=bool(transfer_number),
+                    stage="behavior_reply",
+                )
+                if delivered:
+                    await commit_behavior(response_id, reduction)
+                return
+
+            _record_background(
+                call_id,
+                "response_requested",
+                response_id=response_id,
+            )
+            completed = await run_turn(
+                response_id,
+                user_text,
+                directive.prompt_instruction,
+                caller_turn,
+            )
+            if completed:
+                await commit_behavior(response_id, reduction)
+        finally:
+            if not response_gate.allows(response_id):
+                clear_call_control(call_id, str(response_id))
+            reset_call_control_scope(scope_token)
 
     try:
         while True:
@@ -334,118 +573,22 @@ async def handle_retell_connection(websocket: WebSocket, call_id: str) -> None:
                 continue
 
             was_interrupted = bool(current_task and not current_task.done())
+            response_id = int(message.get("response_id", 0))
+            response_gate.begin(response_id)
             await cancel_current("new_response")
-            active_response_id = int(message.get("response_id", 0))
-
-            if interaction == "reminder_required":
-                # A reminder is never a replay of the previous user action.
-                reminder_count += 1
-                directive = await apply_behavior(
-                    {"content": "", "words": []},
-                    reminder=True,
-                    interrupted=was_interrupted,
-                )
-                content = directive.direct_reply or "Are you still there?"
-                end_call = directive.control is BehaviorControl.END_CALL
-                await send(
-                    _response_event(
-                        active_response_id,
-                        content,
-                        complete=True,
-                        end_call=end_call,
-                    )
-                )
-                _record_background(
-                    call_id,
-                    "silence_reminder",
-                    response_id=active_response_id,
-                    payload={"count": reminder_count},
-                )
-                continue
-
-            reminder_count = 0
             transcript = message.get("transcript")
             if isinstance(transcript, list):
                 latest_transcript = transcript
-            user_turn = _latest_user_turn(latest_transcript)
-            user_text = str(user_turn.get("content") or "").strip()
-
-            if not user_text:
-                runtime = load_restaurant_settings()
-                restaurant = runtime["restaurant_name"]
-                agent_name = runtime.get("ai_agent_name") or settings.ai_agent_name
-                greeting = (
-                    f"Hi, you've reached {restaurant}. This is {agent_name}. "
-                    "How can I help you today?"
-                )
-                await send(
-                    _response_event(active_response_id, greeting, complete=True)
-                )
-                continue
-
-            caller_turn = await process_caller_turn(call_id, user_text)
-            if caller_turn.get("handled"):
-                await send(
-                    _response_event(
-                        active_response_id,
-                        str(caller_turn.get("message") or ""),
-                        complete=True,
-                    )
-                )
-                continue
-
-            directive = await apply_behavior(
-                user_turn,
-                interrupted=was_interrupted,
-            )
-            if directive.locale and not _locale_supported(directive.locale):
-                transfer_number = current_staff_transfer_number()
-                can_transfer = bool(transfer_number)
-                await send(
-                    _response_event(
-                        active_response_id,
-                        (
-                            "I'm sorry, I don't support that language reliably yet. "
-                            + (
-                                "I'll connect you with the restaurant team."
-                                if can_transfer
-                                else "I can't transfer right now, but I can take a callback message."
-                            )
-                        ),
-                        complete=True,
-                        transfer_number=transfer_number,
-                        no_interruption_allowed=can_transfer,
-                    )
-                )
-                continue
-
-            if directive.direct_reply is not None:
-                transfer_number = directive.transfer_number
-                await send(
-                    _response_event(
-                        active_response_id,
-                        directive.direct_reply,
-                        complete=True,
-                        end_call=directive.control is BehaviorControl.END_CALL,
-                        transfer_number=transfer_number,
-                        no_interruption_allowed=bool(transfer_number),
-                    )
-                )
-                continue
-
-            _record_background(
-                call_id,
-                "response_requested",
-                response_id=active_response_id,
-            )
             current_task = asyncio.create_task(
-                run_turn(
-                    active_response_id,
-                    user_text,
-                    directive.prompt_instruction,
-                    caller_turn,
+                process_interaction(
+                    message,
+                    response_id=response_id,
+                    was_interrupted=was_interrupted,
+                    transcript_snapshot=list(latest_transcript),
                 )
             )
+            current_response_id = response_id
+            await asyncio.sleep(0)
     except WebSocketDisconnect:
         logger.info("Retell call %s disconnected", call_id)
     except Exception:

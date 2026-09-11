@@ -1,0 +1,270 @@
+{
+  "arms": {
+    "current_retell_baseline": {
+      "clone_audio_artifact_ref": null,
+      "completed_scenarios": 0,
+      "completed_turns": 0,
+      "event_counts": {
+        "error_count": null,
+        "fallback_count": null,
+        "stale_response_incidents": null,
+        "timeout_count": null
+      },
+      "latency_ms": {
+        "agent_generation": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "completion": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "first_audio": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "interruption_recovery": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "provider_network": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        }
+      },
+      "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+      "prepared_turns": 120,
+      "provider_audio_score": null
+    },
+    "retell_native_clone": {
+      "clone_audio_artifact_ref": null,
+      "completed_scenarios": 0,
+      "completed_turns": 0,
+      "event_counts": {
+        "error_count": null,
+        "fallback_count": null,
+        "stale_response_incidents": null,
+        "timeout_count": null
+      },
+      "latency_ms": {
+        "agent_generation": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "completion": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "first_audio": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "interruption_recovery": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        },
+        "provider_network": {
+          "availability": "missing",
+          "median_ms": null,
+          "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+          "p95_ms": null,
+          "samples": 0
+        }
+      },
+      "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+      "prepared_turns": 120,
+      "provider_audio_score": null
+    }
+  },
+  "baseline_vs_clone": {
+    "baseline_score": null,
+    "clone_score": null,
+    "completed_pairs": 0,
+    "completion_delta_ms": null,
+    "first_audio_delta_ms": null,
+    "preference_delta": null
+  },
+  "evaluation_id": "phase2-voice-humanization-2026-09-09",
+  "human_preference": {
+    "arm_scores": {
+      "current_retell_baseline": {
+        "dimensions": {
+          "clarity": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "confidence": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "conversational_pacing": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "expressiveness": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "feels_like_a_real_human": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "naturalness": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "pronunciation": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "warmth": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          }
+        },
+        "overall_mean": null,
+        "preference_wins": null
+      },
+      "retell_native_clone": {
+        "dimensions": {
+          "clarity": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "confidence": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "conversational_pacing": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "expressiveness": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "feels_like_a_real_human": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "naturalness": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "pronunciation": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          },
+          "warmth": {
+            "availability": "missing",
+            "mean": null,
+            "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+            "samples": 0
+          }
+        },
+        "overall_mean": null,
+        "preference_wins": null
+      }
+    },
+    "availability": "missing",
+    "completed_ratings": 0,
+    "missing_reason": "Explicit voice-sample and provider-action authorization was not supplied.",
+    "preferred_arm": null,
+    "rater_count": 0
+  },
+  "input_sha256": "7896fb748353961a477b2b3ac5a2cd50d0d92f4277a89b024c63a8e5711f2d01",
+  "limitations": [
+    "Explicit voice-sample and provider-action authorization was not supplied.",
+    "No provider call, phone call, recording, voice sample, or customer-visible action occurred.",
+    "Local text fixtures do not measure first-audio, completion, provider-network, or acoustic voice quality."
+  ],
+  "offline_local_text": {
+    "all_passed": true,
+    "completed_scenarios": 12,
+    "errors": 0,
+    "fallbacks": 0,
+    "interruption_recovery_failures": 0,
+    "interruption_scenarios": 1,
+    "passed_scenarios": 12,
+    "stale_response_incidents": 0,
+    "timeouts": 0
+  },
+  "prepared": {
+    "blind_comparisons": 120,
+    "randomization_seed": 20260909,
+    "scenario_count": 12,
+    "turns_per_arm": 120
+  },
+  "provider_authorization": {
+    "available": false,
+    "reason": "Explicit voice-sample and provider-action authorization was not supplied."
+  },
+  "recommendation": {
+    "decision": "retain_baseline",
+    "reason": "Keep the current baseline fallback. The offline wording and turn-taking fixtures pass, but no authorized clone audio, provider latency, or human preference evidence exists to support adopting a clone."
+  },
+  "schema_version": "restaurant-voice-evaluation-results.v1",
+  "targets": {
+    "median_first_audio_under_ms": 700,
+    "p95_first_audio_under_ms": 1200,
+    "provider_targets_evaluated": false,
+    "zero_stale_response_incidents": true
+  }
+}

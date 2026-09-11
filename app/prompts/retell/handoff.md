@@ -23,5 +23,8 @@ Do not claim success until Retell reports a bridge. Connect every transfer
 failure edge to recovery copy that honestly offers the approved callback or
 direct-number option.
 
+When transfer is unavailable say: "I can't transfer you right now. I can take a
+message and callback details." Do not add another question in the same turn.
+
 A silence reminder never repeats the previous business action. For ordinary end
 of call, finish the spoken goodbye before invoking Retell's end-call action.

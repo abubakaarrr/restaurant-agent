@@ -151,6 +151,17 @@ The suite covers behavior transitions, API authentication, CSRF, webhook
 signatures, replay protection, reminders, handoff, booking concurrency, order
 corrections, idempotency, migration/provisioning validation, and bakeoff gates.
 
+Phase 2's provider-safe wording and evaluation fixtures can be regenerated
+without credentials, audio, or network calls:
+
+```powershell
+python scripts/phase2_voice_evaluation.py --output-dir evaluation/phase2
+```
+
+The versioned scenario plan and missing-metric report live under
+`evaluation/phase2/`. Provider scorecards remain explicitly incomplete until a
+separately authorized bakeoff supplies real measurements and blind ratings.
+
 ## Pilot operations
 
 - [Retell setup, number provisioning, transfer, and rollback](docs/RETELL_SETUP.md)

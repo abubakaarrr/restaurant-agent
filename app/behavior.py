@@ -28,6 +28,10 @@ from enum import Enum
 from typing import Any
 
 from app.transfer_availability import resolve_handoff_destination
+from app.spoken_delivery import (
+    MANAGER_TRANSFER_UNAVAILABLE_REPLY,
+    TRANSFER_UNAVAILABLE_REPLY,
+)
 
 
 class BehaviorMode(str, Enum):
@@ -834,14 +838,8 @@ def _direct_reply(
         if destination["can_transfer"]:
             return "Of course. I'll connect you with a staff member now."
         if destination["owner"] == "manager_callback":
-            return (
-                "A manager isn't available by transfer now, but I can take a message "
-                "and callback details for the manager."
-            )
-        return (
-            "I can't transfer the call right now, but I can take a message and "
-            "callback details for the restaurant team."
-        )
+            return MANAGER_TRANSFER_UNAVAILABLE_REPLY
+        return TRANSFER_UNAVAILABLE_REPLY
     if control is BehaviorControl.END_CALL:
         if terminal_reason == "silence":
             return "I haven't heard you, so I'll end the call for now. Please call back anytime."
@@ -854,7 +852,7 @@ def _direct_reply(
     if silence_count == 1:
         return "Take your time—I'm here when you're ready."
     if silence_count == 2:
-        return "Are you still there? I can help with a booking, order, or restaurant question."
+        return "Are you still there?"
     if boundary_kind == "abuse":
         if boundary_strikes == 1:
             return "I want to help, but please keep the conversation respectful."
@@ -865,10 +863,7 @@ def _direct_reply(
                 "I can help with restaurant bookings, orders, menu questions, and policies. "
                 "What do you need?"
             )
-        return (
-            "I need to keep this call to restaurant requests. "
-            "Do you need help with a booking or order?"
-        )
+        return "I need to keep this to restaurant requests. Do you need a booking or order?"
     if unintelligible:
         return "Sorry, I didn't catch that. Could you say it one more time?"
     return None
@@ -1077,7 +1072,9 @@ def reduce_behavior(
         interruption_pressure = min(6, interruption_pressure + 2)
     else:
         interruption_pressure = max(0, interruption_pressure - 1)
-    recent_interruptions = interruption_pressure >= 3
+    # A single barge-in must affect the very next turn.  The pressure window
+    # keeps the adaptation active when interruptions repeat.
+    recent_interruptions = observation.interrupted or interruption_pressure >= 3
 
     silence_count = min(3, state.silence_count + 1) if silent else 0
 
