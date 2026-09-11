@@ -51,8 +51,10 @@ Starting SHA: `b34211f0b1b6f570c8612daa3e69dc36d084d0be`.
 
 Submitted implementation SHA: `094bebac38c0eccdf4ebb595fb4b55a4070def70`.
 
-Frozen implementation candidate SHA after the authorized no-mistakes fix
-rounds: `b394dc3764efcdf9a1ee7ba8ef76143867a7e6b8`.
+Initial Phase 2 delivery SHA: `552ac1403fd111f8cfc018d9fe0633a045c91482`.
+
+Final follow-up implementation candidate SHA:
+`c0ff67688327668c6e622dad242cd5cfe1b1e505`.
 
 The focused Phase 2 speech command was:
 
@@ -110,11 +112,27 @@ git diff --check
 
 Both commands passed with exit status 0. Standalone `ruff`, `flake8`, `pylint`,
 and `pyflakes` were unavailable, so no standalone Python lint pass is claimed.
-These exact local results were produced at submitted SHA `094bebac`; the
-subsequent authorized no-mistakes fixes added focused executable regressions,
-but the run was frozen during fix-review before its formal test, document,
-lint, push, PR, and CI stages. No unproduced result is attributed to frozen
-candidate `b394dc3`.
+These exact local results were produced at submitted SHA `094bebac`; they are
+retained as evidence for the initial Phase 2 delivery and are not attributed to
+the follow-up candidate.
+
+The final follow-up implementation candidate used this focused test selection:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q -p no:cacheprovider \
+  -p pytest_asyncio.plugin \
+  tests/test_phase2_follow_up.py \
+  tests/test_tool_api.py
+```
+
+The review worktree had no `.venv`, so the selection was executed with the same
+`requirements-dev.txt` dependencies in an isolated temporary Python target.
+The exact result was 25 passed and one upstream Starlette/AnyIO deprecation
+warning in 3.67 seconds: 15 large-party, speech-boundary, reconnect, and
+interaction-failure cases in `test_phase2_follow_up.py`, plus 10 managed tool
+API cases in `test_tool_api.py`. No provider, staging, production, deployment,
+push, PR, CI, or live-call validation is claimed for this follow-up.
 
 Changed files relative to the Phase 2 starting commit:
 
@@ -140,30 +158,45 @@ Changed files relative to the Phase 2 starting commit:
 - `tests/test_phase2_voice_humanization.py`
 - `tests/test_retell_protocol.py`
 
+Follow-up changed files relative to `552ac140`:
+
+- `app/behavior.py`
+- `app/caller_turn.py`
+- `app/prompts/retell/reservation.md`
+- `app/prompts/system.md`
+- `app/retell_handler.py`
+- `app/services/restaurant.py`
+- `app/spoken_delivery.py`
+- `app/tool_api.py`
+- `app/tools/db.py`
+- `tests/test_phase2_follow_up.py`
+- `tests/test_tool_api.py`
+
 This run did not access staging or production, enable live writes, call a
 provider or phone, use credentials or recordings, or upload, clone, synthesize,
 select, assign, mutate, or delete any voice. The limitation is unchanged: local
 text and handler traces provide no authorized acoustic or provider-performance
 evidence, so the recommendation remains to retain the baseline.
 
-## Captain-deferred findings
+## Follow-up finding evidence
 
-The Captain froze candidate `b394dc3` and explicitly deferred these review
-findings rather than authorizing another fix/review cycle:
+The focused executable regressions produced for candidate `c0ff676` demonstrate
+that all five previously deferred in-scope speech-boundary findings are fixed:
 
-- `r66` — error, spoken-delivery scope: streaming list lookahead can lose an
-  earlier recommendation context before an incomplete trailing sequence marker.
-- `r67` — error, spoken-delivery scope: currency-decorated numeric ranges can
-  be mistaken for unordered-list separators.
-- `r68` — error, Retell rollback-adapter scope: greeting state is
-  connection-local and can repeat after an automatic reconnect before speech.
-- `r69` — warning, Retell rollback-adapter scope: completed
-  `process_interaction` task exceptions are not supervised at the shared entry
-  boundary.
-- `r70` — error, spoken-delivery scope: a single line-start numbered item is
-  intentionally ambiguous with legitimate standalone numeric speech and can
-  retain its list marker.
+- `r66` retains earlier context while a split sequential ordered marker is
+  incomplete and produces the same sanitized complete and streaming output.
+- `r67` preserves grounded currency-decorated ranges in complete and streaming
+  delivery.
+- `r68` persists the opening-greeting state across a reconnect within one call
+  and emits the greeting only once.
+- `r69` captures a completed interaction-task exception, sends one completed
+  fallback, and records the `generation_error` event.
+- `r70` sanitizes an unambiguous line-start single-item list in complete and
+  streaming delivery while preserving legitimate times, confirmation numbers,
+  ranges, currency, and ordinary numeric speech.
 
-These known limitations mean the offline evidence does not justify adopting a
-clone or merging without review. The recommendation remains to retain the
-current baseline fallback.
+No in-scope review finding remains deferred in this report. Phase 1 review,
+provider integration, dashboard and live-call work, acoustic bakeoff evidence,
+staging, production, deployment, merge, and unrelated architecture remain
+outside this follow-up. The offline evidence still does not justify adopting a
+clone, so the recommendation remains to retain the current baseline fallback.
