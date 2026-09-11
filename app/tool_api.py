@@ -28,7 +28,11 @@ from app.pending_confirmation import (
 from app.reservation_draft import compose_notes, flatten_draft
 from app.restaurant_settings import load_restaurant_settings
 from app.security import constant_time_equal
-from app.services.restaurant import RestaurantServiceError, restaurant_service
+from app.services.restaurant import (
+    RestaurantServiceError,
+    restaurant_service,
+    validate_standard_reservation_party_size,
+)
 
 
 router = APIRouter(prefix="/api/voice-tools", tags=["voice-tools"])
@@ -55,7 +59,7 @@ class CallRequest(BaseModel):
 class AvailabilityRequest(BaseModel):
     date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     time: str = Field(pattern=r"^\d{2}:\d{2}$")
-    party_size: int = Field(ge=1, le=24)
+    party_size: int = Field(ge=1)
     preferred_location: str = Field(default="", max_length=40)
     call_id: str = Field(default="", max_length=200)
 
@@ -136,7 +140,7 @@ class UpdateReservationDraftRequest(CallRequest):
     customer_phone: str | None = Field(default=None, max_length=200)
     date: str | None = Field(default=None, max_length=10)
     time: str | None = Field(default=None, max_length=5)
-    party_size: int | None = Field(default=None, ge=0, le=24)
+    party_size: int | None = Field(default=None, ge=0)
     seating_preference: str | None = Field(default=None, max_length=80)
     seating_backup: str | None = Field(default=None, max_length=80)
     seating_avoid: str | None = Field(default=None, max_length=80)
@@ -150,7 +154,7 @@ class UpdateConfirmedBookingRequest(CallRequest):
     booking_id: int = Field(default=0, ge=0)
     date: str = Field(default="", max_length=10)
     time: str = Field(default="", max_length=5)
-    party_size: int = Field(default=0, ge=0, le=24)
+    party_size: int = Field(default=0, ge=0)
     seating_preference: str | None = Field(default=None, max_length=80)
     seating_backup: str | None = Field(default=None, max_length=80)
     seating_avoid: str | None = Field(default=None, max_length=80)
@@ -321,6 +325,8 @@ async def update_reservation_draft(body: UpdateReservationDraftRequest) -> dict[
     await hydrate_call_memory(body.call_id)
     updates = body.model_dump(exclude_unset=True, exclude={"call_id"})
     try:
+        if body.party_size is not None and body.party_size > 0:
+            validate_standard_reservation_party_size(body.party_size)
         draft = save_reservation_draft(body.call_id, updates)
         await restaurant_service.persist_call_state(
             body.call_id,

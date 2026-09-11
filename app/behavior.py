@@ -241,6 +241,7 @@ class BehaviorState:
     speech_rate_samples: tuple[float, ...] = field(default_factory=tuple)
     inferred_pace: PacePreference | None = None
     turn_index: int = 0
+    opening_greeting_sent: bool = False
 
     # Internal hysteresis/decay state.  These remain public for serialization
     # and deterministic replay.
@@ -1193,6 +1194,7 @@ def reduce_behavior(
         speech_rate_samples=rate_samples,
         inferred_pace=inferred_pace,
         turn_index=turn_index,
+        opening_greeting_sent=state.opening_greeting_sent,
         stable_turns=stable_turns,
         boundary_clean_turns=boundary_clean_turns,
         deescalation_hold=deescalation_hold,

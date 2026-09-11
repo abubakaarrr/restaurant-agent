@@ -40,7 +40,7 @@ _ORDERED_LIST_LOOKAHEAD_MARKER = re.compile(
 )
 _STREAM_BOUNDARY = re.compile(r"\s+")
 _COMPLETE_SEGMENT = re.compile(r"[.!?][\s]*$")
-_RANGE_VALUE = re.compile(r"\d+(?::\d+)?(?:\.\d+)?$")
+_RANGE_VALUE = re.compile(r"[€£$]?\d+(?::\d+)?(?:\.\d+)?$")
 _MERIDIEM_TIME_LEFT = re.compile(
     r"\b\d{1,2}(?::\d{2})?\s*[ap]\.?m\.?$", re.IGNORECASE
 )
@@ -99,8 +99,8 @@ _RANGE_WORDS = {
 def _range_separator(value: str, match: re.Match[str]) -> bool:
     if match.group(2) != "-":
         return False
-    left_match = re.search(r"([\w:.]+)\s*$", value[: match.start(2)])
-    right_match = re.match(r"\s*([\w:.]+)", value[match.end(2) :])
+    left_match = re.search(r"([€£$]?[\w:.]+)\s*$", value[: match.start(2)])
+    right_match = re.match(r"\s*([€£$]?[\w:.]+)", value[match.end(2) :])
     if not left_match or not right_match:
         return False
     left = left_match.group(1).casefold()
@@ -188,6 +188,17 @@ def _ordered_pair_is_sequential(
     return True
 
 
+def _ordered_single_line_item(value: str, match: re.Match[str]) -> bool:
+    if match.group(1) or int(match.group(2)) != 1:
+        return False
+    fragment = _ordered_item_fragment(value, match)
+    return bool(
+        fragment
+        and not _ordered_item_has_transition(fragment)
+        and not _STANDALONE_NUMERIC_SENTENCE.match(fragment)
+    )
+
+
 def _ordered_list_matches(value: str) -> list[re.Match[str]]:
     candidates = list(_ORDERED_LIST_MARKER.finditer(value))
     accepted: list[re.Match[str]] = []
@@ -211,6 +222,7 @@ def _ordered_list_matches(value: str) -> list[re.Match[str]]:
             _ordered_list_has_colon_context(value, first)
             or starts_inline_list
             or starts_line_list
+            or _ordered_single_line_item(value, first)
         ):
             index += 1
             continue
@@ -245,6 +257,15 @@ def _possible_ordered_list(value: str) -> bool:
             _ORDERED_LIST_CONTEXT.search(clause)
             or _ORDERED_LIST_ORDER_CONTEXT.search(clause)
         )
+    for first, following in zip(candidates, candidates[1:]):
+        if not (
+            _ordered_list_has_colon_context(value, first)
+            or _ordered_list_has_context(value, first)
+            or _ordered_single_line_item(value, first)
+        ):
+            continue
+        if _ordered_pair_is_sequential(value, first, following):
+            return True
     match = candidates[-1]
     if _ordered_list_has_colon_context(value, match):
         return True

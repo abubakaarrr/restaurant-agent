@@ -103,6 +103,40 @@ class WritesDisabledError(RestaurantServiceError):
         )
 
 
+def validate_standard_reservation_party_size(value: int) -> int:
+    """Accept phone-table party sizes and explain the approved larger-party route."""
+    reservation_rule = _topic_rule("topic.reservations")
+    maximum = int(reservation_rule.get("max_phone_party") or 10)
+    large_party_min = int(reservation_rule.get("large_party_min") or maximum + 1)
+    event_rule = _topic_rule("topic.events-private-dining")
+    private_dining_maximum = int(event_rule.get("seated_capacity") or 24)
+    if large_party_min <= value <= private_dining_maximum:
+        raise RestaurantServiceError(
+            f"Phone table reservations support up to {maximum} guests. "
+            f"Parties of {large_party_min} to {private_dining_maximum} use the "
+            "private-dining events route and require a signed event agreement. "
+            "I haven't checked table availability or confirmed a reservation. "
+            "I can take your event details for the events team to call you back.",
+            code="large_party_route_required",
+            status=409,
+        )
+    if value > private_dining_maximum:
+        raise RestaurantServiceError(
+            f"Phone table reservations support up to {maximum} guests, and seated "
+            f"private dining supports {large_party_min} to {private_dining_maximum}. "
+            "I can't reserve a table for that party size or promise a larger capacity. "
+            "I can take your details for the events team to review.",
+            code="large_party_capacity_exceeded",
+            status=409,
+        )
+    if not 1 <= value <= maximum:
+        raise RestaurantServiceError(
+            f"Phone table reservations support parties of 1 to {maximum}.",
+            code="invalid_party_size",
+        )
+    return value
+
+
 def _normalized_text(value: str) -> str:
     return " ".join((value or "").casefold().split())
 
@@ -331,21 +365,7 @@ class RestaurantService:
 
     @staticmethod
     def _validate_party_size(value: int) -> int:
-        rule = _topic_rule("topic.reservations")
-        maximum = int(rule.get("max_phone_party") or 10)
-        large_party_min = int(rule.get("large_party_min") or maximum + 1)
-        if large_party_min <= value <= 24:
-            raise RestaurantServiceError(
-                "Parties of 11 to 24 require the private-dining reservations route; phone table inventory was not checked or booked.",
-                code="large_party_route_required",
-                status=409,
-            )
-        if not 1 <= value <= maximum:
-            raise RestaurantServiceError(
-                f"Phone table reservations support parties of 1 to {maximum}.",
-                code="invalid_party_size",
-            )
-        return value
+        return validate_standard_reservation_party_size(value)
 
     @staticmethod
     def _parse_booking_datetime(date: str, time: str) -> datetime:

@@ -38,6 +38,34 @@ _CANCELLATION_ONLY_PREFIX_RE = re.compile(
     r"(?:i\s+was\s+just\s+(?:checking|asking)[,;:.!?\s]*)?$",
     re.IGNORECASE,
 )
+_RESERVATION_INTENT_RE = re.compile(
+    r"\b(?:book(?:ing)?|reservation|reserve|table)\b",
+    re.IGNORECASE,
+)
+_GUEST_COUNT_RE = re.compile(
+    r"\b(?P<count>\d{1,4})\s+(?:guests?|people|persons?)\b",
+    re.IGNORECASE,
+)
+_TABLE_FOR_COUNT_RE = re.compile(
+    r"\b(?:book|reserve)\s+(?:me\s+)?(?:a\s+)?table\s+for\s+"
+    r"(?P<count>\d{1,4})\b",
+    re.IGNORECASE,
+)
+
+
+def _requested_reservation_party_size(utterance: str) -> int | None:
+    """Extract only explicit reservation/guest counts, never bare spoken numbers."""
+    text = str(utterance or "")
+    table_match = _TABLE_FOR_COUNT_RE.search(text)
+    if table_match:
+        return int(table_match.group("count"))
+    guest_match = _GUEST_COUNT_RE.search(text)
+    if guest_match and (
+        _RESERVATION_INTENT_RE.search(text)
+        or re.search(r"\bwe\s+have\b", text[: guest_match.start()], re.IGNORECASE)
+    ):
+        return int(guest_match.group("count"))
+    return None
 
 
 async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]:
@@ -50,6 +78,28 @@ async def process_caller_turn(session_id: str, utterance: str) -> dict[str, Any]
     await hydrate_call_memory(sid)
     affirmation = begin_caller_turn(sid, utterance)
     text = utterance or ""
+    requested_party_size = _requested_reservation_party_size(text)
+    if requested_party_size is not None:
+        from app.services.restaurant import (
+            RestaurantServiceError,
+            validate_standard_reservation_party_size,
+        )
+
+        try:
+            validate_standard_reservation_party_size(requested_party_size)
+        except RestaurantServiceError as error:
+            if error.code in {
+                "large_party_route_required",
+                "large_party_capacity_exceeded",
+            }:
+                return {
+                    "handled": True,
+                    "kind": error.code,
+                    "affirmation": affirmation,
+                    "party_size": requested_party_size,
+                    "message": error.message,
+                }
+
     reversal_match = _CANCELLATION_REVERSAL_RE.search(text)
     order_cancellation = _ORDER_CANCELLATION_RE.search(text)
     pending_cancellation = get_pending_confirmation(sid, ACTION_CANCEL_BOOKING)

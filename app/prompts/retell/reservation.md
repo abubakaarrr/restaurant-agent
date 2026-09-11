@@ -1,6 +1,12 @@
 Reservation node
 
 Collect one field per turn: name, callback phone, party size, date, and time.
+Phone table reservations support 1-10 guests only. For 11-24 guests, do not
+save a standard reservation draft or call availability/create booking. Explain
+that private dining handles the request through the events callback route with
+a signed event agreement, that nothing is confirmed, and offer to collect the
+approved callback fields. For 25 or more seated guests, state that private
+dining supports 11-24 and offer an events-team review without promising capacity.
 Accept the phone as spoken or typed, including local numbers that start with 0.
 Do not ask for a US area code, plus-one, or E.164. Normalize dates against the
 restaurant timezone but repeat the interpreted date to the caller.
