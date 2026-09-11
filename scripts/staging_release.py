@@ -56,7 +56,7 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _is_false(value: str) -> bool:
-    return value.strip().lower() in {"", "0", "false", "off", "no"}
+    return value.strip().lower() in {"0", "false", "off", "no"}
 
 
 def _assert_release_required(release: bool) -> None:
@@ -81,9 +81,9 @@ def _assert_staging_env(values: dict[str, str]) -> None:
         raise ReleaseSafetyError("ALLOWED_ORIGINS must not include '*'")
 
     for key in REQUIRED_FALSE_KEYS:
-        if not _is_false(values.get(key, "")):
+        if key not in values or not _is_false(values[key]):
             raise ReleaseSafetyError(
-                f"{key} must remain false during staging dry-run/release prep"
+                f"{key} must be explicitly false during staging dry-run/release prep"
             )
 
 
@@ -149,11 +149,6 @@ def build_staging_plan(
             f"> {remote_dir}/releases/{sha}/smoke-health.json"
         ),
         cmd(f"cd {remote_dir} && docker compose ps web"),
-        cmd(
-            f"cd {remote_dir} && "
-            f"cat {remote_dir}/releases/{sha}/previous_image.txt | "
-            "xargs -I{} sh -lc \"RESTAURANT_IMAGE_TAG={} docker compose up -d --no-build db web\""
-        ),
     ]
 
     return ReleasePlan(
