@@ -81,7 +81,10 @@ def test_staging_plan_generates_expected_commands(tmp_path: Path) -> None:
     all_commands = " ".join(plan.commands)
     assert plan.image_ref == "ghcr.io/abubakaarrr/restaurant-agent:abc123"
     assert "ssh -p 717 staging" in all_commands
-    assert "RESTAURANT_IMAGE_TAG='ghcr.io/abubakaarrr/restaurant-agent:abc123'" in all_commands
+    assert (
+        "RESTAURANT_IMAGE_TAG=ghcr.io/abubakaarrr/restaurant-agent:abc123"
+        in all_commands
+    )
     assert "python scripts/migrate.py" in all_commands
     assert "docker compose up -d --no-build db web" in all_commands
     assert "curl -fsS https://agent.servicesground.com/health" in all_commands
