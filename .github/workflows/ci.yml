@@ -36,7 +36,7 @@ jobs:
         run: |
           python -m compileall -q app scripts
           python -m compileall -q tests
-          git diff --check
+          git show --check --oneline HEAD
 
       - name: Focused restaurant/phase-2 regressions
         env:

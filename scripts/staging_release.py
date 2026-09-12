@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import re
 import shlex
 from pathlib import Path
+
+from app.config import Settings
 
 STAGING_ALIAS = "staging"
 STAGING_HOSTNAME = "agent.servicesground.com"
@@ -33,6 +36,7 @@ REQUIRED_NON_EMPTY_KEYS = [
 ]
 
 REQUIRED_FALSE_KEYS = ["VOICE_LIVE_WRITES_ENABLED"]
+COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class ReleaseSafetyError(RuntimeError):
@@ -86,6 +90,15 @@ def _assert_staging_env(values: dict[str, str]) -> None:
                 f"{key} must be explicitly false during staging dry-run/release prep"
             )
 
+    try:
+        settings = Settings(
+            _env_file=None,
+            **{key.lower(): value for key, value in values.items()},
+        )
+        settings.validate_runtime_security()
+    except (RuntimeError, ValueError) as exc:
+        raise ReleaseSafetyError(str(exc)) from exc
+
 
 @dataclass(frozen=True)
 class ReleasePlan:
@@ -101,12 +114,13 @@ def build_staging_plan(
     release: bool,
     *,
     env_file: Path = Path(".env.production.example"),
-    remote_alias: str = STAGING_ALIAS,
     remote_dir: str = DEFAULT_REMOTE_DIR,
     image_repo: str = DEFAULT_IMAGE_REPO,
     bootstrap_db: bool = False,
 ) -> ReleasePlan:
     _assert_release_required(release)
+    if not COMMIT_SHA_RE.fullmatch(sha):
+        raise ReleaseSafetyError("sha must be a 40-character hexadecimal commit SHA")
     values = _parse_env_file(env_file)
     _assert_staging_env(values)
 
@@ -118,14 +132,13 @@ def build_staging_plan(
     )
 
     shell_quote = shlex.quote
-    ssh_prefix = f"ssh -p {SSH_PORT} {shell_quote(remote_alias)}"
+    ssh_prefix = f"ssh -p {SSH_PORT} {STAGING_ALIAS}"
 
     def cmd(command: str) -> str:
-        return f"{ssh_prefix} bash -lc {shlex.quote(command)}"
+        return f"{ssh_prefix} bash -lc {shell_quote(f'set -euo pipefail && {command}')}"
 
     commands: list[str] = [
         cmd(
-            "set -euo pipefail && "
             f"mkdir -p {shell_quote(remote_dir)}/releases/{shell_quote(sha)} && "
             f"printf '%s\\n' {shell_quote(sha)} > "
             f"{shell_quote(remote_dir)}/releases/{shell_quote(sha)}/requested_sha.txt"
@@ -165,7 +178,7 @@ def build_staging_plan(
     return ReleasePlan(
         sha=sha,
         image_ref=image_ref,
-        remote_alias=remote_alias,
+        remote_alias=STAGING_ALIAS,
         remote_dir=remote_dir,
         commands=tuple(commands),
     )
@@ -176,11 +189,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--release", action="store_true", help="Enable staged release plan generation")
     parser.add_argument("--sha", required=True, help="Deploy commit SHA")
     parser.add_argument("--env-file", default=".env.production.example", type=Path)
-    parser.add_argument(
-        "--remote-alias",
-        default=STAGING_ALIAS,
-        help="SSH alias for the staging host",
-    )
     parser.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
     parser.add_argument(
         "--image-repo",
@@ -197,7 +205,6 @@ def main() -> int:
         args.sha,
         args.release,
         env_file=args.env_file,
-        remote_alias=args.remote_alias,
         remote_dir=args.remote_dir,
         image_repo=args.image_repo,
         bootstrap_db=args.bootstrap_db,
