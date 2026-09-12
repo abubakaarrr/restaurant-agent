@@ -224,15 +224,16 @@ Host staging
 ```bash
 python scripts/staging_release.py \
   --release \
-  --sha <deploy_sha> \
+  --sha <40-character-deploy-sha> \
   --env-file /path/to/.env.staging \
   --remote-dir /opt/restaurant-agent
 ```
 
-`--env-file` must contain concrete values (no placeholders), `APP_ENV=production`,
+`--sha` must be the full 40-character hexadecimal commit SHA. `--env-file` must
+contain concrete values (no placeholders), `APP_ENV=production`,
 `VOICE_LIVE_WRITES_ENABLED=false`, and safe values for CORS/retell fields.
 
-The generated plan:
+The generated plan emits one fail-closed SSH command sequence that:
 
 - captures the running web container image to `releases/<sha>/previous_image.txt`;
 - starts `db` then `web` with immutable image tag
