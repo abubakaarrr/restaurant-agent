@@ -110,6 +110,7 @@ def test_staging_plan_generates_expected_commands(tmp_path: Path) -> None:
     remote_scripts = [_remote_script(command) for command in plan.commands]
     all_scripts = "\n".join(remote_scripts)
     assert plan.image_ref == "ghcr.io/abubakaarrr/restaurant-agent:" + "a" * 40
+    assert len(plan.commands) == 1
     assert "RESTAURANT_IMAGE_TAG=" + plan.image_ref in all_scripts
     assert "python scripts/migrate.py" in all_scripts
     assert "docker compose up -d --no-build db web" in all_scripts
