@@ -162,6 +162,13 @@ The versioned scenario plan and missing-metric report live under
 `evaluation/phase2/`. Provider scorecards remain explicitly incomplete until a
 separately authorized bakeoff supplies real measurements and blind ratings.
 
+## CI/CD checks
+
+- GitHub workflow: `.github/workflows/ci.yml`.
+- Staging deployment documentation: [DEPLOY.md](DEPLOY.md).
+- CI pipeline documentation: [CI.md](CI.md).
+- Staging rollout plan generator: `scripts/staging_release.py`.
+
 ## Pilot operations
 
 - [Retell setup, number provisioning, transfer, and rollback](docs/RETELL_SETUP.md)
