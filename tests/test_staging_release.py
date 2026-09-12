@@ -1,8 +1,19 @@
 from pathlib import Path
+import shlex
 
 import pytest
 
 from scripts import staging_release
+
+
+def _remote_script(command: str) -> str:
+    ssh_args = shlex.split(command)
+    assert ssh_args[:4] == ["ssh", "-p", "717", "staging"]
+    assert len(ssh_args) == 5
+    bash_args = shlex.split(ssh_args[4])
+    assert bash_args[:2] == ["bash", "-lc"]
+    assert len(bash_args) == 3
+    return bash_args[2]
 
 
 def _production_env_file(tmp_path: Path) -> Path:
@@ -96,14 +107,14 @@ def test_staging_plan_generates_expected_commands(tmp_path: Path) -> None:
         bootstrap_db=False,
     )
 
-    all_commands = " ".join(plan.commands)
+    remote_scripts = [_remote_script(command) for command in plan.commands]
+    all_scripts = "\n".join(remote_scripts)
     assert plan.image_ref == "ghcr.io/abubakaarrr/restaurant-agent:" + "a" * 40
-    assert "ssh -p 717 staging" in all_commands
-    assert "RESTAURANT_IMAGE_TAG='ghcr.io/abubakaarrr/restaurant-agent:" + "a" * 40 + "'" in all_commands
-    assert "python scripts/migrate.py" in all_commands
-    assert "docker compose up -d --no-build db web" in all_commands
-    assert "curl -fsS https://agent.servicesground.com/health" in all_commands
-    assert all("bash -lc 'set -euo pipefail && " in command for command in plan.commands)
+    assert "RESTAURANT_IMAGE_TAG=" + plan.image_ref in all_scripts
+    assert "python scripts/migrate.py" in all_scripts
+    assert "docker compose up -d --no-build db web" in all_scripts
+    assert "curl -fsS https://agent.servicesground.com/health" in all_scripts
+    assert all(script.startswith("set -euo pipefail && ") for script in remote_scripts)
 
 
 def test_staging_plan_bootstrap_uses_initialize_schema_when_requested(tmp_path: Path) -> None:
@@ -114,7 +125,10 @@ def test_staging_plan_bootstrap_uses_initialize_schema_when_requested(tmp_path: 
         env_file=env,
         bootstrap_db=True,
     )
-    assert "--initialize-schema" in " ".join(plan.commands)
+    assert any(
+        "python scripts/migrate.py --initialize-schema" in _remote_script(command)
+        for command in plan.commands
+    )
 
 
 def test_staging_plan_quotes_shell_parameters(tmp_path: Path) -> None:
@@ -127,10 +141,14 @@ def test_staging_plan_quotes_shell_parameters(tmp_path: Path) -> None:
         image_repo="ghcr.io/example/agent; touch /tmp/should-not-run",
     )
 
-    all_commands = " ".join(plan.commands)
-    assert "'/opt/restaurant-agent; touch /tmp/should-not-run'" in all_commands
-    assert "'ghcr.io/example/agent; touch /tmp/should-not-run:" + "a" * 40 + "'" in all_commands
-    assert "; touch /tmp/should-not-run &&" not in all_commands
+    tokens = [
+        token
+        for command in plan.commands
+        for token in shlex.split(_remote_script(command))
+    ]
+    assert "/opt/restaurant-agent; touch /tmp/should-not-run/releases/" + "a" * 40 in tokens
+    assert "ghcr.io/example/agent; touch /tmp/should-not-run:" + "a" * 40 in tokens
+    assert "touch" not in tokens
 
 
 def test_staging_plan_rejects_non_staging_destination(tmp_path: Path) -> None:

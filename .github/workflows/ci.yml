@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -33,10 +35,16 @@ jobs:
           docker --version
 
       - name: Compile checks and diff hygiene
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           python -m compileall -q app scripts
           python -m compileall -q tests
-          git show --check --oneline HEAD
+          if [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            git show --check --oneline HEAD
+          else
+            git diff --check "$BASE_SHA...$GITHUB_SHA"
+          fi
 
       - name: Focused restaurant/phase-2 regressions
         env:

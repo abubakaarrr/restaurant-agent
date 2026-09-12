@@ -135,7 +135,8 @@ def build_staging_plan(
     ssh_prefix = f"ssh -p {SSH_PORT} {STAGING_ALIAS}"
 
     def cmd(command: str) -> str:
-        return f"{ssh_prefix} bash -lc {shell_quote(f'set -euo pipefail && {command}')}"
+        remote_command = f"bash -lc {shell_quote(f'set -euo pipefail && {command}')}"
+        return f"{ssh_prefix} {shell_quote(remote_command)}"
 
     commands: list[str] = [
         cmd(
