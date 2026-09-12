@@ -81,7 +81,7 @@ def test_staging_plan_generates_expected_commands(tmp_path: Path) -> None:
     all_commands = " ".join(plan.commands)
     assert plan.image_ref == "ghcr.io/abubakaarrr/restaurant-agent:abc123"
     assert "ssh -p 717 staging" in all_commands
-    assert "RESTAURANT_IMAGE_TAG=ghcr.io/abubakaarrr/restaurant-agent:abc123" in all_commands
+    assert "RESTAURANT_IMAGE_TAG='ghcr.io/abubakaarrr/restaurant-agent:abc123'" in all_commands
     assert "python scripts/migrate.py" in all_commands
     assert "docker compose up -d --no-build db web" in all_commands
     assert "curl -fsS https://agent.servicesground.com/health" in all_commands
@@ -96,3 +96,21 @@ def test_staging_plan_bootstrap_uses_initialize_schema_when_requested(tmp_path: 
         bootstrap_db=True,
     )
     assert "--initialize-schema" in " ".join(plan.commands)
+
+
+def test_staging_plan_quotes_shell_parameters(tmp_path: Path) -> None:
+    env = _production_env_file(tmp_path)
+    plan = staging_release.build_staging_plan(
+        "abc123; touch /tmp/should-not-run",
+        release=True,
+        env_file=env,
+        remote_alias="staging; touch /tmp/should-not-run",
+        remote_dir="/opt/restaurant-agent; touch /tmp/should-not-run",
+        image_repo="ghcr.io/example/agent; touch /tmp/should-not-run",
+    )
+
+    all_commands = " ".join(plan.commands)
+    assert "'staging; touch /tmp/should-not-run'" in all_commands
+    assert "'/opt/restaurant-agent; touch /tmp/should-not-run'" in all_commands
+    assert "ghcr.io/example/agent; touch /tmp/should-not-run" in all_commands
+    assert "; touch /tmp/should-not-run &&" not in all_commands

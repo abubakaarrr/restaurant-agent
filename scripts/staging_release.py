@@ -117,7 +117,8 @@ def build_staging_plan(
         else "python scripts/migrate.py"
     )
 
-    ssh_prefix = f"ssh -p {SSH_PORT} {remote_alias}"
+    shell_quote = shlex.quote
+    ssh_prefix = f"ssh -p {SSH_PORT} {shell_quote(remote_alias)}"
 
     def cmd(command: str) -> str:
         return f"{ssh_prefix} bash -lc {shlex.quote(command)}"
@@ -125,36 +126,40 @@ def build_staging_plan(
     commands: list[str] = [
         cmd(
             "set -euo pipefail && "
-            f"mkdir -p {remote_dir}/releases/{sha} && "
-            f"printf '%s\\n' '{sha}' > {remote_dir}/releases/{sha}/requested_sha.txt"
+            f"mkdir -p {shell_quote(remote_dir)}/releases/{shell_quote(sha)} && "
+            f"printf '%s\\n' {shell_quote(sha)} > "
+            f"{shell_quote(remote_dir)}/releases/{shell_quote(sha)}/requested_sha.txt"
         ),
         cmd(
-            f"printf '%s\\n' '{image_ref}' > "
-            f"{remote_dir}/releases/{sha}/release_image.txt"
+            f"printf '%s\\n' {shell_quote(image_ref)} > "
+            f"{shell_quote(remote_dir)}/releases/{shell_quote(sha)}/release_image.txt"
         ),
         cmd(
-            f"cd {remote_dir} && docker inspect $(docker compose ps -q web) "
+            f"cd {shell_quote(remote_dir)} && docker inspect $(docker compose ps -q web) "
             f"--format '{{{{.Config.Image}}}}' "
-            f"> {remote_dir}/releases/{sha}/previous_image.txt || true"
+            f"> {shell_quote(remote_dir)}/releases/{shell_quote(sha)}/previous_image.txt || true"
         ),
-        cmd(f"cd {remote_dir} && docker pull {image_ref}"),
+        cmd(f"cd {shell_quote(remote_dir)} && docker pull {shell_quote(image_ref)}"),
         cmd(
-            f"cd {remote_dir} && "
-            f"RESTAURANT_IMAGE_TAG={image_ref} docker compose up -d --no-build db web"
-        ),
-        cmd(
-            f"cd {remote_dir} && "
-            f"RESTAURANT_IMAGE_TAG={image_ref} docker compose run --rm web {migration_cmd}"
+            f"cd {shell_quote(remote_dir)} && "
+            f"RESTAURANT_IMAGE_TAG={shell_quote(image_ref)} "
+            "docker compose up -d --no-build db web"
         ),
         cmd(
-            f"cd {remote_dir} && "
-            f"RESTAURANT_IMAGE_TAG={image_ref} docker compose run --rm web python db/seed.py"
+            f"cd {shell_quote(remote_dir)} && "
+            f"RESTAURANT_IMAGE_TAG={shell_quote(image_ref)} "
+            f"docker compose run --rm web {migration_cmd}"
         ),
         cmd(
-            f"cd {remote_dir} && curl -fsS https://{STAGING_HOSTNAME}/health "
-            f"> {remote_dir}/releases/{sha}/smoke-health.json"
+            f"cd {shell_quote(remote_dir)} && "
+            f"RESTAURANT_IMAGE_TAG={shell_quote(image_ref)} "
+            "docker compose run --rm web python db/seed.py"
         ),
-        cmd(f"cd {remote_dir} && docker compose ps web"),
+        cmd(
+            f"cd {shell_quote(remote_dir)} && curl -fsS https://{STAGING_HOSTNAME}/health "
+            f"> {shell_quote(remote_dir)}/releases/{shell_quote(sha)}/smoke-health.json"
+        ),
+        cmd(f"cd {shell_quote(remote_dir)} && docker compose ps web"),
     ]
 
     return ReleasePlan(

@@ -30,8 +30,8 @@ mutations.
 
 ## Artifact evidence captured
 
-- `ci-image-evidence/<sha>/build-meta.txt`
-- `ci-image-evidence/<sha>/image.json`
+- `artifacts/ci-evidence/build-meta.txt`
+- `artifacts/ci-evidence/image.json`
 
 These artifacts include the generated image reference and the Docker image metadata.
 
@@ -52,4 +52,3 @@ CI builds the image with an immutable SHA tag:
   `releases/<sha>/previous_image.txt`.
 - Rollback command example:
   `RESTAURANT_IMAGE_TAG=$(cat releases/<sha>/previous_image.txt) docker compose up -d --no-build db web`.
-
