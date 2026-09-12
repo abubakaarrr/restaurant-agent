@@ -64,6 +64,8 @@ jobs:
             --ignore tests/test_app_security_integration.py
 
       - name: Configuration and security safety checks
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: |
           python -m pytest -q -p pytest_asyncio.plugin \
             tests/test_config_security.py \
