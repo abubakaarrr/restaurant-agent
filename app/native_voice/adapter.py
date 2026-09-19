@@ -12,18 +12,19 @@ import base64
 import json
 import uuid
 import inspect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Mapping
 
 from app.call_memory import reset_current_action_scope, reset_current_session_id, set_current_action_scope, set_current_session_id
-from app.native_voice.contracts import OrderPatch, OrderState
+from app.native_voice.contracts import OrderItemState, OrderPatch, OrderState
 from app.native_voice.protocol import EventRecorder, RealtimeTransport
 from app.native_voice.speech import SpeechDecision, SpeechGate
-from app.native_voice.state_store import InMemoryOrderStateStore, OrderStateStore
+from app.native_voice.state_store import CallSessionOrderStateStore, OrderStateStore
 from app.native_voice.tools import (
     RestaurantToolExecutor,
     ToolBridge,
     ToolOutcome,
+    MUTATING_TOOLS,
     realtime_tool_definitions,
 )
 from app.native_voice.turns import CompletedCallerTurn, TurnAssembler
@@ -88,6 +89,7 @@ class _ResponseBuffer:
     audio: bytearray = field(default_factory=bytearray)
     transcript_parts: list[str] = field(default_factory=list)
     tool_calls: dict[str, tuple[str, dict[str, Any]]] = field(default_factory=dict)
+    assistant_item_id: str = ""
 
 
 class InterruptionController:
@@ -132,7 +134,7 @@ class NativeVoiceAdapter:
         self.session_id = session_id
         self.transport = transport
         self.config = config or RealtimeConfig()
-        self.state_store = state_store or InMemoryOrderStateStore()
+        self.state_store = state_store or CallSessionOrderStateStore()
         self.tool_bridge = tool_bridge or ToolBridge(RestaurantToolExecutor())
         self.recorder = recorder or EventRecorder()
         self.speech_gate = speech_gate or SpeechGate()
@@ -194,10 +196,21 @@ class NativeVoiceAdapter:
         return await self._drain_response(transcript=transcript)
 
     async def interrupt(self) -> None:
+        response = self._response
         generation = self.interruptions.interrupt()
         self.turns.reset()
         await self.transport.send({"type": "response.cancel"})
         await self.transport.send({"type": "output_audio_buffer.clear"})
+        if response is not None and response.assistant_item_id and response.audio:
+            audio_end_ms = round(len(response.audio) * 1000 / (self.config.sample_rate_hz * 2))
+            await self.transport.send(
+                {
+                    "type": "conversation.item.truncate",
+                    "item_id": response.assistant_item_id,
+                    "content_index": 0,
+                    "audio_end_ms": audio_end_ms,
+                }
+            )
         self.recorder.record({"type": "interruption", "generation": generation})
         self._response = None
         self._outcomes.clear()
@@ -233,10 +246,18 @@ class NativeVoiceAdapter:
                 await self._finalize_caller_turn(str(event.get("transcript") or transcript or ""))
                 continue
             if event_type == "response.output_audio.delta":
+                self._response.assistant_item_id = str(event.get("item_id") or self._response.assistant_item_id)
                 try:
                     self._response.audio.extend(base64.b64decode(str(event.get("delta") or "")))
                 except Exception:
                     self.recorder.record({"type": "audio_decode_error"})
+                continue
+            if event_type in {"response.output_item.added", "response.output_item.done"}:
+                item = event.get("item") or {}
+                if item.get("type") == "message" and item.get("role") == "assistant":
+                    self._response.assistant_item_id = str(item.get("id") or self._response.assistant_item_id)
+                if event_type == "response.output_item.done" and item.get("type") == "function_call":
+                    self._remember_tool_call(item)
                 continue
             if event_type == "response.output_audio_transcript.delta":
                 self._response.transcript_parts.append(str(event.get("delta") or ""))
@@ -247,11 +268,6 @@ class NativeVoiceAdapter:
                 continue
             if event_type == "response.function_call_arguments.done":
                 self._remember_tool_call(event)
-                continue
-            if event_type == "response.output_item.done":
-                item = event.get("item") or {}
-                if item.get("type") == "function_call":
-                    self._remember_tool_call(item)
                 continue
             if event_type == "error":
                 self.recorder.record({"type": "tool_or_response_failure", "code": (event.get("error") or {}).get("code", "realtime_error")})
@@ -278,6 +294,9 @@ class NativeVoiceAdapter:
                         }
                         await self.transport.send(output)
                         self.recorder.record({"type": "tool_result_sent", "call_id": call_id, "success": outcome.success})
+                    synced = await self._sync_order_memory()
+                    if synced is not None:
+                        self._outcomes = [replace(outcome, state_version=synced.version) for outcome in self._outcomes]
                     # The next response has a new server response id.  Clear
                     # the old id before accepting its ``response.created``.
                     self.interruptions.active_response_id = ""
@@ -326,9 +345,70 @@ class NativeVoiceAdapter:
             "unresolved_count": len(self.state.unresolved_fields),
         })
 
+    async def _sync_order_memory(self) -> OrderState | None:
+        readbacks = [
+            outcome.readback
+            for outcome in self._outcomes
+            if outcome.success and outcome.readback_verified and isinstance(outcome.readback, Mapping)
+        ]
+        if not readbacks or self._completed_turn is None:
+            return None
+        readback = readbacks[-1]
+        current = await self.state_store.load(self.session_id)
+        if self._completed_turn.turn_id in current.source_turn_ids:
+            return None
+        items = tuple(
+            OrderItemState(
+                canonical_item_id=str(value.get("item_id") or "order-item"),
+                item_name=str(value.get("item_name") or value.get("name") or "order item"),
+                quantity=int(value.get("quantity") or 1),
+                modifiers=tuple(str(item) for item in value.get("modifiers") or ()),
+                removals=tuple(str(item) for item in value.get("removals") or ()),
+                substitutions=tuple(str(item) for item in value.get("substitutions") or ()),
+                source_turn_ids=(self._completed_turn.turn_id,),
+                line_id=str(value.get("order_item_id") or ""),
+                notes=str(value.get("notes") or ""),
+            )
+            for value in readback.get("items") or ()
+            if isinstance(value, Mapping)
+        )
+        incoming_line_ids = {item.line_id for item in items if item.line_id}
+        remove_line_ids = tuple(
+            item.line_id
+            for item in current.items
+            if item.line_id and item.status != "removed" and item.line_id not in incoming_line_ids
+        )
+        patch = OrderPatch(
+            source_turn_id=self._completed_turn.turn_id,
+            items=items,
+            remove_line_ids=remove_line_ids,
+            order_notes=str(readback.get("order_notes") or ""),
+            allergy_notes=str(readback.get("allergy_notes") or ""),
+            fulfillment=str(readback.get("fulfillment") or ""),
+            fulfillment_details=readback.get("fulfillment_details") or {},
+            status=str(readback.get("status") or "draft"),
+        )
+        if not items and not remove_line_ids and not patch.order_notes and not patch.allergy_notes and not patch.fulfillment:
+            return None
+        next_state = current.apply(patch)
+        await self.state_store.save(self.session_id, next_state, expected_version=current.version)
+        self.state = next_state
+        self.recorder.record({"type": "order_memory_synced", "turn_id": patch.source_turn_id, "state_version": next_state.version})
+        return next_state
+
     async def _run_tool(self, call_id: str, name: str, args: Mapping[str, Any], *, generation: int) -> ToolOutcome:
         if generation != self.interruptions.generation:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="stale_interrupted_tool_call", state_version=self.state.version)
+        if name in MUTATING_TOOLS and self.state.unresolved_fields:
+            return ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=dict(args),
+                result=None,
+                success=False,
+                error="clarification_required",
+                state_version=self.state.version,
+            )
         session_token = set_current_session_id(self.session_id)
         scope_token = set_current_action_scope(self._completed_turn.turn_id if self._completed_turn else call_id)
         try:

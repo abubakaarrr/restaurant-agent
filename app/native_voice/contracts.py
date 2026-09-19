@@ -206,6 +206,10 @@ class OrderState:
 
     def apply(self, patch: OrderPatch) -> "OrderState":
         """Apply one finalized turn atomically and increment the state version."""
+        if not patch.source_turn_id:
+            raise ValueError("source_turn_id is required")
+        if patch.source_turn_id in self.source_turn_ids:
+            raise ValueError("source turn has already been applied")
         items = list(self.items)
         for incoming in patch.items:
             match_index = next(

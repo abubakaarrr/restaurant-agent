@@ -123,6 +123,14 @@ def test_ambiguous_fact_is_unresolved_until_explicitly_cleared():
     assert resolved.items[0].canonical_item_id == "menu.sandwich.portobello"
 
 
+def test_finalized_turn_cannot_be_applied_twice():
+    state = OrderState().apply(
+        OrderPatch(source_turn_id="turn-1", items=(item("menu.na.lemonade", "House Lemonade", 1),))
+    )
+    with pytest.raises(ValueError, match="already been applied"):
+        state.apply(OrderPatch(source_turn_id="turn-1", items=(item("menu.na.lemonade", "House Lemonade", 2),)))
+
+
 @pytest.mark.asyncio
 async def test_structured_state_survives_adapter_restart_without_model_history():
     store = InMemoryOrderStateStore()
@@ -187,7 +195,8 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
         facts={"availability": "available", "prices": {"Hearth Burger": 21.0}, "items": ["Hearth Burger"]},
     )
     assert gate.evaluate("Your booking is confirmed.", b"audio", evidence=[evidence], current_state_version=1).allowed
-    assert gate.evaluate("The 9 PM patio slot is available.", b"audio", evidence=[evidence], current_state_version=1).allowed
+    assert not gate.evaluate("The 9 PM patio slot is available.", b"audio", evidence=[evidence], current_state_version=1).allowed
+    assert not gate.evaluate("Hearth Burger is available.", b"audio", evidence=[evidence], current_state_version=2).allowed
     assert gate.evaluate("The Dragon Burger costs $99.00.", b"audio", evidence=[evidence], current_state_version=1).allowed is False
 
 
@@ -199,6 +208,8 @@ def test_realtime_config_is_native_audio_and_strictly_development_scoped():
     assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
     assert session["audio"]["output"]["voice"] == "marin"
     assert all(tool["parameters"]["additionalProperties"] is False for tool in realtime_tool_definitions())
+    names = {tool["name"] for tool in realtime_tool_definitions()}
+    assert {"set_order_notes", "update_order_item", "remove_order_item", "update_confirmed_booking"} <= names
 
 
 @pytest.mark.asyncio
@@ -215,7 +226,7 @@ async def test_adapter_emits_native_audio_after_final_turn_and_records_protocol_
             {"type": "response.done", "response_id": "response-1"},
         ]
     )
-    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport)
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
     result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-1")
     assert result.audio == output
     assert result.turn and result.turn.transcript == "hello"
@@ -243,7 +254,12 @@ async def test_adapter_tool_result_readback_unlocks_only_matching_final_response
             {"type": "response.done", "response_id": "response-2"},
         ]
     )
-    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, tool_bridge=ToolBridge(executor))
+    adapter = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=transport,
+        state_store=InMemoryOrderStateStore(),
+        tool_bridge=ToolBridge(executor),
+    )
     result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-1")
     assert result.audio == b"confirmed-audio"
     assert result.tool_outcomes[0].readback_verified
@@ -253,7 +269,7 @@ async def test_adapter_tool_result_readback_unlocks_only_matching_final_response
 @pytest.mark.asyncio
 async def test_interruption_cancels_audio_and_rejects_stale_generation():
     transport = MemoryRealtimeTransport()
-    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport)
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
     await adapter.start()
     generation = adapter.interruptions.generation
     await adapter.interrupt()
@@ -261,6 +277,61 @@ async def test_interruption_cancels_audio_and_rejects_stale_generation():
     assert {event["type"] for event in transport.sent} >= {"response.cancel", "output_audio_buffer.clear"}
     assert not adapter.interruptions.accepts(generation=generation, response_id="old-response")
     assert any(event.event_type == "interruption" for event in adapter.recorder.events)
+
+
+@pytest.mark.asyncio
+async def test_interruption_truncates_buffered_assistant_item():
+    output = b"\x00\x01" * 240
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response_id": "response-1"},
+            {"type": "response.output_item.added", "response_id": "response-1", "item": {"id": "item-1", "type": "message", "role": "assistant"}},
+            {"type": "response.output_audio.delta", "response_id": "response-1", "item_id": "item-1", "delta": base64.b64encode(output).decode()},
+            {"type": "input_audio_buffer.speech_started"},
+        ]
+    )
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
+    await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-1")
+    truncate = next(event for event in transport.sent if event["type"] == "conversation.item.truncate")
+    assert truncate == {
+        "type": "conversation.item.truncate",
+        "item_id": "item-1",
+        "content_index": 0,
+        "audio_end_ms": 10,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unresolved_state_blocks_mutating_tool_calls():
+    store = InMemoryOrderStateStore()
+    unresolved = OrderState().apply(
+        OrderPatch(
+            source_turn_id="turn-0",
+            unresolved_fields=(UnresolvedField("item", "ambiguous", ("one", "two"), "turn-0"),),
+        )
+    )
+    await store.save("call-1", unresolved, expected_version=0)
+    executor = FakeExecutor(result={"ok": True})
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response_id": "response-1"},
+            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "yes"},
+            {"type": "response.function_call_arguments.done", "response_id": "response-1", "call_id": "tool-1", "name": "add_order_item", "arguments": "{\"session_id\":\"call-1\",\"item_name\":\"Hearth Burger\"}"},
+            {"type": "response.done", "response_id": "response-1"},
+            {"type": "response.created", "response_id": "response-2"},
+            {"type": "response.output_audio_transcript.delta", "response_id": "response-2", "delta": "Which item did you mean?"},
+            {"type": "response.done", "response_id": "response-2"},
+        ]
+    )
+    adapter = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=transport,
+        state_store=store,
+        tool_bridge=ToolBridge(executor),
+    )
+    result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-1")
+    assert result.tool_outcomes[0].error == "clarification_required"
+    assert not executor.calls
 
 
 def test_production_entrypoint_does_not_import_native_voice():

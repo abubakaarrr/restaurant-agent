@@ -20,6 +20,10 @@ _UNSAFE_FACTUAL = re.compile(
     r"\b(?:the menu|the item|the dish|the order|the booking|the table|the price|the slot|we have|we can seat|it costs?)\b",
     re.IGNORECASE,
 )
+_SUBJECT_WORDS = re.compile(
+    r"\b(?:burger|sandwich|salad|crisp|lemonade|dessert|table|slot|patio|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +77,7 @@ class SpeechGate:
                 if item.speakable
                 and item.state_version == current_state_version
                 and self._success_action_supports(item.action, success_match.group(0).casefold())
+                and self._subject_matches(text, item.facts)
             ]
             if not matching:
                 reasons.append("success_claim_without_matching_readback")
@@ -86,6 +91,7 @@ class SpeechGate:
             if not any(
                 item.speakable
                 and item.state_version == current_state_version
+                and self._subject_matches(text, item.facts)
                 and any(
                     abs(float(value) - spoken_price) < 0.005
                     for value in (item.facts.get("prices") or {}).values()
@@ -96,7 +102,13 @@ class SpeechGate:
                 reasons.append("price_without_authoritative_evidence")
 
         if _AVAILABILITY.search(text or ""):
-            if not any(item.speakable and item.facts.get("availability") for item in evidence_list):
+            if not any(
+                item.speakable
+                and item.state_version == current_state_version
+                and item.facts.get("availability")
+                and self._subject_matches(text, item.facts)
+                for item in evidence_list
+            ):
                 reasons.append("availability_without_authoritative_evidence")
 
         for claim in claims:
@@ -131,7 +143,13 @@ class SpeechGate:
         if word == "placed":
             return action == "confirm_order"
         if word == "updated":
-            return action in {"update_confirmed_booking", "update_order_item", "set_order_notes", "set_fulfillment"}
+            return action in {
+                "update_confirmed_booking",
+                "update_reservation_draft",
+                "update_order_item",
+                "set_order_notes",
+                "set_order_fulfillment",
+            }
         if word == "removed":
             return action == "remove_order_item"
         if word == "confirmed":
@@ -159,3 +177,39 @@ class SpeechGate:
             if kind == "success" and SpeechGate._success_action_supports(item.action, str(value).casefold()):
                 return True
         return False
+
+    @staticmethod
+    def _subject_matches(text: str, facts: Mapping[str, Any]) -> bool:
+        normalized = " ".join((text or "").casefold().split())
+        items = facts.get("items") or ()
+        if isinstance(items, Mapping):
+            items = tuple(items)
+        item_names = tuple(
+            str(item.get("item_name") or item.get("name") or item.get("item_id") or "").casefold()
+            if isinstance(item, Mapping)
+            else str(item).casefold()
+            for item in items
+            if item
+        )
+        if isinstance(subject := facts.get("subject"), Mapping):
+            item_names += (str(subject.get("item_name") or "").casefold(),)
+        if item_names and any(item_name in normalized for item_name in item_names):
+            return True
+        subject = facts.get("subject") or {}
+        if isinstance(subject, Mapping):
+            numbered_subject = re.search(r"\b(?:booking|order)\s*#?\s*(\d+)\b", normalized)
+            if numbered_subject:
+                expected_id = str(subject.get("booking_id") or subject.get("order_id") or "")
+                return bool(expected_id and numbered_subject.group(1) == expected_id)
+            spoken_time = re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", normalized)
+            expected_time = str(subject.get("time") or "").casefold()
+            if spoken_time and expected_time:
+                digits = re.sub(r"[^0-9]", "", spoken_time.group(0))
+                expected_digits = re.sub(r"[^0-9]", "", expected_time)
+                if digits and expected_digits and digits == expected_digits:
+                    return True
+            for key in ("date", "preferred_location", "booking_id", "order_id", "session_id"):
+                value = str(subject.get(key) or "").casefold()
+                if value and value in normalized:
+                    return True
+        return not bool(_SUBJECT_WORDS.search(normalized))

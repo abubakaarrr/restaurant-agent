@@ -16,6 +16,8 @@ MUTATING_TOOLS = frozenset(
         "create_booking",
         "update_confirmed_booking",
         "cancel_booking",
+        "add_guest_note",
+        "update_reservation_draft",
         "add_order_item",
         "set_order_fulfillment",
         "set_order_notes",
@@ -154,6 +156,13 @@ class RestaurantToolExecutor:
             return await restaurant_service.get_order_summary(
                 call_id=str(arguments.get("session_id") or "")
             )
+        if name == "update_reservation_draft":
+            return await self.executor.invoke("get_reservation_draft", {"session_id": arguments.get("session_id", "")})
+        if name == "add_guest_note":
+            booking_id = int(arguments.get("booking_id") or 0)
+            if booking_id:
+                return await self.executor.invoke("lookup_booking", {"booking_id": booking_id})
+            return await self.executor.invoke("get_order_summary", {"session_id": arguments.get("session_id", "")})
         if name in {"create_booking", "update_confirmed_booking", "cancel_booking"}:
             from app.services.restaurant import restaurant_service
 
@@ -242,6 +251,54 @@ def realtime_tool_definitions() -> list[dict[str, Any]]:
             ["session_id", "fulfillment_type"],
         ),
         _tool_definition(
+            "set_order_notes",
+            "Set or clear authoritative order-level and allergy notes.",
+            {
+                "session_id": {"type": "string"},
+                "order_notes": {"type": ["string", "null"]},
+                "allergy_notes": {"type": ["string", "null"]},
+                "caller_confirmed": {"type": "boolean"},
+            },
+            ["session_id"],
+        ),
+        _tool_definition(
+            "update_order_item",
+            "Correct one existing order item quantity or notes.",
+            {
+                "session_id": {"type": "string"},
+                "order_item_id": {"type": "integer", "minimum": 1},
+                "quantity": {"type": "integer", "minimum": 1, "maximum": 20},
+                "notes": {"type": ["string", "null"]},
+                "caller_confirmed": {"type": "boolean"},
+            },
+            ["session_id", "order_item_id", "quantity"],
+        ),
+        _tool_definition(
+            "remove_order_item",
+            "Remove one existing order item after caller confirmation.",
+            {
+                "session_id": {"type": "string"},
+                "order_item_id": {"type": "integer", "minimum": 1},
+                "caller_confirmed": {"type": "boolean"},
+            },
+            ["session_id", "order_item_id"],
+        ),
+        _tool_definition(
+            "update_reservation_draft",
+            "Save or correct reservation fields before booking.",
+            {
+                "session_id": {"type": "string"}, "name": {"type": ["string", "null"]},
+                "phone": {"type": ["string", "null"]}, "date": {"type": ["string", "null"]},
+                "time": {"type": ["string", "null"]}, "party_size": {"type": ["integer", "null"]},
+                "seating_preference": {"type": ["string", "null"]},
+                "seating_backup": {"type": ["string", "null"]},
+                "seating_avoid": {"type": ["string", "null"]}, "dietary": {"type": ["string", "null"]},
+                "occasion": {"type": ["string", "null"]}, "extra_notes": {"type": ["string", "null"]},
+                "require_approval_for_paid_items": {"type": ["boolean", "null"]},
+            },
+            ["session_id"],
+        ),
+        _tool_definition(
             "confirm_order",
             "Commit only after a complete readback, caller approval, and matching draft version.",
             {
@@ -256,6 +313,44 @@ def realtime_tool_definitions() -> list[dict[str, Any]]:
             "Read the reservation draft without treating it as booked.",
             {"session_id": {"type": "string"}},
             ["session_id"],
+        ),
+        _tool_definition(
+            "update_confirmed_booking",
+            "Correct an existing booking after authoritative readback and approval.",
+            {
+                "session_id": {"type": "string"}, "booking_id": {"type": "integer", "minimum": 1},
+                "date": {"type": "string"}, "time": {"type": "string"},
+                "party_size": {"type": "integer", "minimum": 1},
+                "seating_preference": {"type": ["string", "null"]},
+                "seating_backup": {"type": ["string", "null"]},
+                "seating_avoid": {"type": ["string", "null"]}, "dietary": {"type": ["string", "null"]},
+                "occasion": {"type": ["string", "null"]}, "extra_notes": {"type": ["string", "null"]},
+                "customer_name": {"type": "string"},
+                "require_approval_for_paid_items": {"type": ["boolean", "null"]},
+                "caller_confirmed": {"type": "boolean"},
+            },
+            ["session_id", "booking_id"],
+        ),
+        _tool_definition(
+            "lookup_booking",
+            "Read one booking by exact reference or verified customer details.",
+            {
+                "booking_id": {"type": "integer", "minimum": 1},
+                "customer_name": {"type": "string"}, "customer_phone": {"type": "string"},
+            },
+            [],
+        ),
+        _tool_definition(
+            "add_guest_note",
+            "Save a guest instruction on the authoritative reservation or order.",
+            {"note": {"type": "string"}, "session_id": {"type": "string"}, "booking_id": {"type": "integer"}},
+            ["note", "session_id"],
+        ),
+        _tool_definition(
+            "lookup_order",
+            "Read an order only after exact customer verification.",
+            {"order_id": {"type": "integer", "minimum": 1}, "customer_name": {"type": "string"}},
+            ["order_id", "customer_name"],
         ),
         _tool_definition(
             "create_booking",
@@ -388,9 +483,19 @@ class ToolBridge:
     @staticmethod
     def _facts(result: Any, readback: Any, arguments: Mapping[str, Any]) -> dict[str, Any]:
         facts: dict[str, Any] = {}
+        subject = {
+            key: arguments[key]
+            for key in ("item_name", "date", "time", "preferred_location", "session_id", "booking_id")
+            if arguments.get(key) not in (None, "", 0)
+        }
+        if subject:
+            facts["subject"] = subject
         for value in (result, readback):
             if not isinstance(value, Mapping):
                 continue
+            for key in ("booking_id", "order_id"):
+                if value.get(key) not in (None, "", 0):
+                    facts.setdefault("subject", {})[key] = value[key]
             for key in ("items", "prices", "availability", "booking", "order", "status"):
                 if key in value:
                     facts[key] = value[key]
