@@ -157,12 +157,12 @@ class RestaurantToolExecutor:
                 call_id=str(arguments.get("session_id") or "")
             )
         if name == "update_reservation_draft":
-            return await self.executor.invoke("get_reservation_draft", {"session_id": arguments.get("session_id", "")})
+            return await self.invoke("get_reservation_draft", {"session_id": arguments.get("session_id", "")})
         if name == "add_guest_note":
             booking_id = int(arguments.get("booking_id") or 0)
             if booking_id:
-                return await self.executor.invoke("lookup_booking", {"booking_id": booking_id})
-            return await self.executor.invoke("get_order_summary", {"session_id": arguments.get("session_id", "")})
+                return await self.invoke("lookup_booking", {"booking_id": booking_id})
+            return await self.invoke("get_order_summary", {"session_id": arguments.get("session_id", "")})
         if name in {"create_booking", "update_confirmed_booking", "cancel_booking"}:
             from app.services.restaurant import restaurant_service
 
@@ -380,9 +380,16 @@ def realtime_tool_definitions() -> list[dict[str, Any]]:
 class ToolBridge:
     """Validate, deduplicate, execute, and verify constrained model calls."""
 
-    def __init__(self, executor: ToolExecutor) -> None:
+    def __init__(self, executor: ToolExecutor, *, session_id: str = "") -> None:
         self.executor = executor
         self._calls: dict[str, ToolOutcome] = {}
+        self.session_id = session_id
+        self._processed_turn_ids: set[str] = set()
+
+    def bind_session(self, session_id: str) -> None:
+        if self.session_id and self.session_id != session_id:
+            raise ValueError("tool bridge is already bound to another session")
+        self.session_id = session_id
 
     async def invoke(
         self,
@@ -394,6 +401,17 @@ class ToolBridge:
         state_version: int,
     ) -> ToolOutcome:
         args = dict(arguments)
+        supplied_session_id = args.get("session_id")
+        if self.session_id and supplied_session_id not in (None, "", self.session_id):
+            return ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=args,
+                result=None,
+                success=False,
+                error="session_scope_mismatch",
+                state_version=state_version,
+            )
         fingerprint = f"{name}:{_hash(args)}"
         previous = self._calls.get(call_id)
         if previous is not None:
@@ -420,6 +438,19 @@ class ToolBridge:
                 replayed=True,
                 facts=previous.facts,
             )
+
+        if name in MUTATING_TOOLS and turn_id in self._processed_turn_ids:
+            return ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=args,
+                result=None,
+                success=False,
+                error="replayed_finalized_turn",
+                state_version=state_version,
+            )
+        if name in MUTATING_TOOLS and turn_id:
+            self._processed_turn_ids.add(turn_id)
 
         if not call_id or not name:
             outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error="invalid_tool_call", state_version=state_version)
@@ -478,7 +509,9 @@ class ToolBridge:
             if expected_draft is not None and readback.get("draft_version") is not None:
                 return int(readback["draft_version"]) == int(expected_draft)
             return bool(readback.get("status") or readback.get("order_id") or readback.get("booking_id"))
-        return bool(readback)
+        if isinstance(readback, str):
+            return not _is_failure(readback)
+        return False
 
     @staticmethod
     def _facts(result: Any, readback: Any, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -499,9 +532,19 @@ class ToolBridge:
             for key in ("items", "prices", "availability", "booking", "order", "status"):
                 if key in value:
                     facts[key] = value[key]
+            if isinstance(value.get("items"), list):
+                canonical_items = [
+                    {"id": item.get("item_id"), "name": item.get("item_name") or item.get("name")}
+                    for item in value["items"]
+                    if isinstance(item, Mapping) and (item.get("item_id") or item.get("item_name") or item.get("name"))
+                ]
+                if canonical_items:
+                    facts["canonical_items"] = canonical_items
             if value.get("item"):
                 item = value["item"]
                 if isinstance(item, Mapping):
+                    if item.get("item_id") or item.get("name"):
+                        facts.setdefault("canonical_items", []).append({"id": item.get("item_id"), "name": item.get("name")})
                     facts.setdefault("items", []).append(item.get("item_id") or item.get("name"))
                     if item.get("price") is not None:
                         facts.setdefault("prices", {})[item.get("item_id") or item.get("name")] = item["price"]
@@ -509,10 +552,10 @@ class ToolBridge:
             item_name = str(arguments.get("item_name") or "")
             if item_name and item_name.casefold() in result.casefold() and not result.casefold().startswith("no matching"):
                 facts.setdefault("items", []).append(item_name)
-            if re.search(r"\bavailable\b", result, re.IGNORECASE):
-                facts["availability"] = "available"
-            elif re.search(r"\b(?:sold out|unavailable|not available)\b", result, re.IGNORECASE):
+            if re.search(r"\b(?:not available|unavailable|sold out|not yet available|out of stock|closed)\b", result, re.IGNORECASE):
                 facts["availability"] = "unavailable"
+            elif re.search(r"\b(?:available|open|in stock)\b", result, re.IGNORECASE):
+                facts["availability"] = "available"
             prices = re.findall(r"\$\s*(\d+(?:\.\d{1,2})?)", result)
             if prices:
                 facts["prices"] = {item_name or "amount": float(prices[-1])}

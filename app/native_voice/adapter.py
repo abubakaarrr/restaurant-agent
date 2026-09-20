@@ -90,6 +90,7 @@ class _ResponseBuffer:
     transcript_parts: list[str] = field(default_factory=list)
     tool_calls: dict[str, tuple[str, dict[str, Any]]] = field(default_factory=dict)
     assistant_item_id: str = ""
+    played_audio_bytes: int = 0
 
 
 class InterruptionController:
@@ -148,6 +149,9 @@ class NativeVoiceAdapter:
         self._last_result: VoiceTurnResult | None = None
         self._outcomes: list[ToolOutcome] = []
         self._seen_tool_calls: set[str] = set()
+        self._replayed_finalized_turns: set[str] = set()
+        if hasattr(self.tool_bridge, "bind_session"):
+            self.tool_bridge.bind_session(session_id)
 
     async def start(self) -> None:
         if self._started:
@@ -184,6 +188,8 @@ class NativeVoiceAdapter:
         if self._response is not None:
             await self.interrupt()
         resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:12]}"
+        if self.turns.completed(resolved_turn_id) is not None:
+            self._replayed_finalized_turns.add(resolved_turn_id)
         self.turns.start(resolved_turn_id)
         self.recorder.record_audio("audio_received", audio, turn_id=resolved_turn_id)
         append = {"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")}
@@ -195,14 +201,20 @@ class NativeVoiceAdapter:
         self.recorder.record({"type": "response.create", "turn_id": resolved_turn_id})
         return await self._drain_response(transcript=transcript)
 
+    def mark_audio_played(self, byte_count: int) -> None:
+        if byte_count < 0:
+            raise ValueError("byte_count cannot be negative")
+        if self._response is not None:
+            self._response.played_audio_bytes = min(byte_count, len(self._response.audio))
+
     async def interrupt(self) -> None:
         response = self._response
         generation = self.interruptions.interrupt()
         self.turns.reset()
         await self.transport.send({"type": "response.cancel"})
         await self.transport.send({"type": "output_audio_buffer.clear"})
-        if response is not None and response.assistant_item_id and response.audio:
-            audio_end_ms = round(len(response.audio) * 1000 / (self.config.sample_rate_hz * 2))
+        if response is not None and response.assistant_item_id:
+            audio_end_ms = round(response.played_audio_bytes * 1000 / (self.config.sample_rate_hz * 2))
             await self.transport.send(
                 {
                     "type": "conversation.item.truncate",
@@ -328,6 +340,10 @@ class NativeVoiceAdapter:
         self._completed_turn = completed
         self.recorder.record({"type": "turn_finalized", "turn_id": completed.turn_id, "version": completed.version})
         self.state = await self.state_store.load(self.session_id)
+        if completed.turn_id in self.state.finalized_turn_ids:
+            self._replayed_finalized_turns.add(completed.turn_id)
+            self.recorder.record({"type": "replayed_turn_rejected", "turn_id": completed.turn_id})
+            return
         patch = None
         if self.facts_extractor is not None:
             extracted = self.facts_extractor(completed, self.state)
@@ -337,6 +353,9 @@ class NativeVoiceAdapter:
         if patch is not None:
             await self.apply_order_patch(patch)
         else:
+            next_state = self.state.mark_turn_finalized(completed.turn_id)
+            await self.state_store.save(self.session_id, next_state, expected_version=self.state.version)
+            self.state = next_state
             self.recorder.record({"type": "facts_extracted", "turn_id": completed.turn_id, "state_version": self.state.version})
         self.recorder.record({
             "type": "clarify_or_draft",
@@ -349,7 +368,17 @@ class NativeVoiceAdapter:
         readbacks = [
             outcome.readback
             for outcome in self._outcomes
-            if outcome.success and outcome.readback_verified and isinstance(outcome.readback, Mapping)
+            if outcome.name in {
+                "add_order_item",
+                "set_order_fulfillment",
+                "set_order_notes",
+                "update_order_item",
+                "remove_order_item",
+                "confirm_order",
+            }
+            and outcome.success
+            and outcome.readback_verified
+            and isinstance(outcome.readback, Mapping)
         ]
         if not readbacks or self._completed_turn is None:
             return None
@@ -399,6 +428,8 @@ class NativeVoiceAdapter:
     async def _run_tool(self, call_id: str, name: str, args: Mapping[str, Any], *, generation: int) -> ToolOutcome:
         if generation != self.interruptions.generation:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="stale_interrupted_tool_call", state_version=self.state.version)
+        if self._completed_turn is not None and self._completed_turn.turn_id in self._replayed_finalized_turns:
+            return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="replayed_finalized_turn", state_version=self.state.version)
         if name in MUTATING_TOOLS and self.state.unresolved_fields:
             return ToolOutcome(
                 name=name,

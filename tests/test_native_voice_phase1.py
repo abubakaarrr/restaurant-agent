@@ -75,6 +75,7 @@ def test_compound_order_state_retains_every_field_and_correction_history():
                     substitutions=("modifier.gluten-aware-bun",),
                     source_turn_ids=("turn-1",),
                     line_id="burger-1",
+                    notes="extra sauce",
                 ),
                 item("menu.dessert.apple-crisp", "Skillet Apple Crisp", 1, source_turn_ids=("turn-1",), line_id="dessert-1"),
             ),
@@ -100,8 +101,21 @@ def test_compound_order_state_retains_every_field_and_correction_history():
     )
     assert corrected.version == 2
     assert corrected.items[0].quantity == 1
+    assert corrected.items[0].modifiers == ("modifier.side-fries",)
+    assert corrected.items[0].removals == ("onion jam",)
+    assert corrected.items[0].notes == "extra sauce"
     assert corrected.corrections[-1].previous_value == 2
     assert corrected.source_turn_ids == ("turn-1", "turn-2")
+
+    cleared = corrected.apply(
+        OrderPatch(
+            source_turn_id="turn-3",
+            items=(item("menu.main.hearth-burger", "Hearth Burger", 1, line_id="burger-1", modifiers=(), removals=(), substitutions=(), notes=""),),
+        )
+    )
+    assert not cleared.items[0].modifiers
+    assert not cleared.items[0].removals
+    assert cleared.items[0].notes == ""
 
 
 def test_ambiguous_fact_is_unresolved_until_explicitly_cleared():
@@ -112,6 +126,7 @@ def test_ambiguous_fact_is_unresolved_until_explicitly_cleared():
         )
     )
     assert state.status == "needs_clarification"
+    assert state.finalized_turn_ids == ("turn-1",)
     resolved = state.apply(
         OrderPatch(
             source_turn_id="turn-2",
@@ -161,6 +176,46 @@ async def test_tool_bridge_requires_readback_and_replays_idempotently():
     conflict = await bridge.invoke(call_id="tool-1", name="add_order_item", arguments={**args, "quantity": 3}, turn_id="turn-2", state_version=2)
     assert not conflict.success and conflict.error == "idempotency_conflict"
 
+    second_call = await bridge.invoke(call_id="tool-2", name="add_order_item", arguments=args, turn_id="turn-1", state_version=1)
+    assert not second_call.success and second_call.error == "replayed_finalized_turn"
+
+
+@pytest.mark.asyncio
+async def test_tool_bridge_rejects_cross_session_and_error_readbacks():
+    executor = FakeExecutor(result="saved", readback="order_not_found: no order")
+    bridge = ToolBridge(executor)
+    bridge.bind_session("call-a")
+    cross_session = await bridge.invoke(
+        call_id="tool-cross",
+        name="set_order_notes",
+        arguments={"session_id": "call-b", "order_notes": "hello"},
+        turn_id="turn-1",
+        state_version=1,
+    )
+    assert not cross_session.success and cross_session.error == "session_scope_mismatch"
+    failed_readback = await bridge.invoke(
+        call_id="tool-note",
+        name="set_order_notes",
+        arguments={"session_id": "call-a", "order_notes": "hello"},
+        turn_id="turn-2",
+        state_version=1,
+    )
+    assert not failed_readback.readback_verified
+
+
+@pytest.mark.asyncio
+async def test_availability_parser_preserves_negative_authoritative_result():
+    outcome = await ToolBridge(
+        FakeExecutor(result="Hearth Burger is not available at $21.")
+    ).invoke(
+        call_id="tool-availability",
+        name="check_menu_item_availability",
+        arguments={"item_name": "Hearth Burger"},
+        turn_id="turn-1",
+        state_version=1,
+    )
+    assert outcome.facts["availability"] == "unavailable"
+
 
 @pytest.mark.asyncio
 async def test_tool_failure_or_readback_mismatch_cannot_unlock_success_speech():
@@ -197,6 +252,27 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     assert gate.evaluate("Your booking is confirmed.", b"audio", evidence=[evidence], current_state_version=1).allowed
     assert not gate.evaluate("The 9 PM patio slot is available.", b"audio", evidence=[evidence], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger is available.", b"audio", evidence=[evidence], current_state_version=2).allowed
+    unavailable = ToolEvidence(
+        action="check_menu_item_availability",
+        call_id="tool-5",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={"availability": "unavailable", "items": ["Hearth Burger"]},
+    )
+    assert not gate.evaluate("Hearth Burger is available.", b"audio", evidence=[unavailable], current_state_version=1).allowed
+    assert gate.evaluate("Hearth Burger is unavailable.", b"audio", evidence=[unavailable], current_state_version=1).allowed
+    alias = ToolEvidence(
+        action="check_menu_item_availability",
+        call_id="tool-6",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={"availability": "available", "items": ["burger"], "prices": {"burger": 21.0}},
+    )
+    assert not gate.evaluate("Dragon Burger costs $21.", b"audio", evidence=[alias], current_state_version=1).allowed
     assert gate.evaluate("The Dragon Burger costs $99.00.", b"audio", evidence=[evidence], current_state_version=1).allowed is False
 
 
@@ -297,7 +373,7 @@ async def test_interruption_truncates_buffered_assistant_item():
         "type": "conversation.item.truncate",
         "item_id": "item-1",
         "content_index": 0,
-        "audio_end_ms": 10,
+        "audio_end_ms": 0,
     }
 
 

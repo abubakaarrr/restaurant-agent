@@ -24,6 +24,8 @@ _SUBJECT_WORDS = re.compile(
     r"\b(?:burger|sandwich|salad|crisp|lemonade|dessert|table|slot|patio|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
     re.IGNORECASE,
 )
+_AVAILABLE = re.compile(r"\b(?:available|open|in stock)\b", re.IGNORECASE)
+_UNAVAILABLE = re.compile(r"\b(?:not available|unavailable|sold out|not yet available|out of stock|closed)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -77,7 +79,7 @@ class SpeechGate:
                 if item.speakable
                 and item.state_version == current_state_version
                 and self._success_action_supports(item.action, success_match.group(0).casefold())
-                and self._subject_matches(text, item.facts)
+                and self._success_subject_matches(text, item.facts)
             ]
             if not matching:
                 reasons.append("success_claim_without_matching_readback")
@@ -101,11 +103,12 @@ class SpeechGate:
             ):
                 reasons.append("price_without_authoritative_evidence")
 
-        if _AVAILABILITY.search(text or ""):
+        spoken_availability = self._availability_value(text)
+        if spoken_availability:
             if not any(
                 item.speakable
                 and item.state_version == current_state_version
-                and item.facts.get("availability")
+                and self._availability_matches(spoken_availability, item.facts.get("availability"))
                 and self._subject_matches(text, item.facts)
                 for item in evidence_list
             ):
@@ -117,8 +120,11 @@ class SpeechGate:
 
         # A response which presents a restaurant fact without a tool result is
         # blocked even when its wording does not match one of the narrow regexes.
-        if _UNSAFE_FACTUAL.search(text or "") and not any(
-            item.speakable and item.state_version == current_state_version for item in evidence_list
+        if _UNSAFE_FACTUAL.search(text or "") and not success_match and not any(
+            item.speakable
+            and item.state_version == current_state_version
+            and self._subject_matches(text, item.facts)
+            for item in evidence_list
         ):
             reasons.append("factual_claim_without_authority")
 
@@ -166,13 +172,21 @@ class SpeechGate:
             if not item.speakable or item.state_version != current_state_version:
                 continue
             facts = item.facts
-            if kind == "item" and str(value) in {str(v) for v in facts.get("items", ())}:
-                return True
+            if kind == "item":
+                candidates = facts.get("items") or ()
+                names = {
+                    str(candidate.get("item_name") or candidate.get("name") or candidate.get("item_id") or "")
+                    if isinstance(candidate, Mapping)
+                    else str(candidate)
+                    for candidate in candidates
+                }
+                if str(value) in names:
+                    return True
             if kind == "price":
                 prices = facts.get("prices") or {}
-                if str(value) in {str(v) for v in prices.values()} or value in prices.values():
+                if (str(value) in {str(v) for v in prices.values()} or value in prices.values()) and self._claim_subject_matches(claim, facts):
                     return True
-            if kind == "availability" and value == facts.get("availability"):
+            if kind == "availability" and self._availability_matches(str(value), facts.get("availability")) and self._claim_subject_matches(claim, facts):
                 return True
             if kind == "success" and SpeechGate._success_action_supports(item.action, str(value).casefold()):
                 return True
@@ -191,10 +205,34 @@ class SpeechGate:
             for item in items
             if item
         )
+        prices = facts.get("prices") or {}
+        if isinstance(prices, Mapping):
+            item_names += tuple(str(name).casefold() for name in prices if name not in {"", "amount"})
+        canonical_items = facts.get("canonical_items") or ()
+        item_names += tuple(
+            str(item.get("name") or "").casefold()
+            for item in canonical_items
+            if isinstance(item, Mapping) and item.get("name")
+        )
         if isinstance(subject := facts.get("subject"), Mapping):
             item_names += (str(subject.get("item_name") or "").casefold(),)
-        if item_names and any(item_name in normalized for item_name in item_names):
-            return True
+        if item_names:
+            for item_name in item_names:
+                if not item_name:
+                    continue
+                pattern = rf"(?<!\w){re.escape(item_name)}(?!\w)"
+                match = re.search(pattern, normalized)
+                if not match:
+                    continue
+                if len(item_name.split()) == 1 and (
+                    item_name in {"burger", "sandwich", "salad", "dessert", "item", "food"}
+                    or not facts.get("canonical_items")
+                ):
+                    prefix = normalized[:match.start()].rstrip().split()
+                    if prefix and prefix[-1] not in {"the", "a", "an", "this", "that"}:
+                        continue
+                return True
+            return False
         subject = facts.get("subject") or {}
         if isinstance(subject, Mapping):
             numbered_subject = re.search(r"\b(?:booking|order)\s*#?\s*(\d+)\b", normalized)
@@ -204,12 +242,70 @@ class SpeechGate:
             spoken_time = re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", normalized)
             expected_time = str(subject.get("time") or "").casefold()
             if spoken_time and expected_time:
-                digits = re.sub(r"[^0-9]", "", spoken_time.group(0))
-                expected_digits = re.sub(r"[^0-9]", "", expected_time)
-                if digits and expected_digits and digits == expected_digits:
+                if self._time_minutes(spoken_time.group(0)) == self._time_minutes(expected_time):
+                    expected_location = str(subject.get("preferred_location") or "").casefold()
+                    mentioned_location = next(
+                        (location for location in ("patio", "main", "private") if re.search(rf"\b{location}\b", normalized)),
+                        "",
+                    )
+                    if mentioned_location and expected_location and mentioned_location != expected_location:
+                        return False
                     return True
             for key in ("date", "preferred_location", "booking_id", "order_id", "session_id"):
                 value = str(subject.get(key) or "").casefold()
                 if value and value in normalized:
                     return True
         return not bool(_SUBJECT_WORDS.search(normalized))
+
+    @staticmethod
+    def _availability_value(text: str) -> str:
+        if _UNAVAILABLE.search(text or ""):
+            return "unavailable"
+        if _AVAILABLE.search(text or ""):
+            return "available"
+        return ""
+
+    @staticmethod
+    def _time_minutes(value: str) -> int | None:
+        match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", value.casefold())
+        if not match:
+            return None
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        meridiem = match.group(3)
+        if meridiem:
+            if hour == 12:
+                hour = 0
+            if meridiem == "pm":
+                hour += 12
+        if hour > 23 or minute > 59:
+            return None
+        return hour * 60 + minute
+
+    @staticmethod
+    def _availability_matches(spoken: str, authoritative: Any) -> bool:
+        if spoken not in {"available", "unavailable"}:
+            return False
+        value = str(authoritative or "").casefold()
+        if value in {"available", "open", "in stock"}:
+            return spoken == "available"
+        if value in {"unavailable", "closed", "sold out", "not available", "not yet available", "out of stock"}:
+            return spoken == "unavailable"
+        return False
+
+    @staticmethod
+    def _claim_subject_matches(claim: Mapping[str, Any], facts: Mapping[str, Any]) -> bool:
+        subject = claim.get("item") or claim.get("item_name") or claim.get("slot")
+        if subject:
+            return SpeechGate._subject_matches(str(subject), facts)
+        prices = facts.get("prices") or {}
+        return not facts.get("items") and not (prices if isinstance(prices, Mapping) else {}) and not (facts.get("subject") or {}).get("item_name")
+
+    @staticmethod
+    def _success_subject_matches(text: str, facts: Mapping[str, Any]) -> bool:
+        subject = facts.get("subject") or {}
+        numbered_subject = re.search(r"\b(?:booking|order)\s*#?\s*(\d+)\b", (text or "").casefold())
+        if numbered_subject and isinstance(subject, Mapping):
+            expected_id = str(subject.get("booking_id") or subject.get("order_id") or "")
+            return bool(expected_id and numbered_subject.group(1) == expected_id)
+        return True

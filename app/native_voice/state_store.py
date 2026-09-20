@@ -69,28 +69,21 @@ class CallSessionOrderStateStore:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "SELECT state->'native_voice_order' AS native_state FROM call_sessions WHERE session_id = $1 FOR UPDATE",
-                    session_id,
-                )
-                current = row["native_state"] if row else None
-                if isinstance(current, str):
-                    try:
-                        current = json.loads(current)
-                    except json.JSONDecodeError:
-                        current = None
-                current_state = OrderState.from_dict(current if isinstance(current, dict) else None)
-                if current_state.version != expected_version:
-                    raise StateVersionConflict(
-                        f"state version conflict for {session_id}: expected {expected_version}, current {current_state.version}"
-                    )
-                await conn.execute(
                     """
                     INSERT INTO call_sessions (session_id, state)
-                    VALUES ($1, jsonb_build_object('native_voice_order', $2::jsonb))
+                    SELECT $1, jsonb_build_object('native_voice_order', $2::jsonb)
+                    WHERE $3 = 0
                     ON CONFLICT (session_id) DO UPDATE
                     SET state = call_sessions.state || jsonb_build_object('native_voice_order', $2::jsonb),
                         updated_at = NOW()
+                    WHERE COALESCE(NULLIF(call_sessions.state->'native_voice_order'->>'version', '')::int, 0) = $3
+                    RETURNING session_id
                     """,
                     session_id,
                     payload,
+                    expected_version,
                 )
+                if row is None:
+                    raise StateVersionConflict(
+                        f"state version conflict for {session_id}: expected {expected_version}"
+                    )

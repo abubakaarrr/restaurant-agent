@@ -82,13 +82,13 @@ class OrderItemState:
     canonical_item_id: str
     item_name: str
     quantity: int
-    modifiers: tuple[str, ...] = ()
-    removals: tuple[str, ...] = ()
-    substitutions: tuple[str, ...] = ()
+    modifiers: tuple[str, ...] | None = None
+    removals: tuple[str, ...] | None = None
+    substitutions: tuple[str, ...] | None = None
     source_turn_ids: tuple[str, ...] = ()
     status: str = "draft"
     line_id: str = ""
-    notes: str = ""
+    notes: str | None = None
 
     def __post_init__(self) -> None:
         if not self.canonical_item_id:
@@ -98,7 +98,9 @@ class OrderItemState:
         if self.quantity < 1:
             raise ValueError("quantity must be positive")
         for name in ("modifiers", "removals", "substitutions", "source_turn_ids"):
-            object.__setattr__(self, name, _tuple(getattr(self, name)))
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _tuple(value))
 
     def merge(self, other: "OrderItemState") -> "OrderItemState":
         """Merge a repeated line while preserving explicit latest fields."""
@@ -108,13 +110,13 @@ class OrderItemState:
             canonical_item_id=other.canonical_item_id,
             item_name=other.item_name or self.item_name,
             quantity=other.quantity,
-            modifiers=other.modifiers,
-            removals=other.removals,
-            substitutions=other.substitutions,
+            modifiers=self.modifiers if other.modifiers is None else other.modifiers,
+            removals=self.removals if other.removals is None else other.removals,
+            substitutions=self.substitutions if other.substitutions is None else other.substitutions,
             source_turn_ids=tuple(dict.fromkeys(self.source_turn_ids + other.source_turn_ids)),
             status=other.status,
             line_id=other.line_id or self.line_id,
-            notes=other.notes,
+            notes=self.notes if other.notes is None else other.notes,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,13 +124,13 @@ class OrderItemState:
             "canonical_item_id": self.canonical_item_id,
             "item_name": self.item_name,
             "quantity": self.quantity,
-            "modifiers": list(self.modifiers),
-            "removals": list(self.removals),
-            "substitutions": list(self.substitutions),
+            "modifiers": list(self.modifiers or ()),
+            "removals": list(self.removals or ()),
+            "substitutions": list(self.substitutions or ()),
             "source_turn_ids": list(self.source_turn_ids),
             "status": self.status,
             "line_id": self.line_id,
-            "notes": self.notes,
+            "notes": self.notes or "",
         }
 
     @classmethod
@@ -137,13 +139,13 @@ class OrderItemState:
             canonical_item_id=str(value.get("canonical_item_id") or ""),
             item_name=str(value.get("item_name") or ""),
             quantity=int(value.get("quantity") or 0),
-            modifiers=_tuple(value.get("modifiers")),
-            removals=_tuple(value.get("removals")),
-            substitutions=_tuple(value.get("substitutions")),
+            modifiers=_tuple(value.get("modifiers")) if "modifiers" in value else None,
+            removals=_tuple(value.get("removals")) if "removals" in value else None,
+            substitutions=_tuple(value.get("substitutions")) if "substitutions" in value else None,
             source_turn_ids=_tuple(value.get("source_turn_ids")),
             status=str(value.get("status") or "draft"),
             line_id=str(value.get("line_id") or ""),
-            notes=str(value.get("notes") or ""),
+            notes=str(value.get("notes") or "") if "notes" in value else None,
         )
 
 
@@ -193,6 +195,7 @@ class OrderState:
     corrections: tuple[CorrectionRecord, ...] = ()
     unresolved_fields: tuple[UnresolvedField, ...] = ()
     source_turn_ids: tuple[str, ...] = ()
+    finalized_turn_ids: tuple[str, ...] = ()
     status: str = "empty"
 
     def __post_init__(self) -> None:
@@ -202,7 +205,29 @@ class OrderState:
         object.__setattr__(self, "corrections", tuple(self.corrections))
         object.__setattr__(self, "unresolved_fields", tuple(self.unresolved_fields))
         object.__setattr__(self, "source_turn_ids", _tuple(self.source_turn_ids))
+        object.__setattr__(self, "finalized_turn_ids", _tuple(self.finalized_turn_ids))
         object.__setattr__(self, "fulfillment_details", _clean_mapping(self.fulfillment_details))
+
+    def mark_turn_finalized(self, turn_id: str) -> "OrderState":
+        if not turn_id:
+            raise ValueError("turn_id is required")
+        if turn_id in self.finalized_turn_ids:
+            raise ValueError("turn has already been finalized")
+        return OrderState(
+            schema_version=self.schema_version,
+            version=self.version + 1,
+            items=self.items,
+            order_notes=self.order_notes,
+            allergy_notes=self.allergy_notes,
+            guest_notes=self.guest_notes,
+            fulfillment=self.fulfillment,
+            fulfillment_details=self.fulfillment_details,
+            corrections=self.corrections,
+            unresolved_fields=self.unresolved_fields,
+            source_turn_ids=self.source_turn_ids,
+            finalized_turn_ids=self.finalized_turn_ids + (turn_id,),
+            status=self.status,
+        )
 
     def apply(self, patch: OrderPatch) -> "OrderState":
         """Apply one finalized turn atomically and increment the state version."""
@@ -223,16 +248,35 @@ class OrderState:
                             not incoming.line_id
                             and not existing.line_id
                             and existing.canonical_item_id == incoming.canonical_item_id
-                            and existing.modifiers == incoming.modifiers
-                            and existing.removals == incoming.removals
-                            and existing.substitutions == incoming.substitutions
+                            and (
+                                all(value is None for value in (incoming.modifiers, incoming.removals, incoming.substitutions))
+                                or any(value == () for value in (incoming.modifiers, incoming.removals, incoming.substitutions))
+                                or (
+                                    (incoming.modifiers is None or existing.modifiers == incoming.modifiers)
+                                    and (incoming.removals is None or existing.removals == incoming.removals)
+                                    and (incoming.substitutions is None or existing.substitutions == incoming.substitutions)
+                                )
+                            )
                         )
                     )
                 ),
                 None,
             )
             if match_index is None:
-                items.append(incoming)
+                items.append(
+                    OrderItemState(
+                        canonical_item_id=incoming.canonical_item_id,
+                        item_name=incoming.item_name,
+                        quantity=incoming.quantity,
+                        modifiers=incoming.modifiers or (),
+                        removals=incoming.removals or (),
+                        substitutions=incoming.substitutions or (),
+                        source_turn_ids=incoming.source_turn_ids,
+                        status=incoming.status,
+                        line_id=incoming.line_id,
+                        notes=incoming.notes or "",
+                    )
+                )
             else:
                 items[match_index] = items[match_index].merge(incoming)
         if patch.remove_line_ids:
@@ -242,13 +286,13 @@ class OrderState:
                     canonical_item_id=item.canonical_item_id,
                     item_name=item.item_name,
                     quantity=item.quantity,
-                    modifiers=item.modifiers,
-                    removals=item.removals,
-                    substitutions=item.substitutions,
+                    modifiers=item.modifiers or (),
+                    removals=item.removals or (),
+                    substitutions=item.substitutions or (),
                     source_turn_ids=item.source_turn_ids,
                     status="removed" if item.line_id in ids else item.status,
                     line_id=item.line_id,
-                    notes=item.notes,
+                    notes=item.notes or "",
                 )
                 for item in items
             ]
@@ -262,6 +306,7 @@ class OrderState:
             unresolved.append(field_value)
 
         source_turn_ids = tuple(dict.fromkeys(self.source_turn_ids + (patch.source_turn_id,)))
+        finalized_turn_ids = tuple(dict.fromkeys(self.finalized_turn_ids + (patch.source_turn_id,)))
         status = patch.status or ("needs_clarification" if unresolved else "draft")
         if not items and not any((patch.order_notes, patch.allergy_notes, patch.guest_notes, patch.fulfillment)):
             status = patch.status or ("needs_clarification" if unresolved else "empty")
@@ -282,6 +327,7 @@ class OrderState:
             corrections=self.corrections + tuple(patch.corrections),
             unresolved_fields=tuple(unresolved),
             source_turn_ids=source_turn_ids,
+            finalized_turn_ids=finalized_turn_ids,
             status=status,
         )
 
@@ -298,6 +344,7 @@ class OrderState:
             "corrections": [item.to_dict() for item in self.corrections],
             "unresolved_fields": [item.to_dict() for item in self.unresolved_fields],
             "source_turn_ids": list(self.source_turn_ids),
+            "finalized_turn_ids": list(self.finalized_turn_ids),
             "status": self.status,
         }
 
@@ -316,5 +363,6 @@ class OrderState:
             corrections=tuple(CorrectionRecord.from_dict(item) for item in data.get("corrections") or []),
             unresolved_fields=tuple(UnresolvedField.from_dict(item) for item in data.get("unresolved_fields") or []),
             source_turn_ids=_tuple(data.get("source_turn_ids")),
+            finalized_turn_ids=_tuple(data.get("finalized_turn_ids") or data.get("source_turn_ids")),
             status=str(data.get("status") or "empty"),
         )
