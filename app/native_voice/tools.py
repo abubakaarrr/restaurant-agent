@@ -105,35 +105,35 @@ def _canonical_name(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
-def _is_failure(value: Any) -> bool:
+def _is_failure(value: Any, *, allow_negative_availability: bool = False) -> bool:
     if isinstance(value, Mapping):
         return (
             value.get("ok") is False
             or bool(value.get("error"))
             or bool(value.get("pending") or value.get("readback_required"))
-            or bool(value.get("unavailable") or value.get("no_op") or value.get("proposed"))
+            or bool((value.get("unavailable") and not allow_negative_availability) or value.get("no_op") or value.get("proposed"))
             or any(key in value and value[key] is False for key in ("added", "updated", "removed", "cancelled", "saved"))
         )
     if isinstance(value, str):
         lowered = value.casefold()
+        failure_phrases = (
+            "pending confirmation",
+            "readback_required",
+            "not applied",
+            "unchanged",
+            "proposed",
+            "not added",
+            "not saved",
+            "no matching",
+            "no-op",
+            "could not",
+            "cannot",
+            "failed",
+        )
+        if not allow_negative_availability:
+            failure_phrases += ("unavailable", "not available")
         return bool(re.match(r"^[a-z][a-z0-9_]*:", value.strip())) or any(
-            phrase in lowered
-            for phrase in (
-                "pending confirmation",
-                "readback_required",
-                "not applied",
-                "unchanged",
-                "proposed",
-                "not added",
-                "not saved",
-                "unavailable",
-                "not available",
-                "no matching",
-                "no-op",
-                "could not",
-                "cannot",
-                "failed",
-            )
+            phrase in lowered for phrase in failure_phrases
         )
     return False
 
@@ -203,11 +203,26 @@ class ToolExecutor(Protocol):
 
 
 class OfflineToolExecutor:
+    def __init__(
+        self,
+        *,
+        result: Any = None,
+        readback: Any = None,
+        order_scope: Mapping[str, Any] | None = None,
+        booking_identity: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.result = result
+        self.readback_result = readback
+        self.order_scope = dict(order_scope or {})
+        self.booking_identity = dict(booking_identity or {})
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
-        return {"ok": False, "error": "offline_tool_executor_required"}
+        self.calls.append((name, dict(arguments)))
+        return self.result if self.result is not None else {"ok": False, "error": "offline_tool_executor_required"}
 
     async def readback(self, name: str, arguments: Mapping[str, Any], result: Any) -> Any:
-        return None
+        return self.readback_result
 
 
 @dataclass(frozen=True)
@@ -617,6 +632,19 @@ class ToolBridge:
     async def _verified_booking_identity(self) -> tuple[dict[str, Any] | None, str]:
         if not self.session_id:
             return None, "booking_scope_unverified"
+        if isinstance(self.executor, OfflineToolExecutor):
+            identity = dict(self.executor.booking_identity)
+            if identity.get("session_id") not in (None, "", self.session_id):
+                return None, "booking_scope_unverified"
+            if not identity or not identity.get("booking_id") or not identity.get("customer_name") or not identity.get("customer_phone"):
+                return None, "booking_scope_unverified"
+            if str(identity.get("status") or "confirmed").casefold() != "confirmed":
+                return None, "booking_scope_unverified"
+            return {
+                "booking_id": int(identity["booking_id"]),
+                "customer_name": str(identity.get("customer_name") or ""),
+                "customer_phone": str(identity.get("customer_phone") or ""),
+            }, ""
         try:
             from app.call_memory import get_call_memory, hydrate_call_memory
 
@@ -663,6 +691,23 @@ class ToolBridge:
         customer_phone = str(arguments.get("customer_phone") or "").strip()
         if not customer_phone or (not booking_id and not customer_name):
             return None, "booking_scope_unverified"
+        if isinstance(self.executor, OfflineToolExecutor):
+            identity = dict(self.executor.booking_identity)
+            if identity.get("session_id") not in (None, "", self.session_id):
+                return None, "booking_scope_unverified"
+            if not identity:
+                return None, "booking_scope_unverified"
+            if booking_id and int(identity.get("booking_id") or 0) != booking_id:
+                return None, "booking_scope_unverified"
+            if customer_name and _canonical_name(identity.get("customer_name")) != _canonical_name(customer_name):
+                return None, "booking_scope_unverified"
+            if _canonical_phone(identity.get("customer_phone")) != _canonical_phone(customer_phone):
+                return None, "booking_scope_unverified"
+            return {
+                "booking_id": int(identity["booking_id"]),
+                "customer_name": str(identity.get("customer_name") or ""),
+                "customer_phone": str(identity.get("customer_phone") or ""),
+            }, ""
         try:
             from app.services.restaurant import restaurant_service
 
@@ -720,6 +765,38 @@ class ToolBridge:
     ) -> tuple[dict[str, Any] | None, str]:
         if name not in BOOKING_SCOPED_TOOLS:
             return dict(arguments), ""
+        if isinstance(self.executor, OfflineToolExecutor):
+            if name == "add_guest_note" and arguments.get("booking_id") in (None, "", 0):
+                current = await self.scope_resolver(self.session_id) if self.scope_resolver is not None else self.executor.order_scope
+                if isinstance(current, Mapping) and int(current.get("booking_id") or 0):
+                    trusted, error = await self._verified_booking_identity()
+                    if error:
+                        return None, error
+                else:
+                    scoped = dict(arguments)
+                    scoped.update({"session_id": self.session_id, "booking_id": 0})
+                    scoped.pop("customer_name", None)
+                    scoped.pop("customer_phone", None)
+                    return scoped, ""
+            elif name == "lookup_booking":
+                trusted, error = await self._verified_booking_identity()
+                if error:
+                    trusted, error = await self._initial_booking_identity(arguments)
+                if error:
+                    return None, error
+            else:
+                trusted, error = await self._verified_booking_identity()
+                if error:
+                    return None, error
+            scoped = dict(arguments)
+            scoped.update(trusted or {})
+            scoped["session_id"] = self.session_id
+            if name == "lookup_booking":
+                scoped.pop("session_id", None)
+            elif name == "add_guest_note":
+                scoped.pop("customer_name", None)
+                scoped.pop("customer_phone", None)
+            return scoped, ""
         if name == "add_guest_note" and self.session_id and arguments.get("booking_id") in (None, "", 0):
             trusted, error = await self._verified_booking_identity()
             if not error:
@@ -811,7 +888,7 @@ class ToolBridge:
         scoped["session_id"] = self.session_id
         try:
             if isinstance(self.executor, OfflineToolExecutor):
-                current = await self.scope_resolver(self.session_id) if self.scope_resolver is not None else None
+                current = await self.scope_resolver(self.session_id) if self.scope_resolver is not None else self.executor.order_scope
             elif self.scope_resolver is not None:
                 current = await self.scope_resolver(self.session_id)
             else:
@@ -918,6 +995,24 @@ class ToolBridge:
             outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error="unsupported_tool", state_version=state_version)
             self._calls[call_id] = outcome
             return outcome
+        raw_operation_fingerprint = f"{self.session_id}:{turn_id}:{name}:{_hash(args)}"
+        if name in MUTATING_TOOLS and turn_id:
+            prior_call_id = self._turn_operations.get(turn_id, {}).get(raw_operation_fingerprint)
+            prior = self._calls.get(prior_call_id or "")
+            if prior is not None and prior.success and prior.readback_verified:
+                return ToolOutcome(
+                    name=prior.name,
+                    call_id=prior.call_id,
+                    arguments=prior.arguments,
+                    result=prior.result,
+                    success=prior.success,
+                    error=prior.error,
+                    readback=prior.readback,
+                    readback_verified=prior.readback_verified,
+                    state_version=prior.state_version,
+                    replayed=True,
+                    facts=prior.facts,
+                )
         scoped_args, scope_error = await self._scoped_booking_arguments(name, args)
         if scope_error:
             outcome = ToolOutcome(
@@ -1001,7 +1096,10 @@ class ToolBridge:
         readback = None
         readback_verified = False
         try:
-            success = not _is_failure(result)
+            success = not _is_failure(
+                result,
+                allow_negative_availability=name in {"check_menu_item_availability", "check_table_availability"},
+            )
             error = str(result) if not success else ""
             if success and name in MUTATING_TOOLS:
                 try:
@@ -1035,6 +1133,7 @@ class ToolBridge:
         self._calls[call_id] = outcome
         if name in MUTATING_TOOLS and turn_id and outcome.success and outcome.readback_verified:
             self._turn_operations.setdefault(turn_id, {})[operation_fingerprint] = call_id
+            self._turn_operations.setdefault(turn_id, {})[raw_operation_fingerprint] = call_id
         return outcome
 
     @staticmethod

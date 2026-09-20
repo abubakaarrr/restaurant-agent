@@ -929,7 +929,9 @@ class NativeVoiceAdapter:
         if self._completed_turn is not None and self._completed_turn.turn_id in self._replayed_finalized_turns:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="replayed_finalized_turn", state_version=self.state.version)
         if self.state.unresolved_fields:
-            if name != "update_reservation_draft" or not self._reservation_correction_is_scoped(args):
+            if name in MUTATING_TOOLS and (
+                name != "update_reservation_draft" or not self._reservation_correction_is_scoped(args)
+            ):
                 return ToolOutcome(
                     name=name,
                     call_id=call_id,
@@ -963,15 +965,11 @@ class NativeVoiceAdapter:
             reset_current_action_scope(scope_token)
             reset_current_session_id(session_token)
         if generation != self.interruptions.generation:
-            return ToolOutcome(
-                name=outcome.name,
-                call_id=outcome.call_id,
-                arguments=outcome.arguments,
-                result=None,
-                success=False,
-                error="stale_interrupted_tool_call",
-                state_version=outcome.state_version,
-            )
+            if outcome.success and outcome.readback_verified:
+                if name == "update_reservation_draft":
+                    outcome = await self._apply_reservation_correction(outcome, generation=None)
+                return outcome
+            return replace(outcome, result=None, success=False, error="stale_interrupted_tool_call")
         if name == "update_reservation_draft" and outcome.success and outcome.readback_verified:
             outcome = await self._apply_reservation_correction(outcome, generation=generation)
         self.recorder.record({"type": "tool_result_received", "call_id": call_id, "success": outcome.success, "readback_verified": outcome.readback_verified})

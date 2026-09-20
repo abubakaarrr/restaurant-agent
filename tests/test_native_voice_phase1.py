@@ -237,16 +237,58 @@ async def test_tool_bridge_requires_readback_and_replays_idempotently():
 
 @pytest.mark.asyncio
 async def test_offline_order_scope_never_contacts_restaurant_service():
-    bridge = ToolBridge(OfflineToolExecutor(), session_id="offline-call")
+    executor = OfflineToolExecutor(
+        result={"ok": True, "order_id": 7, "order_item_id": 1, "status": "pending", "draft_version": 2},
+        readback=order_readback(
+            order_id=7,
+            call_id="offline-call",
+            draft_version=2,
+            state_version=2,
+            items=[
+                {
+                    "order_item_id": 1,
+                    "item_id": "menu.na.burger",
+                    "item_name": "Hearth Burger",
+                    "quantity": 1,
+                    "modifiers": [],
+                    "removals": [],
+                    "substitutions": [],
+                    "notes": "",
+                }
+            ],
+        ),
+        order_scope={"order_id": 7, "booking_id": 0},
+    )
+    bridge = ToolBridge(executor, session_id="offline-call")
     outcome = await bridge.invoke(
         call_id="offline-order",
         name="add_order_item",
-        arguments={"session_id": "offline-call", "item_name": "Hearth Burger"},
+        arguments={"session_id": "offline-call", "item_name": "Hearth Burger", "quantity": 1},
         turn_id="turn-1",
         state_version=1,
     )
-    assert not outcome.success
-    assert outcome.error != "order_scope_unverified"
+    assert outcome.success and outcome.readback_verified
+    assert len(executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_offline_booking_scope_and_cancellation_retry_are_authorized_without_database():
+    result = {
+        "booking_id": 7,
+        "customer_name": "Ada Lovelace",
+        "customer_phone": "+14155550123",
+        "status": "cancelled",
+        "date": "2026-09-19",
+        "time": "19:00",
+        "party_size": 2,
+    }
+    executor = OfflineToolExecutor(result=result, readback={**result, "readback_committed": True}, booking_identity={**result, "status": "confirmed"})
+    bridge = ToolBridge(executor, session_id="offline-call")
+    arguments = {"session_id": "offline-call", "booking_id": 7, "caller_confirmed": True}
+    first = await bridge.invoke(call_id="cancel-1", name="cancel_booking", arguments=arguments, turn_id="turn-cancel", state_version=1)
+    retry = await bridge.invoke(call_id="cancel-2", name="cancel_booking", arguments=arguments, turn_id="turn-cancel", state_version=2)
+    assert first.success and first.readback_verified
+    assert retry.replayed and retry.success and len(executor.calls) == 1
 
 
 @pytest.mark.asyncio
