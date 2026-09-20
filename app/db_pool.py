@@ -13,7 +13,7 @@ import asyncpg
 
 from app.config import settings
 
-_pools: dict[str, asyncpg.Pool] = {}
+_pool: asyncpg.Pool | None = None
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _REQUIRE_SSL = {"require", "verify-ca", "verify-full"}
@@ -44,26 +44,15 @@ def pool_kwargs(database_url: str) -> dict:
 
 async def get_pool() -> asyncpg.Pool:
     """Return the process-wide connection pool, creating it on first use."""
-    from app.native_voice.database_guard import active_native_voice_database_url
-    from app.native_voice.database_guard import verify_native_voice_database_connection
-
-    database_url = active_native_voice_database_url() or settings.database_url
-    pool = _pools.get(database_url)
-    if pool is None:
-        pool = await asyncpg.create_pool(**pool_kwargs(database_url))
-        if active_native_voice_database_url() is not None:
-            try:
-                await verify_native_voice_database_connection(pool)
-            except Exception:
-                await pool.close()
-                raise
-        _pools[database_url] = pool
-    return pool
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(**pool_kwargs(settings.database_url))
+    return _pool
 
 
 async def close_pool() -> None:
     """Close the pool on application shutdown."""
-    pools = list(_pools.values())
-    _pools.clear()
-    for pool in pools:
-        await pool.close()
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None

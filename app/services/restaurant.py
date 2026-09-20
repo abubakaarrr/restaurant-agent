@@ -317,8 +317,12 @@ def _ensure_order_item_available_at(
 class RestaurantService:
     """Database-backed, provider-neutral restaurant operations."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, pool_provider: Callable[[], Awaitable[Any]] | None = None) -> None:
         self._seating_limits: JsonDict | None = None
+        self._pool_provider = pool_provider
+
+    async def _get_pool(self) -> Any:
+        return await (self._pool_provider or get_pool)()
 
     @staticmethod
     def _require_call_id(call_id: str) -> str:
@@ -468,7 +472,7 @@ class RestaurantService:
         caller_phone: str = "",
     ) -> None:
         call_id = self._require_call_id(call_id)
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             await self._merge_session_state(
                 conn, call_id, patch, caller_phone=caller_phone
@@ -516,7 +520,7 @@ class RestaurantService:
         call_id = self._require_call_id(call_id)
         request_hash = canonical_request_hash(payload)
 
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 inserted = await conn.fetchrow(
@@ -639,7 +643,7 @@ class RestaurantService:
         if conn is not None:
             rows = await conn.fetch(sql, *args)
             return [dict(row) for row in rows]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as acquired:
             rows = await acquired.fetch(sql, *args)
         return [dict(row) for row in rows]
@@ -655,7 +659,7 @@ class RestaurantService:
         if conn is not None:
             rows = await conn.fetch(sql)
         else:
-            pool = await get_pool()
+            pool = await self._get_pool()
             async with pool.acquire() as acquired:
                 rows = await acquired.fetch(sql)
         by_location = {
@@ -1621,7 +1625,7 @@ class RestaurantService:
         customer_phone: str = "",
     ) -> JsonDict:
         phone = self._validate_phone(customer_phone) if customer_phone else ""
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             if booking_id:
                 row = await conn.fetchrow(
@@ -1631,14 +1635,12 @@ class RestaurantService:
                     FROM bookings b
                     LEFT JOIN tables t ON t.id = b.table_id
                     WHERE b.id = $1
-                      AND ($2 = '' OR b.customer_phone = $2)
                     """,
                     booking_id,
-                    phone,
                 )
             elif customer_name and phone:
                 name = self._validate_name(customer_name)
-                rows = await conn.fetch(
+                row = await conn.fetchrow(
                     """
                     SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
                            b.party_size, b.status, b.notes, t.table_number, t.location
@@ -1647,11 +1649,11 @@ class RestaurantService:
                     WHERE LOWER(b.customer_name) = LOWER($1)
                       AND b.customer_phone = $2
                     ORDER BY b.booked_at DESC
+                    LIMIT 1
                     """,
                     name,
                     phone,
                 )
-                row = rows[0] if len(rows) == 1 else None
             else:
                 raise RestaurantServiceError(
                     "Provide the booking ID, or both the exact name and phone number.",
@@ -1665,13 +1667,11 @@ class RestaurantService:
             )
         return {
             "booking_id": row["id"],
-            "reference": str(row["id"]),
             "customer_name": row["customer_name"],
             "customer_phone": row["customer_phone"] or "",
             "booked_at": row["booked_at"].isoformat(),
             "date": row["booked_at"].date().isoformat(),
             "time": row["booked_at"].strftime("%H:%M"),
-            "timezone": get_restaurant_knowledge().identity["timezone"],
             "party_size": row["party_size"],
             "status": row["status"],
             "table_number": row["table_number"],
@@ -1956,7 +1956,7 @@ class RestaurantService:
                     local_date,
                 )
             if conn is None:
-                pool = await get_pool()
+                pool = await self._get_pool()
                 async with pool.acquire() as active_conn:
                     rows = await fetch_rows(active_conn)
             else:
@@ -2626,7 +2626,7 @@ class RestaurantService:
 
     async def get_order_summary(self, *, call_id: str) -> JsonDict:
         call_id = self._require_call_id(call_id)
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             order = await conn.fetchrow(
                 """
@@ -2696,7 +2696,7 @@ class RestaurantService:
                 resolved_booking = None
         if fulfillment == "dine_in" and not resolved_booking:
             # Fall back to active booking in session when switching to dine-in.
-            pool = await get_pool()
+            pool = await self._get_pool()
             async with pool.acquire() as conn:
                 resolved_booking = await self._booking_id_from_session(conn, call_id) or None
             if not resolved_booking:
@@ -3157,7 +3157,7 @@ class RestaurantService:
         if order_id <= 0:
             raise RestaurantServiceError("A valid order_id is required.")
         name = self._validate_name(customer_name)
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             order = await conn.fetchrow(
                 "SELECT id, customer_name FROM orders WHERE id = $1",
@@ -3311,7 +3311,7 @@ class RestaurantService:
         faq_rows: list[JsonDict] = []
         faq_unavailable = False
         try:
-            pool = await get_pool()
+            pool = await self._get_pool()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
@@ -3384,7 +3384,7 @@ class RestaurantService:
         excerpt = " ".join(context_excerpt.split())[:500]
         reply = " ".join(agent_response.split())[:500]
         restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -3416,7 +3416,7 @@ class RestaurantService:
 
     async def list_knowledge_gaps(self) -> JsonDict:
         restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             gaps = await conn.fetch(
                 """
@@ -3484,7 +3484,7 @@ class RestaurantService:
             )
         resolved_by = " ".join(resolved_by.split())[:80] or "admin"
         restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 gap = await conn.fetchrow(

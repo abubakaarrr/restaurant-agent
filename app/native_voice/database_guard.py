@@ -8,7 +8,10 @@ import os
 import socket
 from urllib.parse import urlparse
 
+import asyncpg
+
 from app.config import settings
+from app.db_pool import pool_kwargs
 
 
 class NativeVoiceDatabaseGuardError(RuntimeError):
@@ -18,6 +21,7 @@ class NativeVoiceDatabaseGuardError(RuntimeError):
 _active_database_url: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "native_voice_database_url", default=None
 )
+_native_pool: asyncpg.Pool | None = None
 
 
 def _database_identity(url: str) -> tuple[frozenset[str], int, str]:
@@ -69,7 +73,7 @@ def validate_native_voice_database() -> str:
     return url
 
 
-async def verify_native_voice_database_connection(pool: object) -> None:
+async def verify_native_voice_database_connection(pool: object, *, expected_url: str = "") -> None:
     marker = os.getenv("NATIVE_VOICE_DATABASE_MARKER", "").strip()
     if not marker:
         raise NativeVoiceDatabaseGuardError("native_voice_database_marker_required")
@@ -89,8 +93,8 @@ async def verify_native_voice_database_connection(pool: object) -> None:
         server_port = int(row["server_port"])
         database_name = str(row["database_name"] or "")
         server_address = str(ipaddress.ip_address(server_host))
-        expected_url = active_native_voice_database_url() or os.getenv("NATIVE_VOICE_DATABASE_URL", "").strip()
-        expected_addresses, expected_port, expected_database = _database_identity(expected_url)
+        configured_url = expected_url or active_native_voice_database_url() or os.getenv("NATIVE_VOICE_DATABASE_URL", "").strip()
+        expected_addresses, expected_port, expected_database = _database_identity(configured_url)
         normal_urls = {
             os.getenv("DATABASE_URL", "").strip(),
             str(settings.database_url or "").strip(),
@@ -100,6 +104,7 @@ async def verify_native_voice_database_connection(pool: object) -> None:
             and (server_address, server_port, database_name)
             == (address, port, database)
             for configured_url in normal_urls
+            if configured_url
             for address, port, database in [_database_identity(configured_url)]
         ):
             raise NativeVoiceDatabaseGuardError("native_voice_database_must_be_separate")
@@ -126,3 +131,24 @@ def deactivate_native_voice_database(token: contextvars.Token[str | None]) -> No
 
 def active_native_voice_database_url() -> str | None:
     return _active_database_url.get()
+
+
+async def get_native_voice_pool() -> asyncpg.Pool:
+    global _native_pool
+    database_url = validate_native_voice_database()
+    if _native_pool is None:
+        pool = await asyncpg.create_pool(**pool_kwargs(database_url))
+        try:
+            await verify_native_voice_database_connection(pool, expected_url=database_url)
+        except Exception:
+            await pool.close()
+            raise
+        _native_pool = pool
+    return _native_pool
+
+
+async def close_native_voice_pool() -> None:
+    global _native_pool
+    if _native_pool is not None:
+        await _native_pool.close()
+        _native_pool = None

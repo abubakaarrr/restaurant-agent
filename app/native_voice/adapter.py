@@ -18,14 +18,10 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Mapping
 
 from app.call_memory import reset_current_action_scope, reset_current_session_id, set_current_action_scope, set_current_session_id
-from app.native_voice.contracts import OrderItemState, OrderPatch, OrderState
-from app.native_voice.database_guard import (
-    activate_native_voice_database,
-    deactivate_native_voice_database,
-)
+from app.native_voice.contracts import CommittedOperation, OrderItemState, OrderPatch, OrderState
 from app.native_voice.protocol import EventRecorder, RealtimeTransport
 from app.native_voice.speech import SpeechDecision, SpeechGate
-from app.native_voice.state_store import CallSessionOrderStateStore, OrderStateStore
+from app.native_voice.state_store import CallSessionOrderStateStore, OrderStateStore, StateVersionConflict
 from app.native_voice.tools import (
     RestaurantToolExecutor,
     ToolBridge,
@@ -158,11 +154,15 @@ class NativeVoiceAdapter:
         self.config = config or RealtimeConfig()
         self.state_store = state_store or CallSessionOrderStateStore()
         if tool_bridge is None:
-            executor = (
-                RestaurantToolExecutor()
-                if isinstance(self.state_store, CallSessionOrderStateStore)
-                else OfflineToolExecutor()
-            )
+            if isinstance(self.state_store, CallSessionOrderStateStore):
+                from app.native_voice.database_guard import get_native_voice_pool
+                from app.services.restaurant import RestaurantService
+
+                executor = RestaurantToolExecutor(
+                    service=RestaurantService(pool_provider=get_native_voice_pool)
+                )
+            else:
+                executor = OfflineToolExecutor()
             tool_bridge = ToolBridge(executor)
         self.tool_bridge = tool_bridge
         self.recorder = recorder or EventRecorder()
@@ -196,16 +196,11 @@ class NativeVoiceAdapter:
     async def start(self) -> None:
         if self._started:
             return
-        token = activate_native_voice_database() if self._uses_native_database else None
-        try:
-            self.state = await self.state_store.load(self.session_id)
-            event = self.config.session_update()
-            await self._send(event)
-            self.recorder.record(event)
-            self._started = True
-        finally:
-            if token is not None:
-                deactivate_native_voice_database(token)
+        self.state = await self.state_store.load(self.session_id)
+        event = self.config.session_update()
+        await self._send(event)
+        self.recorder.record(event)
+        self._started = True
 
     async def close(self) -> None:
         await self.transport.close()
@@ -216,12 +211,7 @@ class NativeVoiceAdapter:
 
     async def apply_order_patch(self, patch: OrderPatch) -> OrderState:
         """Apply facts only after a completed caller turn exists."""
-        token = activate_native_voice_database() if self._uses_native_database else None
-        try:
-            return await self._apply_order_patch(patch)
-        finally:
-            if token is not None:
-                deactivate_native_voice_database(token)
+        return await self._apply_order_patch(patch)
 
     async def _apply_order_patch(
         self,
@@ -275,12 +265,7 @@ class NativeVoiceAdapter:
     ) -> VoiceTurnResult:
         """Send one synthetic PCM16 turn and drain native output until done."""
         async with self._turn_lock:
-            token = activate_native_voice_database() if self._uses_native_database else None
-            try:
-                return await self._submit_audio(audio, turn_id=turn_id, transcript=transcript)
-            finally:
-                if token is not None:
-                    deactivate_native_voice_database(token)
+            return await self._submit_audio(audio, turn_id=turn_id, transcript=transcript)
 
     async def _submit_audio(
         self,
@@ -317,19 +302,12 @@ class NativeVoiceAdapter:
             self._response.played_audio_bytes = min(byte_count, len(self._response.audio))
 
     async def interrupt(self) -> None:
-        token = activate_native_voice_database() if self._uses_native_database else None
-        try:
-            async with self._commit_lock:
-                async with self._lifecycle_lock:
-                    await self._interrupt_unlocked()
-        finally:
-            if token is not None:
-                deactivate_native_voice_database(token)
+        async with self._commit_lock:
+            async with self._lifecycle_lock:
+                await self._interrupt_unlocked()
 
     async def _interrupt_unlocked(self) -> None:
         response = self._response
-        if self._memory_write_task is not None and not self._memory_write_task.done():
-            self._memory_write_task.cancel()
         response_id = response.response_id if response is not None else self.interruptions.active_response_id
         if response is not None and response.input_item_id:
             self._cancelled_input_item_ids.add(response.input_item_id)
@@ -594,6 +572,8 @@ class NativeVoiceAdapter:
                     return VoiceTurnResult(self._completed_turn, b"", "", None)
                 outcome = await self._run_tool(call_id, name, args, generation=generation)
                 outcome = self._with_confirmation(outcome)
+                if outcome.success and outcome.readback_verified:
+                    await self._persist_committed_outcome(outcome)
                 if generation != self.interruptions.generation:
                     if outcome.success and outcome.readback_verified:
                         self._outcomes.append(outcome)
@@ -727,12 +707,144 @@ class NativeVoiceAdapter:
         result_id = hashlib.sha256(
             f"{outcome.name}:{outcome.call_id}:{outcome.state_version}".encode("utf-8")
         ).hexdigest()[:24]
-        return {
+        output = {
             "status": "completed" if verified else "failed",
             "result_id": result_id,
             "clarification_state": "required" if clarification_required else "none",
             "speech": sentence,
         }
+        safe_facts = NativeVoiceAdapter._safe_model_facts(outcome.facts)
+        if safe_facts:
+            output["facts"] = safe_facts
+        return output
+
+    @staticmethod
+    def _safe_model_facts(facts: Mapping[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "subject", "canonical_items", "items", "prices", "availability",
+            "availability_by_item", "status", "date", "time", "timezone",
+            "reference", "booking_reference", "booking_id", "party_size",
+            "location", "table_number", "order_id", "draft_version", "total",
+            "fulfillment", "fulfillment_type", "fulfillment_details", "evidence_version",
+        }
+        item_allowed = {
+            "id", "name", "price", "available", "modifier_options", "ingredients",
+            "allergens", "dietary_tags", "customer_safe_answer", "item_name",
+            "item_id", "quantity", "order_item_id", "modifiers", "removals", "substitutions",
+        }
+
+        def clean(value: Any, *, item: bool = False) -> Any:
+            if isinstance(value, Mapping):
+                keys = item_allowed if item else allowed
+                return {
+                    str(key): clean(entry, item=str(key) in {"canonical_items", "items"})
+                    for key, entry in value.items()
+                    if str(key) in keys
+                }
+            if isinstance(value, (list, tuple)):
+                return [clean(entry, item=item) for entry in value]
+            return value
+
+        return {
+            key: clean(value, item=key == "canonical_items")
+            for key, value in facts.items()
+            if key in allowed
+        }
+
+    def _operation_id(self, name: str, arguments: Mapping[str, Any], turn_id: str) -> str:
+        payload = json.dumps(
+            {
+                "session_id": self.session_id,
+                "turn_id": turn_id,
+                "operation": name,
+                "arguments": dict(arguments),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _operation_resource(outcome: ToolOutcome) -> dict[str, Any]:
+        resource: dict[str, Any] = {}
+        for source in (outcome.result, outcome.readback, outcome.facts):
+            if not isinstance(source, Mapping):
+                continue
+            for key in ("order_id", "booking_id", "reference", "order_item_id", "item_id"):
+                if source.get(key) not in (None, "", 0):
+                    resource[key] = source[key]
+            subject = source.get("subject")
+            if isinstance(subject, Mapping):
+                for key in ("order_id", "booking_id", "reference", "order_item_id", "item_id"):
+                    if subject.get(key) not in (None, "", 0):
+                        resource[key] = subject[key]
+        return resource
+
+    async def _persist_committed_outcome(self, outcome: ToolOutcome) -> None:
+        if self._completed_turn is None or not outcome.success or not outcome.readback_verified:
+            return
+        operation_id = self._operation_id(outcome.name, outcome.arguments, self._completed_turn.turn_id)
+        current = await self.state_store.load(self.session_id)
+        if any(item.operation_id == operation_id and item.session_id == self.session_id for item in current.committed_operations):
+            self.state = current
+            return
+        committed = CommittedOperation(
+            session_id=self.session_id,
+            operation_id=operation_id,
+            turn_id=self._completed_turn.turn_id,
+            operation=outcome.name,
+            resource=self._operation_resource(outcome),
+            result=outcome.result,
+            readback=outcome.readback,
+            facts=self._safe_model_facts(outcome.facts),
+            state_version=current.version,
+            confirmation_text=outcome.confirmation_text,
+            confirmation_hash=outcome.confirmation_hash,
+        )
+        next_state = replace(
+            current,
+            version=current.version + 1,
+            committed_operations=current.committed_operations + (committed,),
+        )
+        try:
+            saved = await self._save_state(next_state, expected_version=current.version, generation=None)
+        except StateVersionConflict:
+            latest = await self.state_store.load(self.session_id)
+            if any(item.operation_id == operation_id and item.session_id == self.session_id for item in latest.committed_operations):
+                self.state = latest
+                return
+            next_state = replace(
+                latest,
+                version=latest.version + 1,
+                committed_operations=latest.committed_operations + (committed,),
+            )
+            saved = await self._save_state(next_state, expected_version=latest.version, generation=None)
+        if saved:
+            self.state = next_state
+
+    async def _durable_replay(self, call_id: str, name: str, arguments: Mapping[str, Any]) -> ToolOutcome | None:
+        if self._completed_turn is None:
+            return None
+        operation_id = self._operation_id(name, arguments, self._completed_turn.turn_id)
+        for item in self.state.committed_operations:
+            if item.session_id != self.session_id or item.operation_id != operation_id:
+                continue
+            return ToolOutcome(
+                name=item.operation,
+                call_id=call_id,
+                arguments=dict(arguments),
+                result=item.result,
+                success=True,
+                readback=item.readback,
+                readback_verified=True,
+                state_version=self.state.version,
+                replayed=True,
+                facts=dict(item.facts),
+                confirmation_text=item.confirmation_text,
+                confirmation_hash=item.confirmation_hash,
+            )
+        return None
 
     def _remember_tool_call(self, event: Mapping[str, Any]) -> None:
         call_id = str(event.get("call_id") or event.get("id") or "")
@@ -759,9 +871,12 @@ class NativeVoiceAdapter:
         if generation != self.interruptions.generation:
             return
         if completed.turn_id in self.state.finalized_turn_ids:
-            self._replayed_finalized_turns.add(completed.turn_id)
-            self.recorder.record({"type": "replayed_turn_rejected", "turn_id": completed.turn_id})
-            return
+            if any(item.turn_id == completed.turn_id and item.session_id == self.session_id for item in self.state.committed_operations):
+                self.recorder.record({"type": "replayed_turn_available", "turn_id": completed.turn_id})
+            else:
+                self._replayed_finalized_turns.add(completed.turn_id)
+                self.recorder.record({"type": "replayed_turn_rejected", "turn_id": completed.turn_id})
+                return
         patch = None
         if self.facts_extractor is not None:
             extracted = self.facts_extractor(completed, self.state)
@@ -928,6 +1043,9 @@ class NativeVoiceAdapter:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="stale_interrupted_tool_call", state_version=self.state.version)
         if self._completed_turn is not None and self._completed_turn.turn_id in self._replayed_finalized_turns:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="replayed_finalized_turn", state_version=self.state.version)
+        durable = await self._durable_replay(call_id, name, args)
+        if durable is not None:
+            return replace(durable, call_id=call_id)
         if self.state.unresolved_fields:
             if name in MUTATING_TOOLS and (
                 name != "update_reservation_draft" or not self._reservation_correction_is_scoped(args)

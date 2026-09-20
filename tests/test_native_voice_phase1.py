@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import asyncio
 import hashlib
+import importlib
 import json
 import sys
 
@@ -441,7 +442,7 @@ async def test_anonymous_guest_note_stays_bound_to_current_session():
         return None
 
     bridge = ToolBridge(
-        FakeExecutor(result={"saved": True}, readback=order_readback()),
+        FakeExecutor(result={"saved": True}, readback=order_readback(guest_notes="extra napkins")),
         session_id="call-1",
         scope_resolver=no_order_scope,
     )
@@ -836,8 +837,8 @@ async def test_adapter_tool_result_readback_unlocks_only_matching_final_response
             {"type": "response.done", "response": {"id": "response-1", "status": "completed"}},
             {"type": "response.created", "response": {"id": "response-2"}},
             {"type": "response.output_audio.delta", "response_id": "response-2", "delta": base64.b64encode(b"confirmed-audio").decode()},
-            {"type": "response.output_audio_transcript.delta", "response_id": "response-2", "delta": "Your order is placed."},
-            {"type": "response.output_audio_transcript.done", "response_id": "response-2", "transcript": "Your order is placed."},
+                {"type": "response.output_audio_transcript.delta", "response_id": "response-2", "delta": "Your order is confirmed."},
+                {"type": "response.output_audio_transcript.done", "response_id": "response-2", "transcript": "Your order is confirmed."},
             {"type": "response.done", "response": {"id": "response-2", "status": "completed"}},
         ]
     )
@@ -845,7 +846,7 @@ async def test_adapter_tool_result_readback_unlocks_only_matching_final_response
         session_id="call-1",
         transport=transport,
         state_store=InMemoryOrderStateStore(),
-        tool_bridge=ToolBridge(executor),
+        tool_bridge=ToolBridge(executor, scope_resolver=fake_order_scope),
     )
     result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-1")
     assert result.audio == b"confirmed-audio"
@@ -857,7 +858,8 @@ async def test_adapter_tool_result_readback_unlocks_only_matching_final_response
         if event.get("type") == "conversation.item.create"
     )
     payload = json.loads(tool_output)
-    assert set(payload) == {"status", "result_id", "clarification_state", "speech"}
+    assert {"status", "result_id", "clarification_state", "speech", "facts"} <= set(payload)
+    assert payload["facts"]["subject"]["order_id"] == 3
     assert "result" not in payload
     assert "customer" not in tool_output
 
@@ -944,10 +946,17 @@ async def test_unresolved_state_blocks_mutating_tool_calls():
 
 
 def test_production_entrypoint_does_not_import_native_voice():
-    sys.modules.pop("app.native_voice", None)
-    import app.main  # noqa: F401
-
-    assert "app.native_voice" not in sys.modules
+    previous_native = sys.modules.pop("app.native_voice", None)
+    previous_main = sys.modules.pop("app.main", None)
+    try:
+        importlib.import_module("app.main")
+        assert "app.native_voice" not in sys.modules
+    finally:
+        sys.modules.pop("app.main", None)
+        if previous_main is not None:
+            sys.modules["app.main"] = previous_main
+        if previous_native is not None:
+            sys.modules["app.native_voice"] = previous_native
 
 
 def test_booking_claims_require_structured_date_time_and_reference_evidence():
@@ -1052,6 +1061,58 @@ async def test_empty_readback_notes_replace_application_memory():
     state = await adapter._sync_order_memory()
     assert state is not None and state.order_notes == ""
     assert (await store.load("call-1")).order_notes == ""
+
+
+@pytest.mark.asyncio
+async def test_committed_mutation_replays_after_adapter_restart():
+    store = InMemoryOrderStateStore()
+    arguments = {
+        "session_id": "call-1",
+        "booking_id": 7,
+        "customer_name": "Ada Lovelace",
+        "customer_phone": "+14155550123",
+        "caller_confirmed": True,
+    }
+    first = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=MemoryRealtimeTransport(),
+        state_store=store,
+        tool_bridge=ToolBridge(OfflineToolExecutor()),
+    )
+    first._completed_turn = CompletedCallerTurn("turn-cancel", 1, "cancel it", 0.0)
+    committed = ToolOutcome(
+        name="cancel_booking",
+        call_id="cancel-1",
+        arguments=arguments,
+        result={"booking_id": 7, "status": "cancelled"},
+        success=True,
+        readback_verified=True,
+        readback={
+            "booking_id": 7,
+            "customer_name": "Ada Lovelace",
+            "customer_phone": "+14155550123",
+            "status": "cancelled",
+            "date": "2026-09-19",
+            "time": "19:00",
+            "readback_committed": True,
+        },
+        facts={"status": "cancelled", "booking_id": 7, "reference": "7"},
+    )
+    committed = first._with_confirmation(committed)
+    await first._persist_committed_outcome(committed)
+
+    restarted = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=MemoryRealtimeTransport(),
+        state_store=store,
+        tool_bridge=ToolBridge(OfflineToolExecutor()),
+    )
+    restarted.state = await store.load("call-1")
+    restarted._completed_turn = first._completed_turn
+    replay = await restarted._durable_replay("cancel-2", "cancel_booking", arguments)
+    assert replay is not None
+    assert replay.replayed and replay.success and replay.readback_verified
+    assert replay.result == committed.result
 
 
 @pytest.mark.asyncio
@@ -1177,9 +1238,9 @@ async def test_ga_function_call_done_dispatches_nested_item():
     )
     await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-tool")
     assert any(
-        event.get("type") == "tool_requested"
-        and event.get("call_id") == "call-tool"
-        and event.get("name") == "get_full_menu"
+        event.event_type == "tool_requested"
+        and event.payload.get("call_id") == "call-tool"
+        and event.payload.get("name") == "get_full_menu"
         for event in adapter.recorder.events
     )
 

@@ -45,9 +45,9 @@ class CallSessionOrderStateStore:
     """
 
     async def load(self, session_id: str) -> OrderState:
-        from app.db_pool import get_pool
+        from app.native_voice.database_guard import get_native_voice_pool
 
-        pool = await get_pool()
+        pool = await get_native_voice_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT state->'native_voice_order' AS native_state FROM call_sessions WHERE session_id = $1",
@@ -62,9 +62,9 @@ class CallSessionOrderStateStore:
         return OrderState.from_dict(value if isinstance(value, dict) else None)
 
     async def save(self, session_id: str, state: OrderState, *, expected_version: int) -> None:
-        from app.db_pool import get_pool
+        from app.native_voice.database_guard import get_native_voice_pool
 
-        pool = await get_pool()
+        pool = await get_native_voice_pool()
         payload = json.dumps(state.to_dict(), sort_keys=True)
         async with pool.acquire() as conn:
             async with conn.transaction():

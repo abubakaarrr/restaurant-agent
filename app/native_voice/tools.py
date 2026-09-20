@@ -259,44 +259,214 @@ class ToolOutcome:
 class RestaurantToolExecutor:
     """Use the existing rollback tools and service as the authority boundary."""
 
-    def __init__(self) -> None:
-        from app.tools import db
+    def __init__(self, *, service: Any | None = None) -> None:
+        from app.services.restaurant import restaurant_service
 
-        self._tools = {
-            name: getattr(db, name)
-            for name in (
-                "check_table_availability",
-                "create_booking",
-                "update_reservation_draft",
-                "get_reservation_draft",
-                "update_confirmed_booking",
-                "lookup_booking",
-                "cancel_booking",
-                "add_guest_note",
-                "add_order_item",
-                "get_order_summary",
-                "set_order_fulfillment",
-                "set_order_notes",
-                "update_order_item",
-                "remove_order_item",
-                "confirm_order",
-                "lookup_order",
-                "get_full_menu",
-                "check_menu_item_availability",
+        self._service = service or restaurant_service
+        self._native_service = service
+        if service is None:
+            from app.tools import db
+
+            self._tools = {
+                name: getattr(db, name)
+                for name in (
+                    "check_table_availability",
+                    "create_booking",
+                    "update_reservation_draft",
+                    "get_reservation_draft",
+                    "update_confirmed_booking",
+                    "lookup_booking",
+                    "cancel_booking",
+                    "add_guest_note",
+                    "add_order_item",
+                    "get_order_summary",
+                    "set_order_fulfillment",
+                    "set_order_notes",
+                    "update_order_item",
+                    "remove_order_item",
+                    "confirm_order",
+                    "lookup_order",
+                    "get_full_menu",
+                    "check_menu_item_availability",
+                )
+            }
+        else:
+            self._tools = {}
+
+    def _native_idempotency_key(self, name: str, arguments: Mapping[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                {"session_id": self.session_id, "operation": name, "arguments": dict(arguments)},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+
+    async def _invoke_native(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        args = dict(arguments)
+        session_id = str(args.get("session_id") or self.session_id)
+        key = self._native_idempotency_key(name, args)
+        if name == "check_table_availability":
+            return await self._service.check_availability(
+                str(args.get("date") or ""),
+                str(args.get("time") or ""),
+                int(args.get("party_size") or 0),
+                preferred_location=str(args.get("preferred_location") or ""),
+                call_id=session_id,
             )
-        }
+        if name == "get_full_menu":
+            return await self._service.list_menu(available_only=False)
+        if name == "check_menu_item_availability":
+            return await self._service.find_menu_item(str(args.get("item_name") or ""))
+        if name == "lookup_booking":
+            return await self._service.lookup_booking(
+                booking_id=int(args.get("booking_id") or 0),
+                customer_name=str(args.get("customer_name") or ""),
+                customer_phone=str(args.get("customer_phone") or ""),
+            )
+        if name == "lookup_order":
+            return await self._service.lookup_order(
+                order_id=int(args.get("order_id") or 0),
+                customer_name=str(args.get("customer_name") or ""),
+            )
+        if name == "get_order_summary":
+            return await self._service.get_order_summary(call_id=session_id)
+        if name == "create_booking":
+            return await self._service.create_booking(
+                call_id=session_id,
+                idempotency_key=key,
+                customer_name=str(args.get("name") or ""),
+                customer_phone=str(args.get("phone") or ""),
+                date=str(args.get("date") or ""),
+                time=str(args.get("time") or ""),
+                party_size=int(args.get("party_size") or 0),
+                notes=str(args.get("notes") or ""),
+                confirmed=bool(args.get("caller_confirmed")),
+                table_number=int(args.get("table_number") or 0),
+            )
+        if name == "update_confirmed_booking":
+            return await self._service.update_confirmed_booking(
+                call_id=session_id,
+                idempotency_key=key,
+                booking_id=int(args.get("booking_id") or 0),
+                confirmed=bool(args.get("caller_confirmed")),
+                date=str(args.get("date") or ""),
+                time=str(args.get("time") or ""),
+                party_size=int(args.get("party_size") or 0),
+                seating_preference=args.get("seating_preference"),
+                seating_backup=args.get("seating_backup"),
+                seating_avoid=args.get("seating_avoid"),
+                dietary=args.get("dietary"),
+                occasion=args.get("occasion"),
+                extra_notes=args.get("extra_notes"),
+                customer_name=str(args.get("customer_name") or ""),
+                require_approval_for_paid_items=args.get("require_approval_for_paid_items"),
+            )
+        if name == "cancel_booking":
+            return await self._service.cancel_booking(
+                call_id=session_id,
+                idempotency_key=key,
+                booking_id=int(args.get("booking_id") or 0),
+                customer_name=str(args.get("customer_name") or ""),
+                customer_phone=str(args.get("customer_phone") or ""),
+                reason=str(args.get("reason") or ""),
+                confirmed=bool(args.get("caller_confirmed")),
+            )
+        if name == "add_guest_note":
+            return await self._service.add_guest_note(
+                call_id=session_id,
+                idempotency_key=key,
+                note=str(args.get("note") or ""),
+                booking_id=int(args.get("booking_id") or 0),
+            )
+        if name == "add_order_item":
+            return await self._service.add_order_item(
+                call_id=session_id,
+                idempotency_key=key,
+                item_name=str(args.get("item_name") or ""),
+                quantity=int(args.get("quantity") or 1),
+                notes=str(args.get("notes") or ""),
+                modifier_ids=args.get("modifier_ids") or [],
+                removals=args.get("removals") or [],
+                substitutions=args.get("substitutions") or [],
+                order_notes=str(args.get("order_notes") or ""),
+                allergy_notes=str(args.get("allergy_notes") or ""),
+                booking_id=int(args.get("booking_id") or 0),
+                customer_name=str(args.get("customer_name") or ""),
+                customer_phone=str(args.get("customer_phone") or ""),
+                caller_confirmed=bool(args.get("caller_confirmed")),
+            )
+        if name == "set_order_fulfillment":
+            return await self._service.set_order_fulfillment(
+                call_id=session_id,
+                idempotency_key=key,
+                fulfillment_type=str(args.get("fulfillment_type") or ""),
+                booking_id=args.get("booking_id"),
+                delivery_address=str(args.get("delivery_address") or ""),
+                delivery_instructions=str(args.get("delivery_instructions") or ""),
+            )
+        if name == "set_order_notes":
+            return await self._service.set_order_notes(
+                call_id=session_id,
+                idempotency_key=key,
+                order_notes=args.get("order_notes"),
+                allergy_notes=args.get("allergy_notes"),
+                caller_confirmed=bool(args.get("caller_confirmed")),
+            )
+        if name == "update_order_item":
+            return await self._service.update_order_item(
+                call_id=session_id,
+                idempotency_key=key,
+                order_item_id=int(args.get("order_item_id") or 0),
+                quantity=int(args.get("quantity") or 0),
+                notes=args.get("notes"),
+                caller_confirmed=bool(args.get("caller_confirmed")),
+            )
+        if name == "remove_order_item":
+            return await self._service.remove_order_item(
+                call_id=session_id,
+                idempotency_key=key,
+                order_item_id=int(args.get("order_item_id") or 0),
+                caller_confirmed=bool(args.get("caller_confirmed")),
+            )
+        if name == "confirm_order":
+            return await self._service.confirm_order(
+                call_id=session_id,
+                idempotency_key=key,
+                expected_draft_version=int(args.get("expected_draft_version") or 0),
+                approved=bool(args.get("caller_approved_full_readback")),
+            )
+        if name == "get_reservation_draft":
+            from app.call_memory import get_reservation_draft
+
+            return get_reservation_draft(session_id)
+        if name == "update_reservation_draft":
+            from app.call_memory import get_reservation_draft, update_reservation_draft
+
+            updates = {
+                key: args[key]
+                for key in (
+                    "name", "phone", "date", "time", "party_size", "seating_preference",
+                    "seating_backup", "seating_avoid", "dietary", "occasion", "extra_notes",
+                    "require_approval_for_paid_items",
+                )
+                if key in args and args[key] is not None
+            }
+            draft = update_reservation_draft(session_id, updates)
+            await self._service.persist_call_state(session_id, draft, caller_phone=str(draft.get("customer_phone") or ""))
+            return draft
+        raise ValueError(f"unsupported_native_tool:{name}")
 
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        if self._native_service is not None:
+            return await self._invoke_native(name, arguments)
         if name == "lookup_order":
-            from app.services.restaurant import restaurant_service
-
-            return await restaurant_service.get_order_summary(
+            return await self._service.get_order_summary(
                 call_id=str(arguments.get("session_id") or "")
             )
         if name == "get_full_menu":
-            from app.services.restaurant import restaurant_service
-
-            result = await restaurant_service.list_menu(available_only=False)
+            result = await self._service.list_menu(available_only=False)
             return {
                 **result,
                 "evidence_source": "restaurant_service.list_menu",
@@ -306,9 +476,7 @@ class RestaurantToolExecutor:
                 ),
             }
         if name == "check_menu_item_availability":
-            from app.services.restaurant import restaurant_service
-
-            result = await restaurant_service.find_menu_item(str(arguments.get("item_name") or ""))
+            result = await self._service.find_menu_item(str(arguments.get("item_name") or ""))
             return {
                 **result,
                 "evidence_source": "restaurant_service.find_menu_item",
@@ -318,15 +486,18 @@ class RestaurantToolExecutor:
                 ),
             }
         if name == "lookup_booking":
-            from app.services.restaurant import restaurant_service
+            from app.restaurant_knowledge import get_restaurant_knowledge
 
-            return dict(
-                await restaurant_service.lookup_booking(
+            result = dict(
+                await self._service.lookup_booking(
                     booking_id=int(arguments.get("booking_id") or 0),
                     customer_name=str(arguments.get("customer_name") or ""),
                     customer_phone=str(arguments.get("customer_phone") or ""),
                 )
             )
+            result["reference"] = str(result.get("booking_id") or "")
+            result["timezone"] = get_restaurant_knowledge().identity["timezone"]
+            return result
         tool = self._tools[name]
         args = dict(arguments)
         if hasattr(tool, "ainvoke"):
@@ -336,9 +507,7 @@ class RestaurantToolExecutor:
     async def readback(self, name: str, arguments: Mapping[str, Any], result: Any) -> Any:
         """Read authoritative state after every mutation that can change it."""
         if name in {"add_order_item", "set_order_fulfillment", "set_order_notes", "update_order_item", "remove_order_item", "confirm_order"}:
-            from app.services.restaurant import restaurant_service
-
-            readback = await restaurant_service.get_order_summary(
+            readback = await self._service.get_order_summary(
                 call_id=str(arguments.get("session_id") or "")
             )
             readback = dict(readback)
@@ -351,7 +520,8 @@ class RestaurantToolExecutor:
             from app.call_memory import get_reservation_draft, hydrate_call_memory
 
             session_id = str(arguments.get("session_id") or "")
-            await hydrate_call_memory(session_id)
+            if self._native_service is None:
+                await hydrate_call_memory(session_id)
             draft = dict(get_reservation_draft(session_id))
             draft["readback_committed"] = True
             return draft
@@ -360,21 +530,29 @@ class RestaurantToolExecutor:
             from app.call_memory import get_call_memory
 
             if booking_id:
-                from app.services.restaurant import restaurant_service
-
-                readback = dict(await restaurant_service.lookup_booking(booking_id=booking_id))
+                readback = dict(await self._service.lookup_booking(booking_id=booking_id))
                 readback["readback_committed"] = True
                 readback["guest_notes"] = str(
                     get_call_memory(str(arguments.get("session_id") or "")).get("guest_notes") or ""
                 )
                 return readback
-            from app.services.restaurant import restaurant_service
             from app.call_memory import get_call_memory, hydrate_call_memory
 
             session_id = str(arguments.get("session_id") or "")
+            if self._native_service is not None:
+                try:
+                    readback = dict(await self._service.get_order_summary(call_id=session_id))
+                    readback["guest_notes"] = str(result.get("guest_notes") or arguments.get("note") or "") if isinstance(result, Mapping) else str(arguments.get("note") or "")
+                    readback["readback_committed"] = True
+                    readback.setdefault("unresolved_fields", [])
+                    readback["state_version"] = int(readback.get("draft_version") or 0)
+                    readback["readback_hash"] = _order_readback_hash(readback)
+                    return readback
+                except Exception:
+                    return {**(dict(result) if isinstance(result, Mapping) else {}), "guest_notes": str(arguments.get("note") or ""), "readback_committed": True}
             try:
                 readback = dict(
-                    await restaurant_service.get_order_summary(call_id=session_id)
+                    await self._service.get_order_summary(call_id=session_id)
                 )
             except Exception:
                 from app.call_memory import get_reservation_draft
@@ -393,8 +571,6 @@ class RestaurantToolExecutor:
             readback["readback_hash"] = _order_readback_hash(readback)
             return readback
         if name in {"create_booking", "update_confirmed_booking", "cancel_booking"}:
-            from app.services.restaurant import restaurant_service
-
             booking_id = int(arguments.get("booking_id") or 0)
             if not booking_id and isinstance(result, str):
                 match = re.search(r"(?:reference|booking)\s+#?\s*(\d+)", result, re.IGNORECASE)
@@ -403,7 +579,7 @@ class RestaurantToolExecutor:
             if booking_id <= 0:
                 return None
             try:
-                readback = dict(await restaurant_service.lookup_booking(booking_id=booking_id))
+                readback = dict(await self._service.lookup_booking(booking_id=booking_id))
                 readback["readback_committed"] = True
                 return readback
             except Exception:

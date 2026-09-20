@@ -181,6 +181,52 @@ class OrderPatch:
 
 
 @dataclass(frozen=True)
+class CommittedOperation:
+    session_id: str
+    operation_id: str
+    turn_id: str
+    operation: str
+    resource: dict[str, Any]
+    result: Any
+    readback: Any
+    facts: dict[str, Any]
+    state_version: int
+    confirmation_text: str = ""
+    confirmation_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "operation_id": self.operation_id,
+            "turn_id": self.turn_id,
+            "operation": self.operation,
+            "resource": dict(self.resource),
+            "result": self.result,
+            "readback": self.readback,
+            "facts": dict(self.facts),
+            "state_version": self.state_version,
+            "confirmation_text": self.confirmation_text,
+            "confirmation_hash": self.confirmation_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CommittedOperation":
+        return cls(
+            session_id=str(value.get("session_id") or ""),
+            operation_id=str(value.get("operation_id") or ""),
+            turn_id=str(value.get("turn_id") or ""),
+            operation=str(value.get("operation") or ""),
+            resource=_clean_mapping(value.get("resource")),
+            result=value.get("result"),
+            readback=value.get("readback"),
+            facts=_clean_mapping(value.get("facts")),
+            state_version=int(value.get("state_version") or 0),
+            confirmation_text=str(value.get("confirmation_text") or ""),
+            confirmation_hash=str(value.get("confirmation_hash") or ""),
+        )
+
+
+@dataclass(frozen=True)
 class OrderState:
     """Versioned, typed order memory outside model context."""
 
@@ -196,6 +242,7 @@ class OrderState:
     unresolved_fields: tuple[UnresolvedField, ...] = ()
     source_turn_ids: tuple[str, ...] = ()
     finalized_turn_ids: tuple[str, ...] = ()
+    committed_operations: tuple[CommittedOperation, ...] = ()
     status: str = "empty"
 
     def __post_init__(self) -> None:
@@ -206,6 +253,7 @@ class OrderState:
         object.__setattr__(self, "unresolved_fields", tuple(self.unresolved_fields))
         object.__setattr__(self, "source_turn_ids", _tuple(self.source_turn_ids))
         object.__setattr__(self, "finalized_turn_ids", _tuple(self.finalized_turn_ids))
+        object.__setattr__(self, "committed_operations", tuple(self.committed_operations))
         object.__setattr__(self, "fulfillment_details", _clean_mapping(self.fulfillment_details))
 
     def mark_turn_finalized(self, turn_id: str) -> "OrderState":
@@ -226,6 +274,7 @@ class OrderState:
             unresolved_fields=self.unresolved_fields,
             source_turn_ids=self.source_turn_ids,
             finalized_turn_ids=self.finalized_turn_ids + (turn_id,),
+            committed_operations=self.committed_operations,
             status=self.status,
         )
 
@@ -328,6 +377,7 @@ class OrderState:
             unresolved_fields=tuple(unresolved),
             source_turn_ids=source_turn_ids,
             finalized_turn_ids=finalized_turn_ids,
+            committed_operations=self.committed_operations,
             status=status,
         )
 
@@ -345,6 +395,7 @@ class OrderState:
             "unresolved_fields": [item.to_dict() for item in self.unresolved_fields],
             "source_turn_ids": list(self.source_turn_ids),
             "finalized_turn_ids": list(self.finalized_turn_ids),
+            "committed_operations": [item.to_dict() for item in self.committed_operations],
             "status": self.status,
         }
 
@@ -364,5 +415,10 @@ class OrderState:
             unresolved_fields=tuple(UnresolvedField.from_dict(item) for item in data.get("unresolved_fields") or []),
             source_turn_ids=_tuple(data.get("source_turn_ids")),
             finalized_turn_ids=_tuple(data.get("finalized_turn_ids") or data.get("source_turn_ids")),
+            committed_operations=tuple(
+                CommittedOperation.from_dict(item)
+                for item in data.get("committed_operations") or []
+                if isinstance(item, Mapping)
+            ),
             status=str(data.get("status") or "empty"),
         )
