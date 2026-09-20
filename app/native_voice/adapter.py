@@ -582,8 +582,7 @@ class NativeVoiceAdapter:
         current = await self.state_store.load(self.session_id)
         if generation is not None and generation != self.interruptions.generation:
             return None
-        if self._completed_turn.turn_id in current.source_turn_ids:
-            return None
+        turn_already_applied = self._completed_turn.turn_id in current.source_turn_ids
         if "items" in readback:
             items = tuple(
                 OrderItemState(
@@ -622,7 +621,24 @@ class NativeVoiceAdapter:
         )
         if not items and not remove_line_ids and not patch.order_notes and not patch.allergy_notes and not patch.guest_notes and not patch.fulfillment:
             return None
-        next_state = current.apply(patch)
+        if turn_already_applied:
+            next_state = replace(
+                current,
+                version=current.version + 1,
+                items=items,
+                order_notes=patch.order_notes if patch.order_notes is not None else current.order_notes,
+                allergy_notes=patch.allergy_notes if patch.allergy_notes is not None else current.allergy_notes,
+                guest_notes=patch.guest_notes if patch.guest_notes is not None else current.guest_notes,
+                fulfillment=patch.fulfillment if patch.fulfillment is not None else current.fulfillment,
+                fulfillment_details=(
+                    dict(current.fulfillment_details)
+                    if patch.fulfillment_details is None
+                    else dict(patch.fulfillment_details)
+                ),
+                status=patch.status or current.status,
+            )
+        else:
+            next_state = current.apply(patch)
         if generation is not None and generation != self.interruptions.generation:
             return None
         if not await self._save_state(

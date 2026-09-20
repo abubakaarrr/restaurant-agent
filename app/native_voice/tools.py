@@ -302,12 +302,20 @@ class RestaurantToolExecutor:
             from app.services.restaurant import restaurant_service
             from app.call_memory import get_call_memory, hydrate_call_memory
 
-            readback = dict(
-                await restaurant_service.get_order_summary(
-                    call_id=str(arguments.get("session_id") or "")
-                )
-            )
             session_id = str(arguments.get("session_id") or "")
+            try:
+                readback = dict(
+                    await restaurant_service.get_order_summary(call_id=session_id)
+                )
+            except Exception:
+                from app.call_memory import get_reservation_draft
+
+                await hydrate_call_memory(session_id)
+                readback = dict(get_reservation_draft(session_id))
+                readback["guest_notes"] = str(get_call_memory(session_id).get("guest_notes") or "")
+                readback["readback_committed"] = True
+                readback["note_owner"] = "reservation_draft"
+                return readback
             await hydrate_call_memory(session_id)
             readback["guest_notes"] = str(get_call_memory(session_id).get("guest_notes") or "")
             readback.setdefault("unresolved_fields", [])
@@ -602,8 +610,14 @@ class ToolBridge:
                 memory = get_call_memory(self.session_id)
                 if int(memory.get("booking_id") or 0):
                     return None, "booking_scope_unverified"
+                from app.services.restaurant import restaurant_service
+
+                await restaurant_service.get_order_summary(call_id=self.session_id)
+                return None, "booking_scope_unverified"
             except (TypeError, ValueError):
                 return None, "booking_scope_unverified"
+            except Exception:
+                pass
             scoped = dict(arguments)
             scoped["session_id"] = self.session_id
             scoped["booking_id"] = 0
@@ -661,24 +675,13 @@ class ToolBridge:
             except (TypeError, ValueError):
                 return None, "order_scope_unverified"
             scoped["order_id"] = current["order_id"]
-            if int(current.get("booking_id") or 0):
-                trusted, error = await self._verified_booking_identity()
-                if error or int(current.get("booking_id") or 0) != int(trusted["booking_id"]):
-                    return None, "order_scope_unverified"
-                scoped["customer_name"] = trusted["customer_name"]
-            else:
-                scoped.pop("customer_name", None)
+            trusted, error = await self._verified_booking_identity()
+            if error or int(current.get("booking_id") or 0) != int(trusted["booking_id"]):
+                return None, "order_scope_unverified"
+            scoped["customer_name"] = trusted["customer_name"]
             return scoped, ""
         if isinstance(current, Mapping):
             current_booking_id = int(current.get("booking_id") or 0)
-            if not current_booking_id:
-                if name == "add_order_item":
-                    scoped.pop("customer_name", None)
-                    scoped.pop("customer_phone", None)
-                    scoped.pop("booking_id", None)
-                elif name == "set_order_fulfillment":
-                    scoped.pop("booking_id", None)
-                return scoped, ""
             trusted, error = await self._verified_booking_identity()
             if error or current_booking_id != int(trusted["booking_id"]):
                 return None, "order_scope_unverified"
@@ -836,7 +839,7 @@ class ToolBridge:
             except Exception as exc:
                 error = f"readback_exception:{type(exc).__name__}"
             else:
-                readback_verified = self._verify_readback(name, args, readback, state_version)
+                readback_verified = self._verify_readback(name, args, readback, state_version, result)
                 if not readback_verified:
                     error = "database_readback_mismatch"
         facts = self._facts(result, readback, args)
@@ -858,12 +861,25 @@ class ToolBridge:
         return outcome
 
     @staticmethod
-    def _verify_readback(name: str, arguments: Mapping[str, Any], readback: Any, state_version: int) -> bool:
+    def _verify_readback(
+        name: str,
+        arguments: Mapping[str, Any],
+        readback: Any,
+        state_version: int,
+        result: Any = None,
+    ) -> bool:
         if readback is None:
             return False
         if isinstance(readback, Mapping):
             if readback.get("ok") is False or readback.get("status") in {"failed", "error"}:
                 return False
+            if name == "add_guest_note" and readback.get("note_owner") == "reservation_draft":
+                note = str(arguments.get("note") or "").casefold()
+                stored = " ".join(
+                    str(readback.get(key) or "")
+                    for key in ("guest_notes", "notes")
+                ).casefold()
+                return bool(readback.get("readback_committed") and note and note in stored)
             if arguments.get("expected_draft_version") is not None:
                 try:
                     if int(readback.get("draft_version")) != int(arguments["expected_draft_version"]):
@@ -873,6 +889,11 @@ class ToolBridge:
             if "order_id" in readback:
                 if not readback.get("readback_committed"):
                     return False
+                if arguments.get("session_id") and readback.get("call_id") != arguments.get("session_id"):
+                    return False
+                if isinstance(result, Mapping) and result.get("order_id") not in (None, ""):
+                    if readback.get("order_id") != result.get("order_id"):
+                        return False
                 if not all(field in readback for field in _ORDER_READBACK_FIELDS):
                     return False
                 if not isinstance(readback.get("items"), list) or not isinstance(readback.get("proposed_items"), list):
@@ -894,34 +915,81 @@ class ToolBridge:
                         return False
                 if name == "set_order_fulfillment" and readback.get("fulfillment_type") != arguments.get("fulfillment_type"):
                     return False
+                if name == "set_order_notes":
+                    for field in ("order_notes", "allergy_notes"):
+                        if field in arguments and arguments[field] is not None and readback.get(field) != arguments[field]:
+                            return False
                 if name == "add_order_item" and arguments.get("item_name"):
-                    if not any(
-                        str(item.get("item_name") or "").casefold() == str(arguments["item_name"]).casefold()
+                    committed = [
+                        item
                         for item in readback["items"]
+                        if str(item.get("item_name") or "").casefold() == str(arguments["item_name"]).casefold()
+                    ]
+                    if not committed:
+                        return False
+                    if arguments.get("quantity") is not None and not any(
+                        int(item.get("quantity") or 0) >= int(arguments["quantity"])
+                        for item in committed
                     ):
                         return False
-                if name in {"update_order_item", "remove_order_item"} and arguments.get("order_item_id"):
-                    ids = {str(item.get("order_item_id")) for item in readback["items"] + readback["proposed_items"]}
-                    if name == "update_order_item" and str(arguments["order_item_id"]) not in ids:
+                if name == "update_order_item" and arguments.get("order_item_id"):
+                    matching = [
+                        item
+                        for item in readback["items"]
+                        if str(item.get("order_item_id")) == str(arguments["order_item_id"])
+                    ]
+                    if not matching:
                         return False
-                    if name == "remove_order_item" and str(arguments["order_item_id"]) in ids:
+                    item = matching[0]
+                    if arguments.get("quantity") is not None and int(item.get("quantity") or 0) != int(arguments["quantity"]):
+                        return False
+                    if "notes" in arguments and arguments["notes"] is not None and item.get("notes") != arguments["notes"]:
+                        return False
+                if name == "remove_order_item" and arguments.get("order_item_id"):
+                    ids = {str(item.get("order_item_id")) for item in readback["items"] + readback["proposed_items"]}
+                    if str(arguments["order_item_id"]) in ids:
+                        return False
+                if name == "add_guest_note":
+                    note = str(arguments.get("note") or "").casefold()
+                    stored = " ".join(str(readback.get(key) or "") for key in ("order_notes", "guest_notes")).casefold()
+                    if not note or note not in stored:
                         return False
                 return bool(readback.get("order_id") and int(readback.get("draft_version") or 0) > 0)
             if "booking_id" in readback:
                 required = ("booking_id", "customer_name", "customer_phone", "status", "date", "time", "readback_committed")
+                if not all(field in readback for field in required) or not readback.get("readback_committed"):
+                    return False
+                expected_booking = arguments.get("booking_id")
+                if expected_booking not in (None, "", 0) and int(readback.get("booking_id") or 0) != int(expected_booking):
+                    return False
+                if isinstance(result, Mapping) and result.get("booking_id") not in (None, "", 0):
+                    if int(readback.get("booking_id") or 0) != int(result["booking_id"]):
+                        return False
+                if name == "cancel_booking" and readback.get("status") != "cancelled":
+                    return False
+                if name in {"create_booking", "update_confirmed_booking"} and readback.get("status") != "confirmed":
+                    return False
+                for argument_key, readback_key in (("name", "customer_name"), ("customer_name", "customer_name"), ("phone", "customer_phone"), ("customer_phone", "customer_phone"), ("date", "date"), ("time", "time"), ("party_size", "party_size")):
+                    if argument_key in arguments and arguments[argument_key] not in (None, "") and readback.get(readback_key) != arguments[argument_key]:
+                        return False
+                if name == "add_guest_note":
+                    note = str(arguments.get("note") or "").casefold()
+                    stored = " ".join(str(readback.get(key) or "") for key in ("notes", "guest_notes")).casefold()
+                    if not note or note not in stored:
+                        return False
                 return bool(
                     all(field in readback for field in required)
                     and readback.get("booking_id")
                     and readback.get("customer_name")
                     and readback.get("customer_phone")
-                    and readback.get("status") not in {"failed", "error"}
-                    and (name == "cancel_booking" or readback.get("status") != "cancelled")
                 )
             if name == "update_reservation_draft":
-                return bool(
-                    readback.get("readback_committed")
-                    and all(field in readback for field in ("customer_name", "customer_phone", "date", "time", "party_size"))
-                )
+                if not readback.get("readback_committed"):
+                    return False
+                for argument_key, readback_key in (("name", "customer_name"), ("phone", "customer_phone"), ("date", "date"), ("time", "time"), ("party_size", "party_size")):
+                    if argument_key in arguments and arguments[argument_key] is not None and readback.get(readback_key) != arguments[argument_key]:
+                        return False
+                return all(field in readback for field in ("customer_name", "customer_phone", "date", "time", "party_size"))
             return False
         if isinstance(readback, str):
             return False

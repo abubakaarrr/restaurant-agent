@@ -34,7 +34,8 @@ _UNAVAILABLE = re.compile(
 _CONSEQUENTIAL_FOOD_FACT = re.compile(
     r"\b(?:contain(?:s|ed)?|include(?:s|d)?|made\s+with|ingredient(?:s)?|allergen(?:s)?|"
     r"allerg(?:y|ic|ies)|peanuts?|tree\s+nuts?|dairy|gluten|soy|shellfish|"
-    r"vegan|vegetarian|cross[- ]contact)\b",
+    r"vegan|vegetarian|cross[- ]contact|has|have|calories?|kcal|kilocalories?|"
+    r"grams?|milligrams?|mg|sodium|carbs?|protein|fat|sugar|portion)\b",
     re.IGNORECASE,
 )
 
@@ -456,6 +457,7 @@ class SpeechGate:
                 elif isinstance(value, (list, tuple)):
                     for entry in value:
                         terms.update(re.sub(r"[^a-z0-9]+", " ", str(entry).casefold()).split())
-            if requested & {term.rstrip("s") for term in terms}:
+            authoritative = {term.rstrip("s") for term in terms}
+            if requested <= authoritative:
                 return True
         return False

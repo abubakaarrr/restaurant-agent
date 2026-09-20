@@ -426,6 +426,8 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     )
     assert gate.evaluate("Hearth Burger contains dairy.", b"audio", evidence=[dietary], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger contains peanuts.", b"audio", evidence=[dietary], current_state_version=1).allowed
+    assert not gate.evaluate("Hearth Burger contains dairy and peanuts.", b"audio", evidence=[dietary], current_state_version=1).allowed
+    assert not gate.evaluate("Hearth Burger has 900 calories.", b"audio", evidence=[dietary], current_state_version=1).allowed
 
 
 def test_event_recorder_redacts_transcripts_arguments_and_personal_fields():
@@ -436,12 +438,15 @@ def test_event_recorder_redacts_transcripts_arguments_and_personal_fields():
             "transcript": "My name is Ada and my phone is 555-0100",
             "arguments": '{"customer_phone":"555-0100"}',
             "customer_phone": "555-0100",
+            "item": {"content": [{"type": "input_text", "text": "My address is 123 Main Street"}]},
         }
     )
     payload = event.payload
     assert "transcript" not in payload
     assert "arguments" not in payload
     assert "555-0100" not in str(payload)
+    assert "123 Main Street" not in str(payload)
+    assert payload["item"]["content_parts"][0]["text_chars"] > 0
     assert payload["transcript_chars"] > 0
     assert payload["arguments_present"] is True
 

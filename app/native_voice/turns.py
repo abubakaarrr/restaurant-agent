@@ -63,5 +63,7 @@ class TurnAssembler:
 
     def reset(self) -> None:
         """Invalidate provisional text after an interruption."""
-        if self._active_turn_id and self._active_turn_id not in self._completed:
+        if self._active_turn_id:
             self._deltas.pop(self._active_turn_id, None)
+            self._completed.pop(self._active_turn_id, None)
+        self._active_turn_id = ""

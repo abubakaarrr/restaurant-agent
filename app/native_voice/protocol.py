@@ -62,6 +62,27 @@ class EventRecorder:
                 safe["transcript_chars"] = len(raw)
                 safe["transcript_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 continue
+            if key in {"text", "input_text", "output_text"}:
+                raw = str(value)
+                safe[f"{key}_chars"] = len(raw)
+                safe[f"{key}_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                continue
+            if key == "content":
+                if isinstance(value, list):
+                    safe["content_parts"] = [
+                        {
+                            "type": str(part.get("type") or ""),
+                            "text_chars": len(str(part.get("text") or "")),
+                            "text_sha256": hashlib.sha256(
+                                str(part.get("text") or "").encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        for part in value
+                        if isinstance(part, Mapping)
+                    ]
+                else:
+                    safe["content_present"] = bool(value)
+                continue
             if key == "arguments":
                 if isinstance(value, Mapping):
                     safe["argument_keys"] = sorted(str(argument) for argument in value)
