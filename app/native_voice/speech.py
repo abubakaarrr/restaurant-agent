@@ -61,6 +61,9 @@ _BOOKING_REFERENCE_TOKEN = re.compile(
     r"|\b(?:booking|reservation)\s*#\s*([A-Za-z0-9-]+)\b",
     re.IGNORECASE,
 )
+_PARTY_SIZE_TOKEN = re.compile(r"\b(\d+)\s+(?:people|guests|persons)\b", re.IGNORECASE)
+_LOCATION_TOKEN = re.compile(r"\b(?:patio|main dining|private dining|main room|private room)\b", re.IGNORECASE)
+_TABLE_NUMBER_TOKEN = re.compile(r"\btable\s+#?(\d+)\b", re.IGNORECASE)
 _WEEKDAY_TOKEN = re.compile(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE)
 _FULFILLMENT_TOKEN = re.compile(r"\b(?:pickup|delivery|dine[ -]?in)\b", re.IGNORECASE)
 _EFFECT_MARKER = re.compile(
@@ -174,6 +177,15 @@ class SpeechGate:
                 for item in evidence_list
             ):
                 reasons.append("availability_without_authoritative_evidence")
+
+        if _DATE_TOKEN.search(text or "") or _TIME_TOKEN.search(text or "") or _WEEKDAY_TOKEN.search(text or "") or _BOOKING_REFERENCE_TOKEN.search(text or "") or _PARTY_SIZE_TOKEN.search(text or "") or _LOCATION_TOKEN.search(text or "") or _TABLE_NUMBER_TOKEN.search(text or ""):
+            if not any(
+                item.speakable
+                and item.state_version == current_state_version
+                and self._structured_details_supported(text, item.facts)
+                for item in evidence_list
+            ):
+                reasons.append("structured_detail_without_authority")
 
         for claim in claims:
             if not self._claim_supported(claim, evidence_list, current_state_version):
@@ -471,6 +483,54 @@ class SpeechGate:
         normalized_spoken = spoken.casefold()
         normalized_expected = expected.casefold()
         return normalized_spoken == normalized_expected or normalized_spoken in aliases.get(normalized_expected, set())
+
+    @classmethod
+    def _structured_details_supported(cls, text: str, facts: Mapping[str, Any]) -> bool:
+        booking = facts.get("booking") if isinstance(facts.get("booking"), Mapping) else {}
+        subject = facts.get("subject") if isinstance(facts.get("subject"), Mapping) else {}
+        expected_date = str(facts.get("date") or booking.get("date") or subject.get("date") or "")
+        dates = _DATE_TOKEN.findall(text or "")
+        if dates and (not expected_date or any(not cls._date_matches(value, expected_date) for value in dates)):
+            return False
+        expected_time = str(facts.get("time") or booking.get("time") or subject.get("time") or "")
+        times = _TIME_TOKEN.findall(text or "")
+        if times and (not expected_time or any(cls._time_minutes(value) != cls._time_minutes(expected_time) for value in times)):
+            return False
+        weekdays = _WEEKDAY_TOKEN.findall(text or "")
+        if weekdays and (not expected_date or any(not cls._weekday_matches(value, expected_date) for value in weekdays)):
+            return False
+        references = [match.group(1) or match.group(2) for match in _BOOKING_REFERENCE_TOKEN.finditer(text or "")]
+        expected_reference = str(
+            facts.get("reference")
+            or facts.get("booking_reference")
+            or booking.get("reference")
+            or subject.get("reference")
+            or subject.get("booking_id")
+            or ""
+        )
+        if references and (not expected_reference or any(value != expected_reference for value in references)):
+            return False
+        party = _PARTY_SIZE_TOKEN.search(text or "")
+        if party:
+            try:
+                if int(party.group(1)) != int(facts.get("party_size") or booking.get("party_size") or subject.get("party_size") or 0):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        locations = _LOCATION_TOKEN.findall(text or "")
+        if locations:
+            expected_location = str(
+                facts.get("preferred_location")
+                or facts.get("location")
+                or subject.get("preferred_location")
+                or ""
+            ).replace("-", " ").casefold()
+            if not expected_location or any(value.replace("-", " ").casefold() not in expected_location for value in locations):
+                return False
+        table = _TABLE_NUMBER_TOKEN.search(text or "")
+        if table and str(table.group(1)) != str(facts.get("table_number") or booking.get("table_number") or subject.get("table_number") or ""):
+            return False
+        return True
 
     @staticmethod
     def _availability_matches(spoken: str, authoritative: Any) -> bool:

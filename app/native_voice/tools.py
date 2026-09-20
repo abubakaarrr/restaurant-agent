@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Mapping, Protocol
 
 from app.native_voice.speech import ToolEvidence
 
@@ -584,11 +584,18 @@ def realtime_tool_definitions() -> list[dict[str, Any]]:
 class ToolBridge:
     """Validate, deduplicate, execute, and verify constrained model calls."""
 
-    def __init__(self, executor: ToolExecutor, *, session_id: str = "") -> None:
+    def __init__(
+        self,
+        executor: ToolExecutor,
+        *,
+        session_id: str = "",
+        scope_resolver: Callable[[str], Awaitable[Mapping[str, Any] | None]] | None = None,
+    ) -> None:
         self.executor = executor
         self._calls: dict[str, ToolOutcome] = {}
         self.session_id = session_id
         self._turn_operations: dict[str, dict[str, str]] = {}
+        self.scope_resolver = scope_resolver
 
     def bind_session(self, session_id: str) -> None:
         if self.session_id and self.session_id != session_id:
@@ -720,14 +727,18 @@ class ToolBridge:
             except Exception:
                 return None, "booking_scope_unverified"
             try:
-                from app.services.restaurant import restaurant_service
+                if self.scope_resolver is not None:
+                    current = await self.scope_resolver(self.session_id)
+                else:
+                    from app.services.restaurant import restaurant_service
 
-                await restaurant_service.get_order_summary(call_id=self.session_id)
+                    current = await restaurant_service.get_order_summary(call_id=self.session_id)
             except Exception as exc:
                 if getattr(exc, "code", "") != "order_not_found":
                     return None, "booking_scope_unverified"
             else:
-                return None, "booking_scope_unverified"
+                if current is not None:
+                    return None, "booking_scope_unverified"
             scoped = dict(arguments)
             scoped["session_id"] = self.session_id
             scoped["booking_id"] = 0
@@ -787,9 +798,12 @@ class ToolBridge:
         scoped = dict(arguments)
         scoped["session_id"] = self.session_id
         try:
-            from app.services.restaurant import restaurant_service
+            if self.scope_resolver is not None:
+                current = await self.scope_resolver(self.session_id)
+            else:
+                from app.services.restaurant import restaurant_service
 
-            current = await restaurant_service.get_order_summary(call_id=self.session_id)
+                current = await restaurant_service.get_order_summary(call_id=self.session_id)
         except Exception as exc:
             if getattr(exc, "code", "") != "order_not_found":
                 return None, "order_scope_unverified"
@@ -1247,7 +1261,7 @@ class ToolBridge:
                 "items", "prices", "availability", "booking", "order", "status", "date", "time",
                 "customer_name", "customer_phone", "party_size", "location", "notes", "total",
                 "fulfillment", "fulfillment_type", "fulfillment_details", "order_notes", "allergy_notes",
-                "booked_at", "timezone", "reference", "booking_reference",
+                "booked_at", "timezone", "reference", "booking_reference", "table_number",
             ):
                 if key in value:
                     facts[key] = value[key]

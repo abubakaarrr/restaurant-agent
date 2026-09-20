@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import asyncio
-import hashlib
 import json
 import sys
 
@@ -18,12 +17,16 @@ from app.native_voice.contracts import (
     OrderState,
     UnresolvedField,
 )
-from app.native_voice.database_guard import NativeVoiceDatabaseGuardError, validate_native_voice_database
+from app.native_voice.database_guard import (
+    NativeVoiceDatabaseGuardError,
+    validate_native_voice_database,
+    verify_native_voice_database_connection,
+)
 from app.native_voice.protocol import EventRecorder, MemoryRealtimeTransport
 from app.native_voice.speech import SpeechGate, ToolEvidence
 from app.native_voice.state_store import InMemoryOrderStateStore, StateVersionConflict
 from app.native_voice.tools import ToolBridge, ToolOutcome, _order_readback_hash, realtime_tool_definitions
-from app.native_voice.turns import TurnAssembler
+from app.native_voice.turns import CompletedCallerTurn, TurnAssembler
 
 
 class FakeExecutor:
@@ -41,6 +44,10 @@ class FakeExecutor:
 
     async def readback(self, name, arguments, result):
         return self.readback_result
+
+
+async def fake_order_scope(session_id):
+    return {"order_id": 7, "booking_id": 0}
 
 
 def item(item_id: str, name: str, quantity: int, *, line_id: str = "", **kwargs) -> OrderItemState:
@@ -209,7 +216,7 @@ async def test_tool_bridge_requires_readback_and_replays_idempotently():
             ],
         ),
     )
-    bridge = ToolBridge(executor)
+    bridge = ToolBridge(executor, scope_resolver=fake_order_scope)
     bridge.bind_session("call-1")
     args = {"session_id": "call-1", "item_name": "House Lemonade", "quantity": 2}
     first = await bridge.invoke(call_id="tool-1", name="add_order_item", arguments=args, turn_id="turn-1", state_version=1)
@@ -231,7 +238,7 @@ async def test_tool_bridge_rejects_mutation_before_turn_finalization_and_incompl
         result={"ok": True, "order_id": 7, "status": "pending"},
         readback={"order_id": 7, "status": "pending"},
     )
-    bridge = ToolBridge(executor)
+    bridge = ToolBridge(executor, scope_resolver=fake_order_scope)
     bridge.bind_session("call-1")
     not_finalized = await bridge.invoke(
         call_id="tool-before-turn",
@@ -254,7 +261,7 @@ async def test_tool_bridge_rejects_mutation_before_turn_finalization_and_incompl
 @pytest.mark.asyncio
 async def test_tool_bridge_rejects_cross_session_and_error_readbacks():
     executor = FakeExecutor(result="saved", readback="order_not_found: no order")
-    bridge = ToolBridge(executor)
+    bridge = ToolBridge(executor, scope_resolver=fake_order_scope)
     bridge.bind_session("call-a")
     cross_session = await bridge.invoke(
         call_id="tool-cross",
@@ -308,7 +315,8 @@ async def test_tool_bridge_rejects_proposed_order_items_as_uncommitted():
         FakeExecutor(
             result={"ok": True, "status": "pending"},
             readback=proposed,
-        )
+        ),
+        scope_resolver=fake_order_scope,
     )
     bridge.bind_session("call-1")
     outcome = await bridge.invoke(
@@ -323,13 +331,10 @@ async def test_tool_bridge_rejects_proposed_order_items_as_uncommitted():
 
 @pytest.mark.asyncio
 async def test_anonymous_pickup_scope_keeps_contact_data_server_bound(monkeypatch):
-    from app.services.restaurant import restaurant_service
-
-    async def current_order(*, call_id):
-        assert call_id == "call-1"
+    async def current_order(session_id):
+        assert session_id == "call-1"
         return {"order_id": 7, "booking_id": 0}
 
-    monkeypatch.setattr(restaurant_service, "get_order_summary", current_order)
     executor = FakeExecutor(
         result={"ok": True, "order_id": 7, "order_item_id": 1, "status": "pending", "draft_version": 2},
         readback=order_readback(
@@ -351,7 +356,7 @@ async def test_anonymous_pickup_scope_keeps_contact_data_server_bound(monkeypatc
             ],
         ),
     )
-    bridge = ToolBridge(executor)
+    bridge = ToolBridge(executor, scope_resolver=current_order)
     bridge.bind_session("call-1")
     outcome = await bridge.invoke(
         call_id="tool-contact",
@@ -373,7 +378,14 @@ async def test_anonymous_pickup_scope_keeps_contact_data_server_bound(monkeypatc
 
 @pytest.mark.asyncio
 async def test_anonymous_guest_note_stays_bound_to_current_session():
-    bridge = ToolBridge(FakeExecutor(result={"saved": True}, readback=order_readback()), session_id="call-1")
+    async def no_order_scope(session_id):
+        return None
+
+    bridge = ToolBridge(
+        FakeExecutor(result={"saved": True}, readback=order_readback()),
+        session_id="call-1",
+        scope_resolver=no_order_scope,
+    )
 
     async def no_verified_booking():
         return None, "booking_scope_unverified"
@@ -408,14 +420,14 @@ async def test_availability_parser_preserves_negative_authoritative_result():
 
 @pytest.mark.asyncio
 async def test_tool_failure_or_readback_mismatch_cannot_unlock_success_speech():
-    failed = ToolBridge(FakeExecutor(result={"ok": True}, readback=None), session_id="call-1")
+    failed = ToolBridge(FakeExecutor(result={"ok": True}, readback=None), session_id="call-1", scope_resolver=fake_order_scope)
     outcome = await failed.invoke(call_id="tool-2", name="confirm_order", arguments={"session_id": "call-1"}, turn_id="turn-1", state_version=1)
-    assert outcome.success and not outcome.readback_verified
+    assert not outcome.success and not outcome.readback_verified
     evidence = outcome.as_evidence(turn_id="turn-1")
     decision = SpeechGate().evaluate("Your order is placed.", b"audio", evidence=[evidence], current_state_version=1)
     assert not decision.allowed
 
-    exception = ToolBridge(FakeExecutor(error=TimeoutError()), session_id="call-1")
+    exception = ToolBridge(FakeExecutor(error=TimeoutError()), session_id="call-1", scope_resolver=fake_order_scope)
     timed_out = await exception.invoke(call_id="tool-3", name="confirm_order", arguments={"session_id": "call-1"}, turn_id="turn-1", state_version=1)
     assert not timed_out.success and "tool_exception" in timed_out.error
 
@@ -898,6 +910,21 @@ def test_booking_claims_require_structured_date_time_and_reference_evidence():
         evidence=[evidence],
         current_state_version=1,
     ).allowed
+    lookup = ToolEvidence(
+        action="lookup_booking",
+        call_id="booking-lookup",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts=evidence.facts,
+    )
+    assert not gate.evaluate(
+        "Your reservation is on 2026-09-20 at 20:00.",
+        b"audio",
+        evidence=[lookup],
+        current_state_version=1,
+    ).allowed
 
 
 @pytest.mark.asyncio
@@ -919,10 +946,106 @@ def test_native_voice_database_guard_requires_separate_approved_disposable_datab
     monkeypatch.delenv("NATIVE_VOICE_DATABASE_URL", raising=False)
     with pytest.raises(NativeVoiceDatabaseGuardError):
         validate_native_voice_database()
+
+
+@pytest.mark.asyncio
+async def test_native_voice_database_marker_is_verified_server_side(monkeypatch):
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_MARKER", "preprovisioned-disposable-marker")
+
+    class Pool:
+        async def fetchval(self, query):
+            assert "native_voice_disposable_marker" in query
+            return "preprovisioned-disposable-marker"
+
+    await verify_native_voice_database_connection(Pool())
+
+    class WrongPool:
+        async def fetchval(self, query):
+            return "customer-database"
+
+    with pytest.raises(NativeVoiceDatabaseGuardError):
+        await verify_native_voice_database_connection(WrongPool())
+
+
+def test_item_confirmation_uses_the_committed_operation_item():
+    outcome = ToolOutcome(
+        name="add_order_item",
+        call_id="item-2",
+        arguments={"item_name": "House Lemonade"},
+        result={"order_item_id": 2},
+        success=True,
+        readback_verified=True,
+        readback={
+            "items": [
+                {"order_item_id": 1, "item_name": "Hearth Burger", "quantity": 1},
+                {"order_item_id": 2, "item_name": "House Lemonade", "quantity": 2},
+            ]
+        },
+        facts={"items": [{"item_name": "Hearth Burger"}, {"item_name": "House Lemonade"}]},
+    )
+    payload = NativeVoiceAdapter._model_tool_output(outcome)
+    assert "House Lemonade" in payload["speech"]
+    assert "Hearth Burger" not in payload["speech"]
+
+
+@pytest.mark.asyncio
+async def test_realtime_failure_is_terminal_and_quarantines_input():
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response": {"id": "response-failed"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item-failed"},
+            {"type": "conversation.item.input_audio_transcription.failed", "item_id": "item-failed", "error": {"code": "transcription_failed"}},
+        ]
+    )
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
+    result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-failed")
+    assert result.speech and not result.speech.allowed
+    assert "item-failed" in adapter._quarantined_input_item_ids
+    assert adapter.interruptions.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_reservation_allows_only_scoped_correction():
+    store = InMemoryOrderStateStore()
+    state = OrderState().apply(
+        OrderPatch(
+            source_turn_id="turn-0",
+            unresolved_fields=(UnresolvedField("date", "ambiguous date", ("Friday", "Saturday"), "turn-0"),),
+        )
+    )
+    await store.save("call-1", state, expected_version=0)
+    executor = FakeExecutor(
+        result={"ok": True},
+        readback={
+            "readback_committed": True,
+            "customer_name": "Ada Lovelace",
+            "customer_phone": "+14155550123",
+            "date": "2026-09-19",
+            "time": "19:00",
+            "party_size": 2,
+        },
+    )
+    adapter = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=MemoryRealtimeTransport(),
+        state_store=store,
+        tool_bridge=ToolBridge(executor),
+    )
+    adapter.state = state
+    adapter._completed_turn = CompletedCallerTurn("turn-1", 1, "correct the date", 0.0)
+    outcome = await adapter._run_tool(
+        "correction-1",
+        "update_reservation_draft",
+        {"session_id": "call-1", "date": "2026-09-19"},
+        generation=0,
+    )
+    assert outcome.success and outcome.readback_verified
+    assert not (await store.load("call-1")).unresolved_fields
+    assert executor.calls
     native_url = "postgresql://native:password@localhost:5432/native_voice"
     monkeypatch.setenv("NATIVE_VOICE_DATABASE_URL", native_url)
     monkeypatch.setenv("NATIVE_VOICE_DATABASE_WRITE_ENABLED", "true")
-    monkeypatch.setenv("NATIVE_VOICE_DISPOSABLE_DATABASE_FINGERPRINT", hashlib.sha256(native_url.encode()).hexdigest())
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_MARKER", "preprovisioned-disposable-marker")
     monkeypatch.setenv("DATABASE_URL", native_url)
     with pytest.raises(NativeVoiceDatabaseGuardError):
         validate_native_voice_database()

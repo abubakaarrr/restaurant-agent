@@ -45,11 +45,18 @@ def pool_kwargs(database_url: str) -> dict:
 async def get_pool() -> asyncpg.Pool:
     """Return the process-wide connection pool, creating it on first use."""
     from app.native_voice.database_guard import active_native_voice_database_url
+    from app.native_voice.database_guard import verify_native_voice_database_connection
 
     database_url = active_native_voice_database_url() or settings.database_url
     pool = _pools.get(database_url)
     if pool is None:
         pool = await asyncpg.create_pool(**pool_kwargs(database_url))
+        if active_native_voice_database_url() is not None:
+            try:
+                await verify_native_voice_database_connection(pool)
+            except Exception:
+                await pool.close()
+                raise
         _pools[database_url] = pool
     return pool
 

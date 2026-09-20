@@ -487,9 +487,23 @@ class NativeVoiceAdapter:
             if event_type == "response.function_call_arguments.done":
                 self._remember_tool_call(event)
                 continue
+            if event_type in {
+                "conversation.item.input_audio_transcription.failed",
+                "conversation.item.input_audio_transcription.error",
+            }:
+                error = event.get("error") if isinstance(event.get("error"), Mapping) else {}
+                return await self._terminal_response_failure(
+                    code=str(error.get("code") or event_type),
+                    response_id=response_id,
+                    item_id=str(event.get("item_id") or ""),
+                )
             if event_type == "error":
-                self.recorder.record({"type": "tool_or_response_failure", "code": (event.get("error") or {}).get("code", "realtime_error")})
-                continue
+                error = event.get("error") if isinstance(event.get("error"), Mapping) else {}
+                return await self._terminal_response_failure(
+                    code=str(error.get("code") or "realtime_error"),
+                    response_id=response_id,
+                    item_id=str(event.get("item_id") or ""),
+                )
             if event_type == "response.done":
                 pending_response_id = response_id
                 pending_response_status = str(response.get("status") or event.get("status") or "")
@@ -506,6 +520,33 @@ class NativeVoiceAdapter:
                 if result is not None:
                     return result
                 continue
+
+    async def _terminal_response_failure(
+        self,
+        *,
+        code: str,
+        response_id: str,
+        item_id: str,
+    ) -> VoiceTurnResult:
+        response = self._response
+        for candidate in (item_id, response.input_item_id if response is not None else "", self._expected_input_item_id):
+            if candidate:
+                self._quarantined_input_item_ids.add(candidate)
+        self._input_transcript_quarantined = True
+        self._require_input_item_id = True
+        generation = self.interruptions.interrupt(response_id)
+        self.turns.reset()
+        self.recorder.record({"type": "tool_or_response_failure", "code": code, "generation": generation})
+        self._response = None
+        self._outcomes.clear()
+        decision = SpeechDecision(
+            allowed=False,
+            text="",
+            audio=b"",
+            reasons=("realtime_response_failed",),
+            replacement=self.speech_gate.replacement,
+        )
+        return VoiceTurnResult(None, b"", "", decision, response_id=response_id)
 
     async def _handle_completed_response(
         self,
@@ -610,24 +651,41 @@ class NativeVoiceAdapter:
     def _model_tool_output(outcome: ToolOutcome) -> dict[str, Any]:
         verified = outcome.success and outcome.readback_verified
         clarification_required = outcome.error == "clarification_required"
+        exact_item: Mapping[str, Any] | None = None
+        if outcome.name == "add_order_item":
+            result_item_id = outcome.result.get("order_item_id") if isinstance(outcome.result, Mapping) else None
+            requested_name = str(outcome.arguments.get("item_name") or "").casefold()
+            readback_items = outcome.readback.get("items") if isinstance(outcome.readback, Mapping) else ()
+            for item in readback_items or ():
+                if not isinstance(item, Mapping):
+                    continue
+                if result_item_id not in (None, "") and str(item.get("order_item_id")) == str(result_item_id):
+                    exact_item = item
+                    break
+                if result_item_id in (None, "") and str(item.get("item_name") or item.get("name") or "").casefold() == requested_name:
+                    exact_item = item
+                    break
+            if exact_item is None:
+                verified = False
         if not verified:
             sentence = "I could not complete that request yet."
         elif outcome.name == "add_order_item":
-            items = [item for item in outcome.facts.get("items") or () if isinstance(item, Mapping)]
-            item = items[0] if items else {}
-            item_name = str(item.get("item_name") or item.get("name") or "the item")
-            try:
-                quantity = int(item.get("quantity") or 1)
-            except (TypeError, ValueError):
-                quantity = 1
+            item_name = str(exact_item.get("item_name") or exact_item.get("name") or "the item")
+            quantity = int(exact_item.get("quantity") or 1)
             sentence = f"I added {quantity} {item_name} to your order."
         elif outcome.name == "confirm_order":
             sentence = "Your order is confirmed."
         elif outcome.name == "create_booking":
             date_value = str(outcome.facts.get("date") or "")
             time_value = str(outcome.facts.get("time") or "")
+            location = str(outcome.facts.get("location") or "")
+            table_number = str(outcome.facts.get("table_number") or "")
+            party_size = str(outcome.facts.get("party_size") or "")
             sentence = (
-                f"Your reservation is confirmed for {date_value} at {time_value}."
+                f"Your reservation is confirmed for {date_value} at {time_value}"
+                f"{f' at {location}' if location else ''}"
+                f"{f' at table {table_number}' if table_number else ''}"
+                f"{f' for {party_size} guests' if party_size else ''}."
                 if date_value and time_value
                 else "Your reservation is confirmed."
             )
@@ -836,16 +894,17 @@ class NativeVoiceAdapter:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="stale_interrupted_tool_call", state_version=self.state.version)
         if self._completed_turn is not None and self._completed_turn.turn_id in self._replayed_finalized_turns:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="replayed_finalized_turn", state_version=self.state.version)
-        if name in MUTATING_TOOLS and self.state.unresolved_fields:
-            return ToolOutcome(
-                name=name,
-                call_id=call_id,
-                arguments=dict(args),
-                result=None,
-                success=False,
-                error="clarification_required",
-                state_version=self.state.version,
-            )
+        if self.state.unresolved_fields:
+            if name != "update_reservation_draft" or not self._reservation_correction_is_scoped(args):
+                return ToolOutcome(
+                    name=name,
+                    call_id=call_id,
+                    arguments=dict(args),
+                    result=None,
+                    success=False,
+                    error="clarification_required",
+                    state_version=self.state.version,
+                )
         if name in MUTATING_TOOLS and self._completed_turn is None:
             return ToolOutcome(
                 name=name,
@@ -879,10 +938,56 @@ class NativeVoiceAdapter:
                 error="stale_interrupted_tool_call",
                 state_version=outcome.state_version,
             )
+        if name == "update_reservation_draft" and outcome.success and outcome.readback_verified:
+            outcome = await self._apply_reservation_correction(outcome, generation=generation)
         self.recorder.record({"type": "tool_result_received", "call_id": call_id, "success": outcome.success, "readback_verified": outcome.readback_verified})
         if outcome.success and outcome.readback_verified:
             self.recorder.record({"type": "database_readback_verified", "call_id": call_id, "state_version": outcome.state_version})
         return outcome
+
+    def _reservation_correction_is_scoped(self, arguments: Mapping[str, Any]) -> bool:
+        aliases = {"customer_name": "name", "customer_phone": "phone"}
+        unresolved = {
+            aliases.get(field.rsplit(".", 1)[-1], field.rsplit(".", 1)[-1])
+            for field in (item.field for item in self.state.unresolved_fields)
+        }
+        provided = {
+            aliases.get(key, key)
+            for key, value in arguments.items()
+            if key != "session_id" and value is not None
+        }
+        allowed_fields = {
+            "name", "phone", "date", "time", "party_size", "seating_preference",
+            "seating_backup", "seating_avoid", "dietary", "occasion", "extra_notes",
+            "require_approval_for_paid_items",
+        }
+        return bool(provided) and provided <= allowed_fields and provided <= unresolved
+
+    async def _apply_reservation_correction(
+        self,
+        outcome: ToolOutcome,
+        *,
+        generation: int,
+    ) -> ToolOutcome:
+        aliases = {"customer_name": "name", "customer_phone": "phone"}
+        resolved = {
+            aliases.get(key, key)
+            for key, value in outcome.arguments.items()
+            if key != "session_id" and value is not None
+        }
+        current = await self.state_store.load(self.session_id)
+        remaining = tuple(item for item in current.unresolved_fields if item.field.rsplit(".", 1)[-1] not in resolved)
+        next_status = "needs_clarification" if remaining else ("draft" if current.items else "empty")
+        next_state = replace(
+            current,
+            version=current.version + 1,
+            unresolved_fields=remaining,
+            status=next_status,
+        )
+        if not await self._save_state(next_state, expected_version=current.version, generation=generation):
+            return replace(outcome, success=False, error="stale_interrupted_tool_call", readback_verified=False)
+        self.state = next_state
+        return replace(outcome, state_version=next_state.version)
 
     async def _finish_response(self, *, transcript: str | None) -> VoiceTurnResult:
         if self._response is None:

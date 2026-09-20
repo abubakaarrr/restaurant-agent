@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextvars
-import hashlib
 import os
 
 from app.config import settings
@@ -32,10 +31,21 @@ def validate_native_voice_database() -> str:
         raise NativeVoiceDatabaseGuardError("native_voice_database_production_forbidden")
     if os.getenv("NATIVE_VOICE_DATABASE_WRITE_ENABLED", "").casefold() != "true":
         raise NativeVoiceDatabaseGuardError("native_voice_database_writes_disabled")
-    expected = hashlib.sha256(url.encode("utf-8")).hexdigest()
-    if os.getenv("NATIVE_VOICE_DISPOSABLE_DATABASE_FINGERPRINT", "").strip() != expected:
-        raise NativeVoiceDatabaseGuardError("native_voice_database_fingerprint_required")
+    if not os.getenv("NATIVE_VOICE_DATABASE_MARKER", "").strip():
+        raise NativeVoiceDatabaseGuardError("native_voice_database_marker_required")
     return url
+
+
+async def verify_native_voice_database_connection(pool: object) -> None:
+    marker = os.getenv("NATIVE_VOICE_DATABASE_MARKER", "").strip()
+    if not marker:
+        raise NativeVoiceDatabaseGuardError("native_voice_database_marker_required")
+    try:
+        actual = await pool.fetchval("SELECT current_setting('app.native_voice_disposable_marker', true)")
+    except Exception as exc:
+        raise NativeVoiceDatabaseGuardError("native_voice_database_marker_unreadable") from exc
+    if not isinstance(actual, str) or not actual or actual != marker:
+        raise NativeVoiceDatabaseGuardError("native_voice_database_marker_mismatch")
 
 
 def activate_native_voice_database() -> contextvars.Token[str | None]:
