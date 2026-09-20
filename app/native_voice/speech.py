@@ -190,10 +190,10 @@ class SpeechGate:
             return action == "remove_order_item"
         if word == "confirmed":
             return action in {"confirm_order", "create_booking", "update_confirmed_booking"}
-        if word in {"saved", "set", "completed", "submitted", "processed"}:
+        if word in {"completed", "submitted", "processed"}:
+            return action in {"confirm_order", "create_booking", "update_confirmed_booking"}
+        if word == "saved":
             return action in {
-                "create_booking",
-                "update_confirmed_booking",
                 "update_reservation_draft",
                 "add_guest_note",
                 "add_order_item",
@@ -201,7 +201,14 @@ class SpeechGate:
                 "set_order_notes",
                 "update_order_item",
                 "remove_order_item",
-                "confirm_order",
+            }
+        if word == "set":
+            return action in {
+                "create_booking",
+                "update_confirmed_booking",
+                "update_reservation_draft",
+                "set_order_fulfillment",
+                "set_order_notes",
             }
         return False
 

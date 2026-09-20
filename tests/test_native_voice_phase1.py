@@ -387,6 +387,16 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     assert gate.evaluate("Your booking is confirmed.", b"audio", evidence=[evidence], current_state_version=1).allowed
     assert not gate.evaluate("The 9 PM patio slot is available.", b"audio", evidence=[evidence], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger is available.", b"audio", evidence=[evidence], current_state_version=2).allowed
+    order_edit = ToolEvidence(
+        action="set_order_notes",
+        call_id="tool-notes",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={"items": ["Hearth Burger"]},
+    )
+    assert not gate.evaluate("Your order was submitted.", b"audio", evidence=[order_edit], current_state_version=1).allowed
     unavailable = ToolEvidence(
         action="check_menu_item_availability",
         call_id="tool-5",
@@ -577,6 +587,28 @@ async def test_adapter_reconciles_input_transcript_after_response_done():
     result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-late")
     assert result.audio == output
     assert result.turn and result.turn.transcript == "hello"
+
+
+@pytest.mark.asyncio
+async def test_adapter_quarantines_transcript_after_non_completed_response():
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response": {"id": "response-cancelled"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item-old"},
+            {"type": "response.done", "response": {"id": "response-cancelled", "status": "cancelled"}},
+            {"type": "conversation.item.input_audio_transcription.completed", "item_id": "item-old", "transcript": "old caller"},
+            {"type": "response.created", "response": {"id": "response-current"}},
+            {"type": "input_audio_buffer.committed", "item_id": "item-current"},
+            {"type": "conversation.item.input_audio_transcription.completed", "item_id": "item-current", "transcript": "current caller"},
+            {"type": "response.output_audio_transcript.done", "response_id": "response-current", "transcript": "How can I help?"},
+            {"type": "response.done", "response": {"id": "response-current", "status": "completed"}},
+        ]
+    )
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
+    first = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-old")
+    second = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-current")
+    assert first.turn is None
+    assert second.turn and second.turn.transcript == "current caller"
 
 
 @pytest.mark.asyncio

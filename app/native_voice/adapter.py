@@ -166,8 +166,10 @@ class NativeVoiceAdapter:
         self._seen_tool_calls: set[str] = set()
         self._replayed_finalized_turns: set[str] = set()
         self._cancelled_input_item_ids: set[str] = set()
+        self._quarantined_input_item_ids: set[str] = set()
         self._expected_input_item_id = ""
         self._require_input_item_id = False
+        self._input_transcript_quarantined = False
         self._memory_write_task: asyncio.Task[Any] | None = None
         if hasattr(self.tool_bridge, "bind_session"):
             self.tool_bridge.bind_session(session_id)
@@ -323,7 +325,7 @@ class NativeVoiceAdapter:
                 continue
             if event_type == "input_audio_buffer.committed":
                 item_id = str(event.get("item_id") or "")
-                if item_id and item_id not in self._cancelled_input_item_ids:
+                if item_id and item_id not in self._cancelled_input_item_ids and item_id not in self._quarantined_input_item_ids:
                     self._expected_input_item_id = item_id
                     self._response.input_item_id = item_id
                 continue
@@ -331,7 +333,7 @@ class NativeVoiceAdapter:
                 item = event.get("item") or {}
                 if not self._require_input_item_id and item.get("role") == "user" and item.get("id"):
                     item_id = str(item["id"])
-                    if item_id not in self._cancelled_input_item_ids:
+                    if item_id not in self._cancelled_input_item_ids and item_id not in self._quarantined_input_item_ids:
                         self._expected_input_item_id = item_id
                         self._response.input_item_id = item_id
                 continue
@@ -340,6 +342,11 @@ class NativeVoiceAdapter:
                 return VoiceTurnResult(self._completed_turn, b"", "", None)
             if event_type == "conversation.item.input_audio_transcription.delta":
                 item_id = str(event.get("item_id") or "")
+                if item_id in self._quarantined_input_item_ids or (
+                    self._input_transcript_quarantined and not item_id
+                ):
+                    self.recorder.record({"type": "late_input_transcript_ignored", "item_id": item_id})
+                    continue
                 if self._require_input_item_id and (
                     not item_id or item_id != self._expected_input_item_id
                 ):
@@ -358,6 +365,11 @@ class NativeVoiceAdapter:
                 continue
             if event_type == "conversation.item.input_audio_transcription.completed":
                 item_id = str(event.get("item_id") or "")
+                if item_id in self._quarantined_input_item_ids or (
+                    self._input_transcript_quarantined and not item_id
+                ):
+                    self.recorder.record({"type": "late_input_transcript_ignored", "item_id": item_id})
+                    continue
                 if self._require_input_item_id and (
                     not item_id or item_id != self._expected_input_item_id
                 ):
@@ -451,6 +463,14 @@ class NativeVoiceAdapter:
         generation: int,
     ) -> VoiceTurnResult | None:
         if status != "completed":
+            if self._response is not None:
+                if self._response.input_item_id:
+                    self._quarantined_input_item_ids.add(self._response.input_item_id)
+                if self._expected_input_item_id:
+                    self._quarantined_input_item_ids.add(self._expected_input_item_id)
+            self._input_transcript_quarantined = True
+            self._require_input_item_id = True
+            self.interruptions.interrupt(response_id)
             self.recorder.record({
                 "type": "incomplete_response_ignored",
                 "response_id": response_id,

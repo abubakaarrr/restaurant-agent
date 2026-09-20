@@ -653,14 +653,31 @@ class ToolBridge:
                     "booking_date": verified.get("date") or "",
                     "booking_time": verified.get("time") or "",
                     "party_size": verified.get("party_size") or 0,
-                    "draft_status": "confirmed",
+                    "draft_status": str(verified.get("status") or "").casefold(),
                 },
                 caller_phone=str(verified.get("customer_phone") or ""),
             )
-            from app.call_memory import apply_live_booking_to_memory, hydrate_call_memory
+            from app.call_memory import hydrate_call_memory
 
             await hydrate_call_memory(self.session_id)
-            apply_live_booking_to_memory(self.session_id, verified)
+            booking_status = str(verified.get("status") or "").casefold()
+            if booking_status == "confirmed":
+                from app.call_memory import apply_live_booking_to_memory
+
+                apply_live_booking_to_memory(self.session_id, verified)
+            else:
+                from app.call_memory import update_reservation_draft
+
+                update_reservation_draft(
+                    self.session_id,
+                    booking_id=int(verified["booking_id"]),
+                    customer_name=str(verified.get("customer_name") or ""),
+                    customer_phone=str(verified.get("customer_phone") or ""),
+                    date=str(verified.get("date") or ""),
+                    time=str(verified.get("time") or ""),
+                    party_size=int(verified.get("party_size") or 0),
+                    status=booking_status,
+                )
         except Exception:
             return None, "booking_scope_unverified"
         return {
@@ -776,13 +793,22 @@ class ToolBridge:
             except (TypeError, ValueError):
                 return None, "order_scope_unverified"
             scoped["order_id"] = current["order_id"]
-            trusted, error = await self._verified_booking_identity()
-            if error or int(current.get("booking_id") or 0) != int(trusted["booking_id"]):
-                return None, "order_scope_unverified"
-            scoped["customer_name"] = trusted["customer_name"]
+            if int(current.get("booking_id") or 0):
+                trusted, error = await self._verified_booking_identity()
+                if error or int(current.get("booking_id") or 0) != int(trusted["booking_id"]):
+                    return None, "order_scope_unverified"
+                scoped["customer_name"] = trusted["customer_name"]
+            else:
+                scoped.pop("booking_id", None)
+                scoped.pop("customer_name", None)
             return scoped, ""
         if isinstance(current, Mapping):
             current_booking_id = int(current.get("booking_id") or 0)
+            if not current_booking_id:
+                scoped.pop("booking_id", None)
+                scoped.pop("customer_name", None)
+                scoped.pop("customer_phone", None)
+                return scoped, ""
             trusted, error = await self._verified_booking_identity()
             if error or current_booking_id != int(trusted["booking_id"]):
                 return None, "order_scope_unverified"
