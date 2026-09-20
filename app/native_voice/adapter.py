@@ -784,7 +784,9 @@ class NativeVoiceAdapter:
     async def _persist_committed_outcome(self, outcome: ToolOutcome) -> None:
         if self._completed_turn is None or not outcome.success or not outcome.readback_verified:
             return
-        operation_id = self._operation_id(outcome.name, outcome.arguments, self._completed_turn.turn_id)
+        operation_id = outcome.operation_id or self._operation_id(
+            outcome.name, outcome.arguments, self._completed_turn.turn_id
+        )
         current = await self.state_store.load(self.session_id)
         if any(item.operation_id == operation_id and item.session_id == self.session_id for item in current.committed_operations):
             self.state = current
@@ -826,7 +828,9 @@ class NativeVoiceAdapter:
     async def _durable_replay(self, call_id: str, name: str, arguments: Mapping[str, Any]) -> ToolOutcome | None:
         if self._completed_turn is None:
             return None
-        operation_id = self._operation_id(name, arguments, self._completed_turn.turn_id)
+        operation_id = self.tool_bridge.operation_id(
+            name, arguments, self._completed_turn.turn_id
+        )
         for item in self.state.committed_operations:
             if item.session_id != self.session_id or item.operation_id != operation_id:
                 continue
@@ -873,6 +877,7 @@ class NativeVoiceAdapter:
         if completed.turn_id in self.state.finalized_turn_ids:
             if any(item.turn_id == completed.turn_id and item.session_id == self.session_id for item in self.state.committed_operations):
                 self.recorder.record({"type": "replayed_turn_available", "turn_id": completed.turn_id})
+                return
             else:
                 self._replayed_finalized_turns.add(completed.turn_id)
                 self.recorder.record({"type": "replayed_turn_rejected", "turn_id": completed.turn_id})

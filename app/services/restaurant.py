@@ -478,6 +478,48 @@ class RestaurantService:
                 conn, call_id, patch, caller_phone=caller_phone
             )
 
+    async def load_call_state(self, call_id: str) -> dict[str, Any]:
+        call_id = self._require_call_id(call_id)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT caller_phone, state FROM call_sessions WHERE session_id = $1",
+                call_id,
+            )
+        if not row:
+            return {"caller_phone": "", "state": {}}
+        return {
+            "caller_phone": str(row["caller_phone"] or ""),
+            "state": self._coerce_state(row["state"]),
+        }
+
+    async def get_reservation_draft(self, call_id: str) -> JsonDict:
+        state = (await self.load_call_state(call_id)).get("state") or {}
+        return coerce_draft(state.get("reservation_draft") or state)
+
+    async def update_reservation_draft_native(
+        self, call_id: str, updates: Mapping[str, Any]
+    ) -> JsonDict:
+        state = (await self.load_call_state(call_id)).get("state") or {}
+        current = coerce_draft(state.get("reservation_draft") or state)
+        if (
+            int(current.get("booking_id") or 0) > 0
+            and str(current.get("status") or "") == DRAFT_STATUS_CONFIRMED
+        ):
+            raise RestaurantServiceError(
+                "This reservation is already confirmed; use the confirmed booking flow.",
+                code="confirmed_booking_draft",
+            )
+        draft = patch_draft(current, dict(updates))
+        await self.persist_call_state(
+            call_id,
+            {
+                **flatten_draft(draft, guest_notes=str(state.get("guest_notes") or "")),
+            },
+            caller_phone=str(draft.get("customer_phone") or ""),
+        )
+        return draft
+
     def _table_select_sql(self, *, for_update: bool, require_location_match: bool) -> str:
         lock = "FOR UPDATE OF t SKIP LOCKED" if for_update else ""
         location_filter = "AND ($5 = '' OR t.location = $5)" if require_location_match else ""

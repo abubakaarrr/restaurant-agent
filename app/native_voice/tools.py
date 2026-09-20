@@ -240,6 +240,7 @@ class ToolOutcome:
     facts: dict[str, Any] = field(default_factory=dict)
     confirmation_text: str = ""
     confirmation_hash: str = ""
+    operation_id: str = ""
 
     def as_evidence(self, *, turn_id: str) -> ToolEvidence:
         return ToolEvidence(
@@ -264,6 +265,8 @@ class RestaurantToolExecutor:
 
         self._service = service or restaurant_service
         self._native_service = service
+        self.session_id = ""
+        self._operation_turn_id = ""
         if service is None:
             from app.tools import db
 
@@ -293,10 +296,26 @@ class RestaurantToolExecutor:
         else:
             self._tools = {}
 
+    def bind_session(self, session_id: str) -> None:
+        if self.session_id and self.session_id != session_id:
+            raise ValueError("tool executor is already bound to another session")
+        self.session_id = session_id
+
+    def bind_operation_scope(self, turn_id: str) -> None:
+        self._operation_turn_id = turn_id
+
+    def clear_operation_scope(self) -> None:
+        self._operation_turn_id = ""
+
     def _native_idempotency_key(self, name: str, arguments: Mapping[str, Any]) -> str:
         return hashlib.sha256(
             json.dumps(
-                {"session_id": self.session_id, "operation": name, "arguments": dict(arguments)},
+                {
+                    "session_id": self.session_id,
+                    "turn_id": self._operation_turn_id,
+                    "operation": name,
+                    "arguments": dict(arguments),
+                },
                 sort_keys=True,
                 separators=(",", ":"),
                 default=str,
@@ -438,12 +457,8 @@ class RestaurantToolExecutor:
                 approved=bool(args.get("caller_approved_full_readback")),
             )
         if name == "get_reservation_draft":
-            from app.call_memory import get_reservation_draft
-
-            return get_reservation_draft(session_id)
+            return await self._service.get_reservation_draft(session_id)
         if name == "update_reservation_draft":
-            from app.call_memory import get_reservation_draft, update_reservation_draft
-
             updates = {
                 key: args[key]
                 for key in (
@@ -453,9 +468,7 @@ class RestaurantToolExecutor:
                 )
                 if key in args and args[key] is not None
             }
-            draft = update_reservation_draft(session_id, updates)
-            await self._service.persist_call_state(session_id, draft, caller_phone=str(draft.get("customer_phone") or ""))
-            return draft
+            return await self._service.update_reservation_draft_native(session_id, updates)
         raise ValueError(f"unsupported_native_tool:{name}")
 
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
@@ -517,27 +530,30 @@ class RestaurantToolExecutor:
             readback["readback_hash"] = _order_readback_hash(readback)
             return readback
         if name == "update_reservation_draft":
-            from app.call_memory import get_reservation_draft, hydrate_call_memory
-
             session_id = str(arguments.get("session_id") or "")
-            if self._native_service is None:
+            if self._native_service is not None:
+                draft = dict(await self._service.get_reservation_draft(session_id))
+            else:
+                from app.call_memory import get_reservation_draft, hydrate_call_memory
+
                 await hydrate_call_memory(session_id)
-            draft = dict(get_reservation_draft(session_id))
+                draft = dict(get_reservation_draft(session_id))
             draft["readback_committed"] = True
             return draft
         if name == "add_guest_note":
             booking_id = int(arguments.get("booking_id") or 0)
-            from app.call_memory import get_call_memory
 
             if booking_id:
                 readback = dict(await self._service.lookup_booking(booking_id=booking_id))
                 readback["readback_committed"] = True
-                readback["guest_notes"] = str(
-                    get_call_memory(str(arguments.get("session_id") or "")).get("guest_notes") or ""
-                )
-                return readback
-            from app.call_memory import get_call_memory, hydrate_call_memory
+                if self._native_service is not None:
+                    state = await self._service.load_call_state(str(arguments.get("session_id") or ""))
+                    readback["guest_notes"] = str((state.get("state") or {}).get("guest_notes") or "")
+                else:
+                    from app.call_memory import get_call_memory
 
+                    readback["guest_notes"] = str(get_call_memory(str(arguments.get("session_id") or "")).get("guest_notes") or "")
+                return readback
             session_id = str(arguments.get("session_id") or "")
             if self._native_service is not None:
                 try:
@@ -550,6 +566,7 @@ class RestaurantToolExecutor:
                     return readback
                 except Exception:
                     return {**(dict(result) if isinstance(result, Mapping) else {}), "guest_notes": str(arguments.get("note") or ""), "readback_committed": True}
+            from app.call_memory import get_call_memory, hydrate_call_memory
             try:
                 readback = dict(
                     await self._service.get_order_summary(call_id=session_id)
@@ -799,11 +816,32 @@ class ToolBridge:
         self.session_id = session_id
         self._turn_operations: dict[str, dict[str, str]] = {}
         self.scope_resolver = scope_resolver
+        self.native_service = getattr(executor, "_native_service", None)
+        bind_session = getattr(executor, "bind_session", None)
+        if session_id and bind_session is not None:
+            bind_session(session_id)
 
     def bind_session(self, session_id: str) -> None:
         if self.session_id and self.session_id != session_id:
             raise ValueError("tool bridge is already bound to another session")
         self.session_id = session_id
+        bind_session = getattr(self.executor, "bind_session", None)
+        if bind_session is not None:
+            bind_session(session_id)
+
+    def operation_id(self, name: str, arguments: Mapping[str, Any], turn_id: str) -> str:
+        payload = json.dumps(
+            {
+                "session_id": self.session_id,
+                "turn_id": turn_id,
+                "operation": name,
+                "arguments": dict(arguments),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     async def _verified_booking_identity(self) -> tuple[dict[str, Any] | None, str]:
         if not self.session_id:
@@ -821,13 +859,19 @@ class ToolBridge:
                 "customer_name": str(identity.get("customer_name") or ""),
                 "customer_phone": str(identity.get("customer_phone") or ""),
             }, ""
-        try:
-            from app.call_memory import get_call_memory, hydrate_call_memory
+        if self.native_service is not None:
+            try:
+                memory = (await self.native_service.load_call_state(self.session_id)).get("state") or {}
+            except Exception:
+                return None, "booking_scope_unverified"
+        else:
+            try:
+                from app.call_memory import get_call_memory, hydrate_call_memory
 
-            await hydrate_call_memory(self.session_id)
-            memory = get_call_memory(self.session_id)
-        except Exception:
-            return None, "booking_scope_unverified"
+                await hydrate_call_memory(self.session_id)
+                memory = get_call_memory(self.session_id)
+            except Exception:
+                return None, "booking_scope_unverified"
         try:
             booking_id = int(memory.get("booking_id") or 0)
         except (TypeError, ValueError):
@@ -837,9 +881,12 @@ class ToolBridge:
         if not booking_id or not trusted_name or not trusted_phone:
             return None, "booking_scope_unverified"
         try:
-            from app.services.restaurant import restaurant_service
+            service = self.native_service
+            if service is None:
+                from app.services.restaurant import restaurant_service
 
-            verified_booking = await restaurant_service.lookup_booking(booking_id=booking_id)
+                service = restaurant_service
+            verified_booking = await service.lookup_booking(booking_id=booking_id)
         except Exception:
             return None, "booking_scope_unverified"
         if (
@@ -885,16 +932,21 @@ class ToolBridge:
                 "customer_phone": str(identity.get("customer_phone") or ""),
             }, ""
         try:
-            from app.services.restaurant import restaurant_service
+            service = self.native_service
+            if service is None:
+                from app.services.restaurant import restaurant_service
 
-            verified = await restaurant_service.lookup_booking(
+                service = restaurant_service
+            verified = await service.lookup_booking(
                 booking_id=booking_id,
                 customer_name="" if booking_id else customer_name,
                 customer_phone=customer_phone,
             )
             if customer_name and _canonical_name(verified.get("customer_name")) != _canonical_name(customer_name):
                 return None, "booking_scope_unverified"
-            await restaurant_service.persist_call_state(
+            if _canonical_phone(verified.get("customer_phone")) != _canonical_phone(customer_phone):
+                return None, "booking_scope_unverified"
+            await service.persist_call_state(
                 self.session_id,
                 {
                     "booking_id": verified["booking_id"],
@@ -907,27 +959,28 @@ class ToolBridge:
                 },
                 caller_phone=str(verified.get("customer_phone") or ""),
             )
-            from app.call_memory import hydrate_call_memory
+            if self.native_service is None:
+                from app.call_memory import hydrate_call_memory
 
-            await hydrate_call_memory(self.session_id)
-            booking_status = str(verified.get("status") or "").casefold()
-            if booking_status == "confirmed":
-                from app.call_memory import apply_live_booking_to_memory
+                await hydrate_call_memory(self.session_id)
+                booking_status = str(verified.get("status") or "").casefold()
+                if booking_status == "confirmed":
+                    from app.call_memory import apply_live_booking_to_memory
 
-                apply_live_booking_to_memory(self.session_id, verified)
-            else:
-                from app.call_memory import update_reservation_draft
+                    apply_live_booking_to_memory(self.session_id, verified)
+                else:
+                    from app.call_memory import update_reservation_draft
 
-                update_reservation_draft(
-                    self.session_id,
-                    booking_id=int(verified["booking_id"]),
-                    customer_name=str(verified.get("customer_name") or ""),
-                    customer_phone=str(verified.get("customer_phone") or ""),
-                    date=str(verified.get("date") or ""),
-                    time=str(verified.get("time") or ""),
-                    party_size=int(verified.get("party_size") or 0),
-                    status=booking_status,
-                )
+                    update_reservation_draft(
+                        self.session_id,
+                        booking_id=int(verified["booking_id"]),
+                        customer_name=str(verified.get("customer_name") or ""),
+                        customer_phone=str(verified.get("customer_phone") or ""),
+                        date=str(verified.get("date") or ""),
+                        time=str(verified.get("time") or ""),
+                        party_size=int(verified.get("party_size") or 0),
+                        status=booking_status,
+                    )
         except Exception:
             return None, "booking_scope_unverified"
         return {
@@ -982,22 +1035,33 @@ class ToolBridge:
                 scoped.pop("customer_name", None)
                 scoped.pop("customer_phone", None)
                 return scoped, ""
-            from app.call_memory import get_call_memory, hydrate_call_memory
-
-            try:
-                await hydrate_call_memory(self.session_id)
-                memory = get_call_memory(self.session_id)
-                if int(memory.get("booking_id") or 0):
+            if self.native_service is not None:
+                try:
+                    memory = (await self.native_service.load_call_state(self.session_id)).get("state") or {}
+                    if int(memory.get("booking_id") or 0):
+                        return None, "booking_scope_unverified"
+                except Exception:
                     return None, "booking_scope_unverified"
-            except Exception:
-                return None, "booking_scope_unverified"
+            else:
+                from app.call_memory import get_call_memory, hydrate_call_memory
+
+                try:
+                    await hydrate_call_memory(self.session_id)
+                    memory = get_call_memory(self.session_id)
+                    if int(memory.get("booking_id") or 0):
+                        return None, "booking_scope_unverified"
+                except Exception:
+                    return None, "booking_scope_unverified"
             try:
                 if self.scope_resolver is not None:
                     current = await self.scope_resolver(self.session_id)
                 else:
-                    from app.services.restaurant import restaurant_service
+                    service = self.native_service
+                    if service is None:
+                        from app.services.restaurant import restaurant_service
 
-                    current = await restaurant_service.get_order_summary(call_id=self.session_id)
+                        service = restaurant_service
+                    current = await service.get_order_summary(call_id=self.session_id)
             except Exception as exc:
                 if getattr(exc, "code", "") != "order_not_found":
                     return None, "booking_scope_unverified"
@@ -1068,9 +1132,12 @@ class ToolBridge:
             elif self.scope_resolver is not None:
                 current = await self.scope_resolver(self.session_id)
             else:
-                from app.services.restaurant import restaurant_service
+                service = self.native_service
+                if service is None:
+                    from app.services.restaurant import restaurant_service
 
-                current = await restaurant_service.get_order_summary(call_id=self.session_id)
+                    service = restaurant_service
+                current = await service.get_order_summary(call_id=self.session_id)
         except Exception as exc:
             if getattr(exc, "code", "") != "order_not_found":
                 return None, "order_scope_unverified"
@@ -1172,6 +1239,7 @@ class ToolBridge:
             self._calls[call_id] = outcome
             return outcome
         raw_operation_fingerprint = f"{self.session_id}:{turn_id}:{name}:{_hash(args)}"
+        operation_id = self.operation_id(name, args, turn_id)
         if name in MUTATING_TOOLS and turn_id:
             prior_call_id = self._turn_operations.get(turn_id, {}).get(raw_operation_fingerprint)
             prior = self._calls.get(prior_call_id or "")
@@ -1262,12 +1330,19 @@ class ToolBridge:
                     facts=prior.facts,
                 )
 
+        bind_operation_scope = getattr(self.executor, "bind_operation_scope", None)
+        clear_operation_scope = getattr(self.executor, "clear_operation_scope", None)
+        if bind_operation_scope is not None:
+            bind_operation_scope(turn_id)
         try:
             result = await self.executor.invoke(name, args)
         except Exception as exc:  # structured failure; never a success-like response
             outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error=f"tool_exception:{type(exc).__name__}", state_version=state_version)
             self._calls[call_id] = outcome
             return outcome
+        finally:
+            if clear_operation_scope is not None:
+                clear_operation_scope()
 
         readback = None
         readback_verified = False
@@ -1305,6 +1380,7 @@ class ToolBridge:
             readback_verified=readback_verified if name in MUTATING_TOOLS else success,
             state_version=state_version,
             facts=facts,
+            operation_id=operation_id,
         )
         self._calls[call_id] = outcome
         if name in MUTATING_TOOLS and turn_id and outcome.success and outcome.readback_verified:

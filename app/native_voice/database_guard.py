@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextvars
 import ipaddress
 import os
 import socket
@@ -18,9 +17,6 @@ class NativeVoiceDatabaseGuardError(RuntimeError):
     """Raised when native voice is not pointed at an approved disposable database."""
 
 
-_active_database_url: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "native_voice_database_url", default=None
-)
 _native_pool: asyncpg.Pool | None = None
 
 
@@ -79,7 +75,7 @@ async def verify_native_voice_database_connection(pool: object, *, expected_url:
         raise NativeVoiceDatabaseGuardError("native_voice_database_marker_required")
     try:
         row = await pool.fetchrow(
-            "SELECT inet_server_addr()::text AS server_host, "
+            "SELECT host(inet_server_addr()) AS server_host, "
             "inet_server_port() AS server_port, current_database() AS database_name, "
             "current_setting('app.native_voice_disposable_marker', true) AS marker"
         )
@@ -92,8 +88,14 @@ async def verify_native_voice_database_connection(pool: object, *, expected_url:
         server_host = str(row["server_host"] or "")
         server_port = int(row["server_port"])
         database_name = str(row["database_name"] or "")
-        server_address = str(ipaddress.ip_address(server_host))
-        configured_url = expected_url or active_native_voice_database_url() or os.getenv("NATIVE_VOICE_DATABASE_URL", "").strip()
+        try:
+            try:
+                server_address = str(ipaddress.ip_address(server_host))
+            except ValueError:
+                server_address = str(ipaddress.ip_interface(server_host).ip)
+        except ValueError as exc:
+            raise NativeVoiceDatabaseGuardError("native_voice_database_identity_invalid") from exc
+        configured_url = expected_url or os.getenv("NATIVE_VOICE_DATABASE_URL", "").strip()
         expected_addresses, expected_port, expected_database = _database_identity(configured_url)
         normal_urls = {
             os.getenv("DATABASE_URL", "").strip(),
@@ -119,18 +121,6 @@ async def verify_native_voice_database_connection(pool: object, *, expected_url:
         or server_address not in expected_addresses
     ):
         raise NativeVoiceDatabaseGuardError("native_voice_database_marker_mismatch")
-
-
-def activate_native_voice_database() -> contextvars.Token[str | None]:
-    return _active_database_url.set(validate_native_voice_database())
-
-
-def deactivate_native_voice_database(token: contextvars.Token[str | None]) -> None:
-    _active_database_url.reset(token)
-
-
-def active_native_voice_database_url() -> str | None:
-    return _active_database_url.get()
 
 
 async def get_native_voice_pool() -> asyncpg.Pool:

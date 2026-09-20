@@ -7,7 +7,9 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
 import sys
+import uuid
 
 import pytest
 
@@ -21,13 +23,17 @@ from app.native_voice.contracts import (
 )
 from app.native_voice.database_guard import (
     NativeVoiceDatabaseGuardError,
+    close_native_voice_pool,
+    get_native_voice_pool,
     validate_native_voice_database,
     verify_native_voice_database_connection,
 )
 from app.native_voice.protocol import EventRecorder, MemoryRealtimeTransport
 from app.native_voice.speech import SpeechGate, ToolEvidence
-from app.native_voice.state_store import InMemoryOrderStateStore, StateVersionConflict
+from app.native_voice.state_store import CallSessionOrderStateStore, InMemoryOrderStateStore, StateVersionConflict
 from app.native_voice.tools import OfflineToolExecutor, ToolBridge, ToolOutcome, _order_readback_hash, realtime_tool_definitions
+from app.native_voice.tools import RestaurantToolExecutor
+from app.services.restaurant import RestaurantService
 from app.native_voice.turns import CompletedCallerTurn, TurnAssembler
 
 
@@ -46,6 +52,55 @@ class FakeExecutor:
 
     async def readback(self, name, arguments, result):
         return self.readback_result
+
+
+class NativeServiceFake:
+    def __init__(self):
+        self.calls = []
+        self.summary = order_readback(order_id=7, call_id="native-call")
+
+    async def load_call_state(self, session_id):
+        return {"state": {}}
+
+    async def get_order_summary(self, *, call_id):
+        return self.summary
+
+    async def add_order_item(self, **kwargs):
+        self.calls.append(kwargs)
+        item_id = len(self.calls)
+        self.summary = order_readback(
+            order_id=7,
+            call_id="native-call",
+            draft_version=item_id,
+            state_version=item_id,
+            items=[
+                {
+                    "order_item_id": item_id,
+                    "item_id": "menu.main.hearth-burger",
+                    "item_name": "Hearth Burger",
+                    "quantity": 1,
+                    "modifiers": [],
+                    "removals": [],
+                    "substitutions": [],
+                    "notes": "",
+                }
+            ],
+        )
+        return {"ok": True, "order_id": 7, "order_item_id": len(self.calls), "status": "pending", "draft_version": len(self.calls)}
+
+    async def lookup_booking(self, **kwargs):
+        return {
+            "booking_id": 7,
+            "customer_name": "Ada Lovelace",
+            "customer_phone": "+14155550123",
+            "status": "confirmed",
+            "date": "2026-09-19",
+            "time": "19:00",
+            "party_size": 2,
+        }
+
+    async def persist_call_state(self, *args, **kwargs):
+        return None
 
 
 async def fake_order_scope(session_id):
@@ -196,6 +251,30 @@ async def test_structured_state_survives_adapter_restart_without_model_history()
         await store.save("call-1", next_state, expected_version=0)
 
 
+@pytest.mark.skipif(os.getenv("RUN_DB_INTEGRATION") != "1", reason="disposable native PostgreSQL required")
+@pytest.mark.asyncio
+async def test_native_postgresql_executor_and_state_store_are_actual_boundaries():
+    session = f"native-test-{uuid.uuid4().hex}"
+    pool = await get_native_voice_pool()
+    store = CallSessionOrderStateStore()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM call_sessions WHERE session_id = $1", session)
+        first = OrderState().apply(OrderPatch(source_turn_id="turn-1", items=(item("menu.na.lemonade", "House Lemonade", 1),)))
+        await store.save(session, first, expected_version=0)
+        second = first.apply(OrderPatch(source_turn_id="turn-2", items=(item("menu.main.hearth-burger", "Hearth Burger", 1),)))
+        await store.save(session, second, expected_version=1)
+        assert (await store.load(session)).version == 2
+        service = RestaurantService(pool_provider=get_native_voice_pool)
+        bridge = ToolBridge(RestaurantToolExecutor(service=service), session_id=session)
+        outcome = await bridge.invoke(call_id="menu-1", name="get_full_menu", arguments={}, turn_id="turn-menu", state_version=0)
+        assert outcome.success and outcome.facts.get("items")
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM call_sessions WHERE session_id = $1", session)
+        await close_native_voice_pool()
+
+
 @pytest.mark.asyncio
 async def test_tool_bridge_requires_readback_and_replays_idempotently():
     executor = FakeExecutor(
@@ -290,6 +369,45 @@ async def test_offline_booking_scope_and_cancellation_retry_are_authorized_witho
     retry = await bridge.invoke(call_id="cancel-2", name="cancel_booking", arguments=arguments, turn_id="turn-cancel", state_version=2)
     assert first.success and first.readback_verified
     assert retry.replayed and retry.success and len(executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_executor_scopes_idempotency_to_session_and_finalized_turn():
+    from app.native_voice.tools import RestaurantToolExecutor
+
+    service = NativeServiceFake()
+    bridge = ToolBridge(RestaurantToolExecutor(service=service), session_id="native-call")
+    arguments = {"session_id": "native-call", "item_name": "Hearth Burger", "quantity": 1}
+    first = await bridge.invoke(
+        call_id="native-1", name="add_order_item", arguments=arguments, turn_id="turn-1", state_version=1
+    )
+    same_turn = await bridge.invoke(
+        call_id="native-2", name="add_order_item", arguments=arguments, turn_id="turn-1", state_version=2
+    )
+    next_turn = await bridge.invoke(
+        call_id="native-3", name="add_order_item", arguments=arguments, turn_id="turn-2", state_version=3
+    )
+    assert first.success and first.readback_verified
+    assert same_turn.replayed and same_turn.success
+    assert next_turn.success and next_turn.readback_verified
+    assert len(service.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_native_booking_lookup_requires_supplied_phone_match():
+    from app.native_voice.tools import RestaurantToolExecutor
+
+    service = NativeServiceFake()
+    bridge = ToolBridge(RestaurantToolExecutor(service=service), session_id="native-call")
+    outcome = await bridge.invoke(
+        call_id="booking-1",
+        name="lookup_booking",
+        arguments={"booking_id": 7, "customer_phone": "+14155550999"},
+        turn_id="turn-1",
+        state_version=1,
+    )
+    assert not outcome.success
+    assert outcome.error == "booking_scope_unverified"
 
 
 @pytest.mark.asyncio
