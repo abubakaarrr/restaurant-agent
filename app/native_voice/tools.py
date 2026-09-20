@@ -202,6 +202,14 @@ class ToolExecutor(Protocol):
     async def readback(self, name: str, arguments: Mapping[str, Any], result: Any) -> Any: ...
 
 
+class OfflineToolExecutor:
+    async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        return {"ok": False, "error": "offline_tool_executor_required"}
+
+    async def readback(self, name: str, arguments: Mapping[str, Any], result: Any) -> Any:
+        return None
+
+
 @dataclass(frozen=True)
 class ToolOutcome:
     name: str

@@ -13,6 +13,10 @@ _SUCCESS = re.compile(
     r"\b(?:confirmed|booked|reserved|placed|added|updated|cancelled|canceled|removed|charged|saved|set|completed|submitted|processed)\b",
     re.IGNORECASE,
 )
+_UNCLASSIFIED_SUCCESS = re.compile(
+    r"\b(?:successful(?:ly)?|ready|done|finished|complete(?:d)?|all\s+set|good\s+to\s+go|taken\s+care\s+of)\b",
+    re.IGNORECASE,
+)
 _AVAILABILITY = re.compile(
     r"\b(?:available|unavailable|sold out|open|closed|in stock|out of stock)\b",
     re.IGNORECASE,
@@ -144,6 +148,11 @@ class SpeechGate:
                 for item in envelope_evidence
             ):
                 reasons.append("confirmation_envelope_mismatch")
+
+        if _UNCLASSIFIED_SUCCESS.search(text or "") and not any(
+            item.speakable and item.state_version == current_state_version for item in evidence_list
+        ):
+            reasons.append("success_claim_without_matching_readback")
 
         success_matches = list(_SUCCESS.finditer(text or ""))
         for success_match in success_matches:

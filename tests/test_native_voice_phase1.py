@@ -437,6 +437,7 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     gate = SpeechGate()
     for text in (
         "Your booking is confirmed.",
+        "Your reservation is all set.",
         "The Dragon Burger costs $99.00.",
         "The 9 PM patio slot is available.",
     ):
@@ -926,6 +927,63 @@ def test_booking_claims_require_structured_date_time_and_reference_evidence():
         evidence=[lookup],
         current_state_version=1,
     ).allowed
+
+
+def test_read_only_facts_do_not_require_mutation_confirmation_envelope():
+    outcome = ToolOutcome(
+        name="get_full_menu",
+        call_id="menu-1",
+        arguments={},
+        result={"ok": True},
+        success=True,
+        readback_verified=True,
+        facts={"prices": {"Hearth Burger": 21.0}, "canonical_items": [{"name": "Hearth Burger"}]},
+        state_version=1,
+    )
+    evidence = outcome.as_evidence(turn_id="turn-1")
+    assert not evidence.confirmation_text
+    assert SpeechGate().evaluate(
+        "Hearth Burger costs $21.00.", b"audio", evidence=[evidence], current_state_version=1
+    ).allowed
+
+
+@pytest.mark.asyncio
+async def test_inmemory_adapter_uses_offline_executor(monkeypatch):
+    monkeypatch.delenv("NATIVE_VOICE_DATABASE_URL", raising=False)
+    adapter = NativeVoiceAdapter(
+        session_id="offline-call",
+        transport=MemoryRealtimeTransport(),
+        state_store=InMemoryOrderStateStore(),
+    )
+    assert not adapter._uses_native_database
+    await adapter.start()
+
+
+@pytest.mark.asyncio
+async def test_empty_readback_notes_replace_application_memory():
+    store = InMemoryOrderStateStore()
+    await store.save("call-1", OrderState(version=1, order_notes="old note"), expected_version=0)
+    adapter = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=MemoryRealtimeTransport(),
+        state_store=store,
+        tool_bridge=ToolBridge(FakeExecutor()),
+    )
+    adapter._completed_turn = CompletedCallerTurn("turn-clear", 2, "clear the note", 0.0)
+    adapter._outcomes = [
+        ToolOutcome(
+            name="set_order_notes",
+            call_id="notes-1",
+            arguments={"notes": ""},
+            result={"ok": True},
+            success=True,
+            readback_verified=True,
+            readback={"order_notes": "", "readback_committed": True},
+        )
+    ]
+    state = await adapter._sync_order_memory()
+    assert state is not None and state.order_notes == ""
+    assert (await store.load("call-1")).order_notes == ""
 
 
 @pytest.mark.asyncio

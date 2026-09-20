@@ -31,6 +31,7 @@ from app.native_voice.tools import (
     ToolBridge,
     ToolOutcome,
     MUTATING_TOOLS,
+    OfflineToolExecutor,
     realtime_tool_definitions,
 )
 from app.native_voice.turns import CompletedCallerTurn, TurnAssembler
@@ -156,7 +157,14 @@ class NativeVoiceAdapter:
         self.transport = transport
         self.config = config or RealtimeConfig()
         self.state_store = state_store or CallSessionOrderStateStore()
-        self.tool_bridge = tool_bridge or ToolBridge(RestaurantToolExecutor())
+        if tool_bridge is None:
+            executor = (
+                RestaurantToolExecutor()
+                if isinstance(self.state_store, CallSessionOrderStateStore)
+                else OfflineToolExecutor()
+            )
+            tool_bridge = ToolBridge(executor)
+        self.tool_bridge = tool_bridge
         self.recorder = recorder or EventRecorder()
         self.speech_gate = speech_gate or SpeechGate()
         self.facts_extractor = facts_extractor
@@ -704,6 +712,8 @@ class NativeVoiceAdapter:
 
     @staticmethod
     def _with_confirmation(outcome: ToolOutcome) -> ToolOutcome:
+        if outcome.name not in MUTATING_TOOLS:
+            return outcome
         sentence = NativeVoiceAdapter._confirmation_sentence(outcome)
         confirmation_hash = hashlib.sha256(sentence.casefold().strip().encode("utf-8")).hexdigest()
         return replace(outcome, confirmation_text=sentence, confirmation_hash=confirmation_hash)
@@ -871,7 +881,16 @@ class NativeVoiceAdapter:
             fulfillment_details=fulfillment_details,
             status=status,
         )
-        if not items and not remove_line_ids and not patch.order_notes and not patch.allergy_notes and not patch.guest_notes and not patch.fulfillment:
+        synchronized_fields = {
+            "items",
+            "order_notes",
+            "allergy_notes",
+            "guest_notes",
+            "fulfillment",
+            "fulfillment_details",
+            "status",
+        }
+        if not remove_line_ids and not (synchronized_fields & readback.keys()):
             return None
         if turn_already_applied:
             next_state = replace(
