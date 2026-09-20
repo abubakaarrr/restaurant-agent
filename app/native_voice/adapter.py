@@ -93,6 +93,7 @@ class _ResponseBuffer:
     played_audio_bytes: int = 0
     assistant_transcript_seen: bool = False
     assistant_transcript_done: bool = False
+    input_item_id: str = ""
 
 
 class InterruptionController:
@@ -163,6 +164,9 @@ class NativeVoiceAdapter:
         self._outcomes: list[ToolOutcome] = []
         self._seen_tool_calls: set[str] = set()
         self._replayed_finalized_turns: set[str] = set()
+        self._cancelled_input_item_ids: set[str] = set()
+        self._expected_input_item_id = ""
+        self._require_input_item_id = False
         if hasattr(self.tool_bridge, "bind_session"):
             self.tool_bridge.bind_session(session_id)
 
@@ -204,6 +208,7 @@ class NativeVoiceAdapter:
         if self.turns.completed(resolved_turn_id) is not None:
             self._replayed_finalized_turns.add(resolved_turn_id)
         self._completed_turn = None
+        self._expected_input_item_id = ""
         self.turns.start(resolved_turn_id)
         self.recorder.record_audio("audio_received", audio, turn_id=resolved_turn_id)
         append = {"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")}
@@ -224,6 +229,12 @@ class NativeVoiceAdapter:
     async def interrupt(self) -> None:
         response = self._response
         response_id = response.response_id if response is not None else self.interruptions.active_response_id
+        if response is not None and response.input_item_id:
+            self._cancelled_input_item_ids.add(response.input_item_id)
+        if self._expected_input_item_id:
+            self._cancelled_input_item_ids.add(self._expected_input_item_id)
+        self._expected_input_item_id = ""
+        self._require_input_item_id = True
         generation = self.interruptions.interrupt(response_id)
         self.turns.reset()
         await self.transport.send({"type": "response.cancel"})
@@ -267,13 +278,58 @@ class NativeVoiceAdapter:
                 self._response.response_id = response_id or str((event.get("response") or {}).get("id") or "")
                 self.interruptions.begin_response(self._response.response_id)
                 continue
+            if event_type == "input_audio_buffer.committed":
+                item_id = str(event.get("item_id") or "")
+                if item_id and item_id not in self._cancelled_input_item_ids:
+                    self._expected_input_item_id = item_id
+                    self._response.input_item_id = item_id
+                continue
+            if event_type == "conversation.item.created":
+                item = event.get("item") or {}
+                if not self._require_input_item_id and item.get("role") == "user" and item.get("id"):
+                    item_id = str(item["id"])
+                    if item_id not in self._cancelled_input_item_ids:
+                        self._expected_input_item_id = item_id
+                        self._response.input_item_id = item_id
+                continue
             if event_type == "input_audio_buffer.speech_started":
                 await self.interrupt()
                 return VoiceTurnResult(self._completed_turn, b"", "", None)
             if event_type == "conversation.item.input_audio_transcription.delta":
+                item_id = str(event.get("item_id") or "")
+                if self._require_input_item_id and (
+                    not item_id or item_id != self._expected_input_item_id
+                ):
+                    self.recorder.record({"type": "late_input_transcript_ignored", "item_id": item_id})
+                    continue
+                if item_id:
+                    if item_id in self._cancelled_input_item_ids:
+                        self.recorder.record({"type": "late_input_transcript_ignored", "item_id": item_id})
+                        continue
+                    if self._expected_input_item_id and item_id != self._expected_input_item_id:
+                        self.recorder.record({"type": "out_of_order_input_transcript_ignored", "item_id": item_id})
+                        continue
+                    self._expected_input_item_id = item_id
+                    self._response.input_item_id = item_id
                 self.turns.add_delta(str(event.get("delta") or ""))
                 continue
             if event_type == "conversation.item.input_audio_transcription.completed":
+                item_id = str(event.get("item_id") or "")
+                if self._require_input_item_id and (
+                    not item_id or item_id != self._expected_input_item_id
+                ):
+                    self.recorder.record({"type": "late_input_transcript_ignored", "item_id": item_id})
+                    continue
+                if item_id and item_id in self._cancelled_input_item_ids:
+                    self.recorder.record({"type": "late_input_transcript_ignored", "item_id": item_id})
+                    continue
+                if item_id and self._expected_input_item_id and item_id != self._expected_input_item_id:
+                    self.recorder.record({"type": "out_of_order_input_transcript_ignored", "item_id": item_id})
+                    continue
+                if item_id:
+                    self._expected_input_item_id = item_id
+                    self._response.input_item_id = item_id
+                self._require_input_item_id = False
                 await self._finalize_caller_turn(str(event.get("transcript") or transcript or ""))
                 continue
             if event_type == "response.output_audio.delta":
@@ -314,9 +370,21 @@ class NativeVoiceAdapter:
                 continue
             if event_type == "response.done":
                 result = await self._finish_response(transcript=transcript)
+                if generation != self.interruptions.generation:
+                    self._response = None
+                    self._outcomes.clear()
+                    return VoiceTurnResult(self._completed_turn, b"", "", None)
                 if self._response is not None and self._response.tool_calls:
                     for call_id, (name, args) in list(self._response.tool_calls.items()):
+                        if generation != self.interruptions.generation:
+                            self._response = None
+                            self._outcomes.clear()
+                            return VoiceTurnResult(self._completed_turn, b"", "", None)
                         outcome = await self._run_tool(call_id, name, args, generation=generation)
+                        if generation != self.interruptions.generation:
+                            self._response = None
+                            self._outcomes.clear()
+                            return VoiceTurnResult(self._completed_turn, b"", "", None)
                         self._outcomes.append(outcome)
                         output = {
                             "type": "conversation.item.create",
@@ -334,9 +402,40 @@ class NativeVoiceAdapter:
                         }
                         await self.transport.send(output)
                         self.recorder.record({"type": "tool_result_sent", "call_id": call_id, "success": outcome.success})
+                    if generation != self.interruptions.generation:
+                        self._response = None
+                        self._outcomes.clear()
+                        return VoiceTurnResult(self._completed_turn, b"", "", None)
                     synced = await self._sync_order_memory()
-                    if synced is not None:
-                        self._outcomes = [replace(outcome, state_version=synced.version) for outcome in self._outcomes]
+                    if synced is not None and generation == self.interruptions.generation:
+                        order_mutations = {
+                            "add_order_item",
+                            "set_order_fulfillment",
+                            "set_order_notes",
+                            "update_order_item",
+                            "remove_order_item",
+                            "confirm_order",
+                        }
+                        current_readback = next(
+                            (
+                                outcome.readback
+                                for outcome in reversed(self._outcomes)
+                                if outcome.name in order_mutations
+                                and outcome.readback_verified
+                                and isinstance(outcome.readback, Mapping)
+                            ),
+                            None,
+                        )
+                        self._outcomes = [
+                            replace(outcome, state_version=synced.version)
+                            if outcome.readback is current_readback
+                            else outcome
+                            for outcome in self._outcomes
+                        ]
+                    if generation != self.interruptions.generation:
+                        self._response = None
+                        self._outcomes.clear()
+                        return VoiceTurnResult(self._completed_turn, b"", "", None)
                     # The next response has a new server response id.  Clear
                     # the old id before accepting its ``response.created``.
                     self.interruptions.active_response_id = ""
@@ -512,7 +611,7 @@ class NativeVoiceAdapter:
         text = "".join(self._response.transcript_parts)
         current = await self.state_store.load(self.session_id)
         self.state = current
-        if self._response.audio and not self._response.assistant_transcript_seen:
+        if self._response.audio and not self._response.assistant_transcript_done:
             decision = SpeechDecision(
                 allowed=False,
                 text="",

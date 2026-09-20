@@ -14,7 +14,7 @@ pgvector==0.2.5
 # OpenAI SDK (legacy rollback LLM/optional offline embedding jobs)
 openai>=1.25.0
 # Development-only server-to-server OpenAI Realtime WebSocket transport.
-websockets>=13.1,<16.0
+websockets>=14.0,<16.0
 
 # Config + utilities
 python-dotenv==1.0.1

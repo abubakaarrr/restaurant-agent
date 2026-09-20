@@ -31,6 +31,19 @@ BOOKING_SCOPED_TOOLS = frozenset(
     {"lookup_booking", "update_confirmed_booking", "cancel_booking", "add_guest_note"}
 )
 
+ORDER_SCOPED_TOOLS = frozenset(
+    {
+        "lookup_order",
+        "get_order_summary",
+        "add_order_item",
+        "set_order_fulfillment",
+        "set_order_notes",
+        "update_order_item",
+        "remove_order_item",
+        "confirm_order",
+    }
+)
+
 KNOWN_TOOLS = frozenset(
     {
         "check_menu_item_availability",
@@ -66,12 +79,26 @@ def _is_failure(value: Any) -> bool:
             value.get("ok") is False
             or bool(value.get("error"))
             or bool(value.get("pending") or value.get("readback_required"))
+            or bool(value.get("unavailable") or value.get("no_op") or value.get("proposed"))
+            or any(key in value and value[key] is False for key in ("added", "updated", "removed", "cancelled", "saved"))
         )
     if isinstance(value, str):
         lowered = value.casefold()
         return bool(re.match(r"^[a-z][a-z0-9_]*:", value.strip())) or any(
             phrase in lowered
-            for phrase in ("pending confirmation", "readback_required", "not applied", "unchanged")
+            for phrase in (
+                "pending confirmation",
+                "readback_required",
+                "not applied",
+                "unchanged",
+                "unavailable",
+                "not available",
+                "no matching",
+                "no-op",
+                "could not",
+                "cannot",
+                "failed",
+            )
         )
     return False
 
@@ -198,6 +225,12 @@ class RestaurantToolExecutor:
         }
 
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        if name == "lookup_order":
+            from app.services.restaurant import restaurant_service
+
+            return await restaurant_service.get_order_summary(
+                call_id=str(arguments.get("session_id") or "")
+            )
         if name == "get_full_menu":
             from app.services.restaurant import restaurant_service
 
@@ -500,11 +533,7 @@ class ToolBridge:
             raise ValueError("tool bridge is already bound to another session")
         self.session_id = session_id
 
-    async def _scoped_booking_arguments(
-        self, name: str, arguments: Mapping[str, Any]
-    ) -> tuple[dict[str, Any] | None, str]:
-        if name not in BOOKING_SCOPED_TOOLS:
-            return dict(arguments), ""
+    async def _verified_booking_identity(self) -> tuple[dict[str, Any] | None, str]:
         if not self.session_id:
             return None, "booking_scope_unverified"
         try:
@@ -534,19 +563,34 @@ class ToolBridge:
             or str(verified_booking.get("status") or "").casefold() != "confirmed"
         ):
             return None, "booking_scope_unverified"
+        return {
+            "booking_id": booking_id,
+            "customer_name": trusted_name,
+            "customer_phone": trusted_phone,
+        }, ""
+
+    async def _scoped_booking_arguments(
+        self, name: str, arguments: Mapping[str, Any]
+    ) -> tuple[dict[str, Any] | None, str]:
+        if name not in BOOKING_SCOPED_TOOLS:
+            return dict(arguments), ""
+        trusted, error = await self._verified_booking_identity()
+        if error:
+            return None, error
         supplied_booking = arguments.get("booking_id")
+        booking_id = int(trusted["booking_id"])
         if supplied_booking not in (None, "", 0):
             try:
                 if int(supplied_booking) != booking_id:
                     return None, "booking_scope_mismatch"
             except (TypeError, ValueError):
                 return None, "booking_scope_mismatch"
-        for key, trusted in (("customer_name", trusted_name), ("customer_phone", trusted_phone)):
+        for key in ("customer_name", "customer_phone"):
             supplied = str(arguments.get(key) or "").strip()
-            if supplied and supplied.casefold() != trusted.casefold():
+            if supplied and supplied.casefold() != str(trusted[key]).casefold():
                 return None, "booking_scope_mismatch"
         scoped = dict(arguments)
-        scoped.update({"booking_id": booking_id, "customer_name": trusted_name, "customer_phone": trusted_phone})
+        scoped.update(trusted)
         scoped["session_id"] = self.session_id
         if name == "lookup_booking":
             scoped.pop("session_id", None)
@@ -555,6 +599,54 @@ class ToolBridge:
         elif name == "add_guest_note":
             scoped.pop("customer_name", None)
             scoped.pop("customer_phone", None)
+        return scoped, ""
+
+    async def _scoped_order_arguments(
+        self, name: str, arguments: Mapping[str, Any]
+    ) -> tuple[dict[str, Any] | None, str]:
+        if name not in ORDER_SCOPED_TOOLS:
+            return dict(arguments), ""
+        if not self.session_id:
+            return None, "order_scope_unverified"
+        scoped = dict(arguments)
+        scoped["session_id"] = self.session_id
+        try:
+            from app.services.restaurant import restaurant_service
+
+            current = await restaurant_service.get_order_summary(call_id=self.session_id)
+        except Exception:
+            current = None
+        if name == "lookup_order":
+            if not isinstance(current, Mapping):
+                return None, "order_scope_unverified"
+            try:
+                if int(arguments.get("order_id") or 0) != int(current.get("order_id") or 0):
+                    return None, "order_scope_unverified"
+            except (TypeError, ValueError):
+                return None, "order_scope_unverified"
+            supplied_name = str(arguments.get("customer_name") or "").strip()
+            trusted_name = str(current.get("customer_name") or "").strip()
+            if not supplied_name or not trusted_name or supplied_name.casefold() != trusted_name.casefold():
+                return None, "order_scope_unverified"
+            scoped["order_id"] = current["order_id"]
+            scoped["customer_name"] = trusted_name
+            return scoped, ""
+        supplied_booking = arguments.get("booking_id")
+        if supplied_booking not in (None, "", 0):
+            trusted, error = await self._verified_booking_identity()
+            if error:
+                return None, "order_scope_unverified"
+            try:
+                if int(supplied_booking) != int(trusted["booking_id"]):
+                    return None, "order_scope_unverified"
+            except (TypeError, ValueError):
+                return None, "order_scope_unverified"
+            scoped.update(trusted)
+        elif isinstance(current, Mapping):
+            if current.get("customer_name"):
+                scoped["customer_name"] = current["customer_name"]
+            if current.get("customer_phone"):
+                scoped["customer_phone"] = current["customer_phone"]
         return scoped, ""
 
     async def invoke(
@@ -588,6 +680,41 @@ class ToolBridge:
                 error="caller_turn_not_finalized",
                 state_version=state_version,
             )
+        if not call_id or not name:
+            outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error="invalid_tool_call", state_version=state_version)
+            self._calls[call_id] = outcome
+            return outcome
+        if name not in KNOWN_TOOLS:
+            outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error="unsupported_tool", state_version=state_version)
+            self._calls[call_id] = outcome
+            return outcome
+        scoped_args, scope_error = await self._scoped_booking_arguments(name, args)
+        if scope_error:
+            outcome = ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=args,
+                result=None,
+                success=False,
+                error=scope_error,
+                state_version=state_version,
+            )
+            self._calls[call_id] = outcome
+            return outcome
+        args, scope_error = await self._scoped_order_arguments(name, scoped_args or args)
+        if scope_error:
+            outcome = ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=scoped_args or arguments,
+                result=None,
+                success=False,
+                error=scope_error,
+                state_version=state_version,
+            )
+            self._calls[call_id] = outcome
+            return outcome
+        args = args or scoped_args or dict(arguments)
         fingerprint = f"{name}:{_hash(args)}"
         previous = self._calls.get(call_id)
         if previous is not None:
@@ -628,28 +755,6 @@ class ToolBridge:
         if name in MUTATING_TOOLS and turn_id:
             self._processed_turn_ids.add(turn_id)
 
-        if not call_id or not name:
-            outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error="invalid_tool_call", state_version=state_version)
-            self._calls[call_id] = outcome
-            return outcome
-        if name not in KNOWN_TOOLS:
-            outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error="unsupported_tool", state_version=state_version)
-            self._calls[call_id] = outcome
-            return outcome
-        scoped_args, scope_error = await self._scoped_booking_arguments(name, args)
-        if scope_error:
-            outcome = ToolOutcome(
-                name=name,
-                call_id=call_id,
-                arguments=args,
-                result=None,
-                success=False,
-                error=scope_error,
-                state_version=state_version,
-            )
-            self._calls[call_id] = outcome
-            return outcome
-        args = scoped_args or args
         try:
             result = await self.executor.invoke(name, args)
         except Exception as exc:  # structured failure; never a success-like response

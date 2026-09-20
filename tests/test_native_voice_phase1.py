@@ -206,6 +206,7 @@ async def test_tool_bridge_requires_readback_and_replays_idempotently():
         ),
     )
     bridge = ToolBridge(executor)
+    bridge.bind_session("call-1")
     args = {"session_id": "call-1", "item_name": "House Lemonade", "quantity": 2}
     first = await bridge.invoke(call_id="tool-1", name="add_order_item", arguments=args, turn_id="turn-1", state_version=1)
     replay = await bridge.invoke(call_id="tool-1", name="add_order_item", arguments=args, turn_id="turn-1", state_version=1)
@@ -227,6 +228,7 @@ async def test_tool_bridge_rejects_mutation_before_turn_finalization_and_incompl
         readback={"order_id": 7, "status": "pending"},
     )
     bridge = ToolBridge(executor)
+    bridge.bind_session("call-1")
     not_finalized = await bridge.invoke(
         call_id="tool-before-turn",
         name="set_order_notes",
@@ -284,14 +286,14 @@ async def test_availability_parser_preserves_negative_authoritative_result():
 
 @pytest.mark.asyncio
 async def test_tool_failure_or_readback_mismatch_cannot_unlock_success_speech():
-    failed = ToolBridge(FakeExecutor(result={"ok": True}, readback=None))
+    failed = ToolBridge(FakeExecutor(result={"ok": True}, readback=None), session_id="call-1")
     outcome = await failed.invoke(call_id="tool-2", name="confirm_order", arguments={"session_id": "call-1"}, turn_id="turn-1", state_version=1)
     assert outcome.success and not outcome.readback_verified
     evidence = outcome.as_evidence(turn_id="turn-1")
     decision = SpeechGate().evaluate("Your order is placed.", b"audio", evidence=[evidence], current_state_version=1)
     assert not decision.allowed
 
-    exception = ToolBridge(FakeExecutor(error=TimeoutError()))
+    exception = ToolBridge(FakeExecutor(error=TimeoutError()), session_id="call-1")
     timed_out = await exception.invoke(call_id="tool-3", name="confirm_order", arguments={"session_id": "call-1"}, turn_id="turn-1", state_version=1)
     assert not timed_out.success and "tool_exception" in timed_out.error
 

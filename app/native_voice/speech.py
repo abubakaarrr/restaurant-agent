@@ -21,7 +21,7 @@ _UNSAFE_FACTUAL = re.compile(
     re.IGNORECASE,
 )
 _SUBJECT_WORDS = re.compile(
-    r"\b(?:burger|sandwich|salad|crisp|lemonade|dessert|table|slot|patio|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
+    r"\b(?:burger|sandwich|salad|crisp|lemonade|dessert|menu|order|booking|reservation|table|slot|patio|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
     re.IGNORECASE,
 )
 _AVAILABLE = re.compile(r"\b(?:available|open|in stock)\b", re.IGNORECASE)
@@ -84,7 +84,7 @@ class SpeechGate:
                 if item.speakable
                 and item.state_version == current_state_version
                 and self._success_action_supports(item.action, success_match.group(0).casefold())
-                and self._success_subject_matches(text, item.facts)
+                and self._success_subject_matches(text, item.facts, item.action, success_match)
             ]
             if not matching:
                 reasons.append("success_claim_without_matching_readback")
@@ -320,7 +320,33 @@ class SpeechGate:
         return not facts.get("items") and not (prices if isinstance(prices, Mapping) else {}) and not (facts.get("subject") or {}).get("item_name")
 
     @staticmethod
-    def _success_subject_matches(text: str, facts: Mapping[str, Any]) -> bool:
+    def _success_subject_matches(
+        text: str,
+        facts: Mapping[str, Any],
+        action: str,
+        match: re.Match[str],
+    ) -> bool:
+        prefix = (text or "")[: match.start()].casefold().rstrip()
+        if re.search(r"\b(?:not|never|isn't|wasn't|cannot|can't|no)\s*$", prefix):
+            return False
+        action = action.casefold()
+        if action in {"create_booking", "update_confirmed_booking", "cancel_booking"}:
+            required = r"\b(?:booking|reservation|table|slot)\b"
+        elif action in {
+            "confirm_order",
+            "add_order_item",
+            "update_order_item",
+            "remove_order_item",
+            "set_order_notes",
+            "set_order_fulfillment",
+        }:
+            required = r"\b(?:order|item|dish|meal)\b"
+        elif action == "update_reservation_draft":
+            required = r"\b(?:reservation|booking|draft)\b"
+        else:
+            required = r"\b(?:booking|reservation|order|item)\b"
+        if not re.search(required, (text or ""), re.IGNORECASE):
+            return False
         subject = facts.get("subject") or {}
         numbered_subject = re.search(r"\b(?:booking|order)\s*#?\s*(\d+)\b", (text or "").casefold())
         if numbered_subject and isinstance(subject, Mapping):
