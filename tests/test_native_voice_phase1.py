@@ -218,7 +218,7 @@ async def test_tool_bridge_requires_readback_and_replays_idempotently():
     assert not conflict.success and conflict.error == "idempotency_conflict"
 
     second_call = await bridge.invoke(call_id="tool-2", name="add_order_item", arguments=args, turn_id="turn-1", state_version=1)
-    assert not second_call.success and second_call.error == "replayed_finalized_turn"
+    assert second_call.replayed and second_call.success and len(executor.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -408,12 +408,13 @@ async def test_adapter_emits_native_audio_after_final_turn_and_records_protocol_
     transport = MemoryRealtimeTransport(
         [
             {"type": "session.updated"},
-            {"type": "response.created", "response_id": "response-1"},
+            {"type": "response.created", "response": {"id": "response-1"}},
             {"type": "conversation.item.input_audio_transcription.delta", "delta": "hello"},
             {"type": "conversation.item.input_audio_transcription.completed", "transcript": "hello"},
             {"type": "response.output_audio.delta", "response_id": "response-1", "delta": base64.b64encode(output).decode()},
             {"type": "response.output_audio_transcript.delta", "response_id": "response-1", "delta": "How can I help?"},
-            {"type": "response.done", "response_id": "response-1"},
+            {"type": "response.output_audio_transcript.done", "response_id": "response-1", "transcript": "How can I help?"},
+            {"type": "response.done", "response": {"id": "response-1", "status": "completed"}},
         ]
     )
     adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
@@ -431,10 +432,10 @@ async def test_adapter_suppresses_audio_without_assistant_transcript():
     output = b"unsupported-audio"
     transport = MemoryRealtimeTransport(
         [
-            {"type": "response.created", "response_id": "response-1"},
+            {"type": "response.created", "response": {"id": "response-1"}},
             {"type": "conversation.item.input_audio_transcription.completed", "transcript": "hello"},
             {"type": "response.output_audio.delta", "response_id": "response-1", "delta": base64.b64encode(output).decode()},
-            {"type": "response.done", "response_id": "response-1"},
+            {"type": "response.done", "response": {"id": "response-1", "status": "completed"}},
         ]
     )
     adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
@@ -451,14 +452,15 @@ async def test_adapter_tool_result_readback_unlocks_only_matching_final_response
     )
     transport = MemoryRealtimeTransport(
         [
-            {"type": "response.created", "response_id": "response-1"},
+            {"type": "response.created", "response": {"id": "response-1"}},
             {"type": "conversation.item.input_audio_transcription.completed", "transcript": "yes"},
             {"type": "response.function_call_arguments.done", "response_id": "response-1", "call_id": "tool-1", "name": "confirm_order", "arguments": '{"session_id":"call-1","expected_draft_version":2,"caller_approved_full_readback":true}'},
-            {"type": "response.done", "response_id": "response-1"},
-            {"type": "response.created", "response_id": "response-2"},
+            {"type": "response.done", "response": {"id": "response-1", "status": "completed"}},
+            {"type": "response.created", "response": {"id": "response-2"}},
             {"type": "response.output_audio.delta", "response_id": "response-2", "delta": base64.b64encode(b"confirmed-audio").decode()},
             {"type": "response.output_audio_transcript.delta", "response_id": "response-2", "delta": "Your order is placed."},
-            {"type": "response.done", "response_id": "response-2"},
+            {"type": "response.output_audio_transcript.done", "response_id": "response-2", "transcript": "Your order is placed."},
+            {"type": "response.done", "response": {"id": "response-2", "status": "completed"}},
         ]
     )
     adapter = NativeVoiceAdapter(
@@ -503,7 +505,7 @@ async def test_interruption_truncates_buffered_assistant_item():
     output = b"\x00\x01" * 240
     transport = MemoryRealtimeTransport(
         [
-            {"type": "response.created", "response_id": "response-1"},
+            {"type": "response.created", "response": {"id": "response-1"}},
             {"type": "response.output_item.added", "response_id": "response-1", "item": {"id": "item-1", "type": "message", "role": "assistant"}},
             {"type": "response.output_audio.delta", "response_id": "response-1", "item_id": "item-1", "delta": base64.b64encode(output).decode()},
             {"type": "input_audio_buffer.speech_started"},
@@ -533,13 +535,14 @@ async def test_unresolved_state_blocks_mutating_tool_calls():
     executor = FakeExecutor(result={"ok": True})
     transport = MemoryRealtimeTransport(
         [
-            {"type": "response.created", "response_id": "response-1"},
+            {"type": "response.created", "response": {"id": "response-1"}},
             {"type": "conversation.item.input_audio_transcription.completed", "transcript": "yes"},
             {"type": "response.function_call_arguments.done", "response_id": "response-1", "call_id": "tool-1", "name": "add_order_item", "arguments": "{\"session_id\":\"call-1\",\"item_name\":\"Hearth Burger\"}"},
-            {"type": "response.done", "response_id": "response-1"},
-            {"type": "response.created", "response_id": "response-2"},
+            {"type": "response.done", "response": {"id": "response-1", "status": "completed"}},
+            {"type": "response.created", "response": {"id": "response-2"}},
             {"type": "response.output_audio_transcript.delta", "response_id": "response-2", "delta": "Which item did you mean?"},
-            {"type": "response.done", "response_id": "response-2"},
+            {"type": "response.output_audio_transcript.done", "response_id": "response-2", "transcript": "Which item did you mean?"},
+            {"type": "response.done", "response": {"id": "response-2", "status": "completed"}},
         ]
     )
     adapter = NativeVoiceAdapter(

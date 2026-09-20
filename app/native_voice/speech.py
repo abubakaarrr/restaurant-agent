@@ -76,48 +76,49 @@ class SpeechGate:
         reasons: list[str] = []
         claims = list(explicit_claims)
 
-        success_match = _SUCCESS.search(text or "")
-        if success_match:
-            matching = [
-                item
-                for item in evidence_list
-                if item.speakable
-                and item.state_version == current_state_version
-                and self._success_action_supports(item.action, success_match.group(0).casefold())
-                and self._success_subject_matches(text, item.facts, item.action, success_match)
-            ]
-            if not matching:
-                reasons.append("success_claim_without_matching_readback")
-
-        if _MONEY.search(text or ""):
-            spoken_prices: set[float] = set()
-            for match in _MONEY.findall(text or ""):
-                cleaned = re.sub(r"[^0-9.]", "", match)
-                if cleaned:
-                    spoken_prices.add(float(cleaned))
+        success_matches = list(_SUCCESS.finditer(text or ""))
+        for success_match in success_matches:
             if not any(
                 item.speakable
                 and item.state_version == current_state_version
-                and self._subject_matches(text, item.facts)
+                and self._success_action_supports(item.action, success_match.group(0).casefold())
+                and (fragment := self._claim_fragment(text, success_match.start(), item.facts))
+                and (fragment_match := _SUCCESS.search(fragment)) is not None
+                and self._success_subject_matches(fragment, item.facts, item.action, fragment_match)
+                for item in evidence_list
+            ):
+                reasons.append("success_claim_without_matching_readback")
+
+        for price_match in _MONEY.finditer(text or ""):
+            cleaned = re.sub(r"[^0-9.]", "", price_match.group(0))
+            if not cleaned:
+                reasons.append("price_without_authoritative_evidence")
+                continue
+            spoken_price = float(cleaned)
+            if not any(
+                item.speakable
+                and item.state_version == current_state_version
+                and (fragment := self._claim_fragment(text, price_match.start(), item.facts))
+                and self._subject_matches(fragment, item.facts)
                 and any(
                     abs(float(value) - spoken_price) < 0.005
                     for value in (item.facts.get("prices") or {}).values()
-                    for spoken_price in spoken_prices
                 )
                 for item in evidence_list
             ):
                 reasons.append("price_without_authoritative_evidence")
 
-        spoken_availability = self._availability_value(text)
-        if spoken_availability:
+        for availability_match in _AVAILABILITY.finditer(text or ""):
             if not any(
                 item.speakable
                 and item.state_version == current_state_version
+                and (fragment := self._claim_fragment(text, availability_match.start(), item.facts))
+                and (spoken_availability := self._availability_value(fragment))
                 and self._availability_matches(
                     spoken_availability,
-                    self._fact_availability(text, item.facts),
+                    self._fact_availability(fragment, item.facts),
                 )
-                and self._subject_matches(text, item.facts)
+                and self._subject_matches(fragment, item.facts)
                 for item in evidence_list
             ):
                 reasons.append("availability_without_authoritative_evidence")
@@ -128,7 +129,7 @@ class SpeechGate:
 
         # A response which presents a restaurant fact without a tool result is
         # blocked even when its wording does not match one of the narrow regexes.
-        if _UNSAFE_FACTUAL.search(text or "") and not success_match and not any(
+        if _UNSAFE_FACTUAL.search(text or "") and not success_matches and not any(
             item.speakable
             and item.state_version == current_state_version
             and self._subject_matches(text, item.facts)
@@ -274,13 +275,55 @@ class SpeechGate:
         return ""
 
     @staticmethod
+    def _claim_fragment(text: str, position: int, facts: Mapping[str, Any] | None = None) -> str:
+        left = max(
+            (text.rfind(marker, 0, position) for marker in ".!?;"),
+            default=-1,
+        )
+        right_candidates = [text.find(marker, position) for marker in ".!?;" if text.find(marker, position) >= 0]
+        right = min(right_candidates, default=len(text))
+        fragment = text[left + 1 : right].strip()
+        if not facts:
+            return fragment
+        names = [
+            str(item.get("name") or item.get("item_name") or "")
+            for item in facts.get("canonical_items") or ()
+            if isinstance(item, Mapping) and (item.get("name") or item.get("item_name"))
+        ]
+        names.extend(str(name) for name in (facts.get("availability_by_item") or {}) if name)
+        names.extend(str(name) for name in (facts.get("prices") or {}) if name not in {"", "amount"})
+        if not names:
+            return fragment
+        conjunctions = [match for match in re.finditer(r"\band\b", fragment, re.IGNORECASE)]
+        for conjunction in conjunctions:
+            before = fragment[: conjunction.start()].strip()
+            after = fragment[conjunction.end() :].strip()
+            before_has_name = any(re.search(rf"(?<!\w){re.escape(name.casefold())}(?!\w)", before.casefold()) for name in names)
+            after_has_name = any(re.search(rf"(?<!\w){re.escape(name.casefold())}(?!\w)", after.casefold()) for name in names)
+            if position <= left + 1 + conjunction.start() and before_has_name:
+                return before
+            if position > left + 1 + conjunction.end() and after_has_name:
+                return after
+            if position > left + 1 + conjunction.end() and after and not re.match(
+                r"^(?:is|are|was|were|has|have|does|did|costs?|runs?)\b", after, re.IGNORECASE
+            ):
+                return after
+        return fragment
+
+    @staticmethod
     def _fact_availability(text: str, facts: Mapping[str, Any]) -> Any:
         by_item = facts.get("availability_by_item")
         if isinstance(by_item, Mapping):
             normalized = " ".join((text or "").casefold().split())
-            for item, value in by_item.items():
-                if re.search(rf"(?<!\w){re.escape(str(item).casefold())}(?!\w)", normalized):
-                    return value
+            matches = [
+                (str(item), value)
+                for item, value in by_item.items()
+                if re.search(rf"(?<!\w){re.escape(str(item).casefold())}(?!\w)", normalized)
+            ]
+            if len(matches) == 1:
+                return matches[0][1]
+            if len(matches) > 1:
+                return None
         return facts.get("availability")
 
     @staticmethod

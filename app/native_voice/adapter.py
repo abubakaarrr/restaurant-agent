@@ -9,6 +9,7 @@ production startup and Retell never import it.
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import uuid
 import inspect
@@ -167,6 +168,7 @@ class NativeVoiceAdapter:
         self._cancelled_input_item_ids: set[str] = set()
         self._expected_input_item_id = ""
         self._require_input_item_id = False
+        self._memory_write_task: asyncio.Task[Any] | None = None
         if hasattr(self.tool_bridge, "bind_session"):
             self.tool_bridge.bind_session(session_id)
 
@@ -228,6 +230,8 @@ class NativeVoiceAdapter:
 
     async def interrupt(self) -> None:
         response = self._response
+        if self._memory_write_task is not None and not self._memory_write_task.done():
+            self._memory_write_task.cancel()
         response_id = response.response_id if response is not None else self.interruptions.active_response_id
         if response is not None and response.input_item_id:
             self._cancelled_input_item_ids.add(response.input_item_id)
@@ -261,7 +265,9 @@ class NativeVoiceAdapter:
         while True:
             event = await self.transport.receive()
             event_type = str(event.get("type") or "unknown")
-            response_id = str(event.get("response_id") or "")
+            response = event.get("response")
+            response = response if isinstance(response, Mapping) else {}
+            response_id = str(event.get("response_id") or response.get("id") or "")
             if not self.interruptions.accepts(
                 generation=generation,
                 response_id=response_id,
@@ -275,7 +281,7 @@ class NativeVoiceAdapter:
                 continue
             self.recorder.record(event)
             if event_type == "response.created":
-                self._response.response_id = response_id or str((event.get("response") or {}).get("id") or "")
+                self._response.response_id = response_id
                 self.interruptions.begin_response(self._response.response_id)
                 continue
             if event_type == "input_audio_buffer.committed":
@@ -369,6 +375,15 @@ class NativeVoiceAdapter:
                 self.recorder.record({"type": "tool_or_response_failure", "code": (event.get("error") or {}).get("code", "realtime_error")})
                 continue
             if event_type == "response.done":
+                if str(response.get("status") or event.get("status") or "") != "completed":
+                    self.recorder.record({
+                        "type": "incomplete_response_ignored",
+                        "response_id": response_id,
+                        "status": response.get("status") or event.get("status") or "",
+                    })
+                    self._response = None
+                    self._outcomes.clear()
+                    return VoiceTurnResult(self._completed_turn, b"", "", None, response_id=response_id)
                 result = await self._finish_response(transcript=transcript)
                 if generation != self.interruptions.generation:
                     self._response = None
@@ -406,7 +421,7 @@ class NativeVoiceAdapter:
                         self._response = None
                         self._outcomes.clear()
                         return VoiceTurnResult(self._completed_turn, b"", "", None)
-                    synced = await self._sync_order_memory()
+                    synced = await self._sync_order_memory(generation=generation)
                     if synced is not None and generation == self.interruptions.generation:
                         order_mutations = {
                             "add_order_item",
@@ -415,6 +430,7 @@ class NativeVoiceAdapter:
                             "update_order_item",
                             "remove_order_item",
                             "confirm_order",
+                            "add_guest_note",
                         }
                         current_readback = next(
                             (
@@ -491,7 +507,9 @@ class NativeVoiceAdapter:
             "unresolved_count": len(self.state.unresolved_fields),
         })
 
-    async def _sync_order_memory(self) -> OrderState | None:
+    async def _sync_order_memory(self, *, generation: int | None = None) -> OrderState | None:
+        if generation is not None and generation != self.interruptions.generation:
+            return None
         readbacks = [
             outcome.readback
             for outcome in self._outcomes
@@ -502,6 +520,7 @@ class NativeVoiceAdapter:
                 "update_order_item",
                 "remove_order_item",
                 "confirm_order",
+                "add_guest_note",
             }
             and outcome.success
             and outcome.readback_verified
@@ -511,43 +530,64 @@ class NativeVoiceAdapter:
             return None
         readback = readbacks[-1]
         current = await self.state_store.load(self.session_id)
+        if generation is not None and generation != self.interruptions.generation:
+            return None
         if self._completed_turn.turn_id in current.source_turn_ids:
             return None
-        items = tuple(
-            OrderItemState(
-                canonical_item_id=str(value.get("item_id") or "order-item"),
-                item_name=str(value.get("item_name") or value.get("name") or "order item"),
-                quantity=int(value.get("quantity") or 1),
-                modifiers=tuple(str(item) for item in value.get("modifiers") or ()),
-                removals=tuple(str(item) for item in value.get("removals") or ()),
-                substitutions=tuple(str(item) for item in value.get("substitutions") or ()),
-                source_turn_ids=(self._completed_turn.turn_id,),
-                line_id=str(value.get("order_item_id") or ""),
-                notes=str(value.get("notes") or ""),
+        if "items" in readback:
+            items = tuple(
+                OrderItemState(
+                    canonical_item_id=str(value.get("item_id") or "order-item"),
+                    item_name=str(value.get("item_name") or value.get("name") or "order item"),
+                    quantity=int(value.get("quantity") or 1),
+                    modifiers=tuple(str(item) for item in value.get("modifiers") or ()),
+                    removals=tuple(str(item) for item in value.get("removals") or ()),
+                    substitutions=tuple(str(item) for item in value.get("substitutions") or ()),
+                    source_turn_ids=(self._completed_turn.turn_id,),
+                    line_id=str(value.get("order_item_id") or ""),
+                    notes=str(value.get("notes") or ""),
+                )
+                for value in readback.get("items") or ()
+                if isinstance(value, Mapping)
             )
-            for value in readback.get("items") or ()
-            if isinstance(value, Mapping)
-        )
-        incoming_line_ids = {item.line_id for item in items if item.line_id}
-        remove_line_ids = tuple(
-            item.line_id
-            for item in current.items
-            if item.line_id and item.status != "removed" and item.line_id not in incoming_line_ids
-        )
+            incoming_line_ids = {item.line_id for item in items if item.line_id}
+            remove_line_ids = tuple(
+                item.line_id
+                for item in current.items
+                if item.line_id and item.status != "removed" and item.line_id not in incoming_line_ids
+            )
+        else:
+            items = current.items
+            remove_line_ids = ()
         patch = OrderPatch(
             source_turn_id=self._completed_turn.turn_id,
             items=items,
             remove_line_ids=remove_line_ids,
-            order_notes=str(readback.get("order_notes") or ""),
-            allergy_notes=str(readback.get("allergy_notes") or ""),
-            fulfillment=str(readback.get("fulfillment") or ""),
-            fulfillment_details=readback.get("fulfillment_details") or {},
-            status=str(readback.get("status") or "draft"),
+            order_notes=str(readback.get("order_notes") or current.order_notes),
+            allergy_notes=str(readback.get("allergy_notes") or current.allergy_notes),
+            guest_notes=str(readback.get("guest_notes") or current.guest_notes),
+            fulfillment=str(readback.get("fulfillment") or current.fulfillment),
+            fulfillment_details=readback.get("fulfillment_details") or current.fulfillment_details,
+            status=str(readback.get("status") or current.status),
         )
-        if not items and not remove_line_ids and not patch.order_notes and not patch.allergy_notes and not patch.fulfillment:
+        if not items and not remove_line_ids and not patch.order_notes and not patch.allergy_notes and not patch.guest_notes and not patch.fulfillment:
             return None
         next_state = current.apply(patch)
-        await self.state_store.save(self.session_id, next_state, expected_version=current.version)
+        if generation is not None and generation != self.interruptions.generation:
+            return None
+        write_task = asyncio.create_task(
+            self.state_store.save(self.session_id, next_state, expected_version=current.version)
+        )
+        self._memory_write_task = write_task
+        try:
+            await write_task
+        except asyncio.CancelledError:
+            return None
+        finally:
+            if self._memory_write_task is write_task:
+                self._memory_write_task = None
+        if generation is not None and generation != self.interruptions.generation:
+            return None
         self.state = next_state
         self.recorder.record({"type": "order_memory_synced", "turn_id": patch.source_turn_id, "state_version": next_state.version})
         return next_state
@@ -611,7 +651,10 @@ class NativeVoiceAdapter:
         text = "".join(self._response.transcript_parts)
         current = await self.state_store.load(self.session_id)
         self.state = current
-        if self._response.audio and not self._response.assistant_transcript_done:
+        if self._response.audio and (
+            not self._response.assistant_transcript_done
+            or not self._response.assistant_transcript_seen
+        ):
             decision = SpeechDecision(
                 allowed=False,
                 text="",

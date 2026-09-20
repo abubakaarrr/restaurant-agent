@@ -285,11 +285,16 @@ class RestaurantToolExecutor:
             return draft
         if name == "add_guest_note":
             booking_id = int(arguments.get("booking_id") or 0)
+            from app.call_memory import get_call_memory
+
             if booking_id:
                 from app.services.restaurant import restaurant_service
 
                 readback = dict(await restaurant_service.lookup_booking(booking_id=booking_id))
                 readback["readback_committed"] = True
+                readback["guest_notes"] = str(
+                    get_call_memory(str(arguments.get("session_id") or "")).get("guest_notes") or ""
+                )
                 return readback
             from app.services.restaurant import restaurant_service
 
@@ -526,7 +531,7 @@ class ToolBridge:
         self.executor = executor
         self._calls: dict[str, ToolOutcome] = {}
         self.session_id = session_id
-        self._processed_turn_ids: set[str] = set()
+        self._turn_operations: dict[str, dict[str, str]] = {}
 
     def bind_session(self, session_id: str) -> None:
         if self.session_id and self.session_id != session_id:
@@ -624,12 +629,32 @@ class ToolBridge:
                     return None, "order_scope_unverified"
             except (TypeError, ValueError):
                 return None, "order_scope_unverified"
-            supplied_name = str(arguments.get("customer_name") or "").strip()
-            trusted_name = str(current.get("customer_name") or "").strip()
-            if not supplied_name or not trusted_name or supplied_name.casefold() != trusted_name.casefold():
-                return None, "order_scope_unverified"
             scoped["order_id"] = current["order_id"]
-            scoped["customer_name"] = trusted_name
+            if int(current.get("booking_id") or 0):
+                trusted, error = await self._verified_booking_identity()
+                if error or int(current.get("booking_id") or 0) != int(trusted["booking_id"]):
+                    return None, "order_scope_unverified"
+                scoped["customer_name"] = trusted["customer_name"]
+            else:
+                scoped.pop("customer_name", None)
+            return scoped, ""
+        if isinstance(current, Mapping):
+            current_booking_id = int(current.get("booking_id") or 0)
+            if not current_booking_id:
+                if name == "add_order_item":
+                    scoped.pop("customer_name", None)
+                    scoped.pop("customer_phone", None)
+                    scoped.pop("booking_id", None)
+                elif name == "set_order_fulfillment":
+                    scoped.pop("booking_id", None)
+                return scoped, ""
+            trusted, error = await self._verified_booking_identity()
+            if error or current_booking_id != int(trusted["booking_id"]):
+                return None, "order_scope_unverified"
+            if name == "add_order_item":
+                scoped.update(trusted)
+            elif name == "set_order_fulfillment":
+                scoped["booking_id"] = trusted["booking_id"]
             return scoped, ""
         supplied_booking = arguments.get("booking_id")
         if supplied_booking not in (None, "", 0):
@@ -641,12 +666,14 @@ class ToolBridge:
                     return None, "order_scope_unverified"
             except (TypeError, ValueError):
                 return None, "order_scope_unverified"
-            scoped.update(trusted)
-        elif isinstance(current, Mapping):
-            if current.get("customer_name"):
-                scoped["customer_name"] = current["customer_name"]
-            if current.get("customer_phone"):
-                scoped["customer_phone"] = current["customer_phone"]
+            if name == "add_order_item":
+                scoped.update(trusted)
+            elif name == "set_order_fulfillment":
+                scoped["booking_id"] = trusted["booking_id"]
+        elif name == "add_order_item":
+            scoped.pop("customer_name", None)
+            scoped.pop("customer_phone", None)
+            scoped.pop("booking_id", None)
         return scoped, ""
 
     async def invoke(
@@ -716,6 +743,7 @@ class ToolBridge:
             return outcome
         args = args or scoped_args or dict(arguments)
         fingerprint = f"{name}:{_hash(args)}"
+        operation_fingerprint = f"{fingerprint}:{state_version}"
         previous = self._calls.get(call_id)
         if previous is not None:
             if f"{previous.name}:{_hash(previous.arguments)}" != fingerprint:
@@ -742,18 +770,23 @@ class ToolBridge:
                 facts=previous.facts,
             )
 
-        if name in MUTATING_TOOLS and turn_id in self._processed_turn_ids:
-            return ToolOutcome(
-                name=name,
-                call_id=call_id,
-                arguments=args,
-                result=None,
-                success=False,
-                error="replayed_finalized_turn",
-                state_version=state_version,
-            )
         if name in MUTATING_TOOLS and turn_id:
-            self._processed_turn_ids.add(turn_id)
+            prior_call_id = self._turn_operations.get(turn_id, {}).get(operation_fingerprint)
+            prior = self._calls.get(prior_call_id or "")
+            if prior is not None and prior.success and prior.readback_verified:
+                return ToolOutcome(
+                    name=prior.name,
+                    call_id=prior.call_id,
+                    arguments=prior.arguments,
+                    result=prior.result,
+                    success=prior.success,
+                    error=prior.error,
+                    readback=prior.readback,
+                    readback_verified=prior.readback_verified,
+                    state_version=prior.state_version,
+                    replayed=True,
+                    facts=prior.facts,
+                )
 
         try:
             result = await self.executor.invoke(name, args)
@@ -789,6 +822,8 @@ class ToolBridge:
             facts=facts,
         )
         self._calls[call_id] = outcome
+        if name in MUTATING_TOOLS and turn_id and outcome.success and outcome.readback_verified:
+            self._turn_operations.setdefault(turn_id, {})[operation_fingerprint] = call_id
         return outcome
 
     @staticmethod
