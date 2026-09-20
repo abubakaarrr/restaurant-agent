@@ -186,14 +186,49 @@ class NativeVoiceAdapter:
 
     async def apply_order_patch(self, patch: OrderPatch) -> OrderState:
         """Apply facts only after a completed caller turn exists."""
+        return await self._apply_order_patch(patch)
+
+    async def _apply_order_patch(
+        self,
+        patch: OrderPatch,
+        *,
+        generation: int | None = None,
+    ) -> OrderState | None:
         if self._completed_turn is None or self._completed_turn.turn_id != patch.source_turn_id:
             raise RuntimeError("structured order mutation requires the matching finalized caller turn")
+        if generation is not None and generation != self.interruptions.generation:
+            return None
         current = await self.state_store.load(self.session_id)
+        if generation is not None and generation != self.interruptions.generation:
+            return None
         next_state = current.apply(patch)
-        await self.state_store.save(self.session_id, next_state, expected_version=current.version)
+        if not await self._save_state(next_state, expected_version=current.version, generation=generation):
+            return None
         self.state = next_state
         self.recorder.record({"type": "facts_extracted", "turn_id": patch.source_turn_id, "state_version": next_state.version})
         return next_state
+
+    async def _save_state(
+        self,
+        state: OrderState,
+        *,
+        expected_version: int,
+        generation: int | None = None,
+    ) -> bool:
+        if generation is not None and generation != self.interruptions.generation:
+            return False
+        write_task = asyncio.create_task(
+            self.state_store.save(self.session_id, state, expected_version=expected_version)
+        )
+        self._memory_write_task = write_task
+        try:
+            await write_task
+        except asyncio.CancelledError:
+            return False
+        finally:
+            if self._memory_write_task is write_task:
+                self._memory_write_task = None
+        return generation is None or generation == self.interruptions.generation
 
     async def submit_audio(
         self,
@@ -336,7 +371,10 @@ class NativeVoiceAdapter:
                     self._expected_input_item_id = item_id
                     self._response.input_item_id = item_id
                 self._require_input_item_id = False
-                await self._finalize_caller_turn(str(event.get("transcript") or transcript or ""))
+                await self._finalize_caller_turn(
+                    str(event.get("transcript") or transcript or ""),
+                    generation=generation,
+                )
                 continue
             if event_type == "response.output_audio.delta":
                 self._response.assistant_item_id = str(event.get("item_id") or self._response.assistant_item_id)
@@ -476,13 +514,17 @@ class NativeVoiceAdapter:
         self._response.tool_calls[call_id] = (str(event.get("name") or ""), arguments)
         self.recorder.record({"type": "tool_requested", "call_id": call_id, "name": event.get("name")})
 
-    async def _finalize_caller_turn(self, transcript: str) -> None:
+    async def _finalize_caller_turn(self, transcript: str, *, generation: int) -> None:
+        if generation != self.interruptions.generation:
+            return
         completed = self.turns.finalize(transcript)
         if self._completed_turn is not None and self._completed_turn.turn_id == completed.turn_id:
             return
         self._completed_turn = completed
         self.recorder.record({"type": "turn_finalized", "turn_id": completed.turn_id, "version": completed.version})
         self.state = await self.state_store.load(self.session_id)
+        if generation != self.interruptions.generation:
+            return
         if completed.turn_id in self.state.finalized_turn_ids:
             self._replayed_finalized_turns.add(completed.turn_id)
             self.recorder.record({"type": "replayed_turn_rejected", "turn_id": completed.turn_id})
@@ -493,11 +535,19 @@ class NativeVoiceAdapter:
             patch = await extracted if inspect.isawaitable(extracted) else extracted
             if patch is not None and patch.source_turn_id != completed.turn_id:
                 raise RuntimeError("facts extractor must return a patch for the finalized turn")
+            if generation != self.interruptions.generation:
+                return
         if patch is not None:
-            await self.apply_order_patch(patch)
+            if await self._apply_order_patch(patch, generation=generation) is None:
+                return
         else:
             next_state = self.state.mark_turn_finalized(completed.turn_id)
-            await self.state_store.save(self.session_id, next_state, expected_version=self.state.version)
+            if not await self._save_state(
+                next_state,
+                expected_version=self.state.version,
+                generation=generation,
+            ):
+                return
             self.state = next_state
             self.recorder.record({"type": "facts_extracted", "turn_id": completed.turn_id, "state_version": self.state.version})
         self.recorder.record({
@@ -575,18 +625,11 @@ class NativeVoiceAdapter:
         next_state = current.apply(patch)
         if generation is not None and generation != self.interruptions.generation:
             return None
-        write_task = asyncio.create_task(
-            self.state_store.save(self.session_id, next_state, expected_version=current.version)
-        )
-        self._memory_write_task = write_task
-        try:
-            await write_task
-        except asyncio.CancelledError:
-            return None
-        finally:
-            if self._memory_write_task is write_task:
-                self._memory_write_task = None
-        if generation is not None and generation != self.interruptions.generation:
+        if not await self._save_state(
+            next_state,
+            expected_version=current.version,
+            generation=generation,
+        ):
             return None
         self.state = next_state
         self.recorder.record({"type": "order_memory_synced", "turn_id": patch.source_turn_id, "state_version": next_state.version})

@@ -57,6 +57,22 @@ class EventRecorder:
     def _safe_payload(event: Mapping[str, Any]) -> dict[str, Any]:
         safe: dict[str, Any] = {}
         for key, value in event.items():
+            if key == "transcript":
+                raw = str(value)
+                safe["transcript_chars"] = len(raw)
+                safe["transcript_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                continue
+            if key == "arguments":
+                if isinstance(value, Mapping):
+                    safe["argument_keys"] = sorted(str(argument) for argument in value)
+                else:
+                    safe["arguments_present"] = bool(value)
+                continue
+            if key in {"customer_name", "customer_phone", "phone", "address", "email", "note", "notes"}:
+                raw = str(value)
+                safe[f"{key}_chars"] = len(raw)
+                safe[f"{key}_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                continue
             if key in {"authorization", "api_key", "client_secret", "audio", "delta"}:
                 if key in {"audio", "delta"} and isinstance(value, str):
                     try:

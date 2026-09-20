@@ -271,6 +271,74 @@ async def test_tool_bridge_rejects_cross_session_and_error_readbacks():
 
 
 @pytest.mark.asyncio
+async def test_tool_bridge_rejects_proposed_order_items_as_uncommitted():
+    proposed = {
+        "order_id": 7,
+        "call_id": "call-1",
+        "booking_id": 0,
+        "status": "pending",
+        "draft_version": 2,
+        "total": 21.0,
+        "items": [],
+        "proposed_items": [{
+            "order_item_id": "proposal-1",
+            "item_id": "menu.hearth",
+            "item_name": "Hearth Burger",
+            "quantity": 1,
+            "modifiers": [],
+            "removals": [],
+            "substitutions": [],
+            "notes": "",
+        }],
+        "fulfillment": "pickup",
+        "fulfillment_type": "pickup",
+        "fulfillment_details": {},
+        "order_notes": "",
+        "allergy_notes": "",
+        "unresolved_fields": [],
+        "state_version": 2,
+        "readback_committed": True,
+    }
+    proposed["readback_hash"] = _order_readback_hash(proposed)
+    bridge = ToolBridge(
+        FakeExecutor(
+            result={"ok": True, "status": "pending"},
+            readback=proposed,
+        )
+    )
+    bridge.bind_session("call-1")
+    outcome = await bridge.invoke(
+        call_id="proposal-1",
+        name="add_order_item",
+        arguments={"session_id": "call-1", "item_name": "Hearth Burger", "quantity": 1},
+        turn_id="turn-proposal",
+        state_version=1,
+    )
+    assert not outcome.readback_verified
+
+
+@pytest.mark.asyncio
+async def test_anonymous_guest_note_stays_bound_to_current_session():
+    bridge = ToolBridge(FakeExecutor(result={"saved": True}, readback=order_readback()), session_id="call-1")
+
+    async def no_verified_booking():
+        return None, "booking_scope_unverified"
+
+    bridge._verified_booking_identity = no_verified_booking
+    outcome = await bridge.invoke(
+        call_id="guest-note-1",
+        name="add_guest_note",
+        arguments={"session_id": "call-1", "note": "extra napkins"},
+        turn_id="turn-note",
+        state_version=1,
+    )
+    assert outcome.success and outcome.readback_verified
+    assert bridge.executor.calls[0][1]["session_id"] == "call-1"
+    assert bridge.executor.calls[0][1]["booking_id"] == 0
+    assert "customer_name" not in bridge.executor.calls[0][1]
+
+
+@pytest.mark.asyncio
 async def test_availability_parser_preserves_negative_authoritative_result():
     outcome = await ToolBridge(
         FakeExecutor(result="Hearth Burger is not available at $21.")
@@ -342,6 +410,66 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     )
     assert not gate.evaluate("Dragon Burger costs $21.", b"audio", evidence=[alias], current_state_version=1).allowed
     assert gate.evaluate("The Dragon Burger costs $99.00.", b"audio", evidence=[evidence], current_state_version=1).allowed is False
+    assert not gate.evaluate("Hearth Burger was added to your order.", b"audio", current_state_version=1).allowed
+
+    dietary = ToolEvidence(
+        action="check_menu_item_availability",
+        call_id="tool-dietary",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={
+            "canonical_items": [{"name": "Hearth Burger", "allergens": ["dairy"]}],
+            "items": ["Hearth Burger"],
+        },
+    )
+    assert gate.evaluate("Hearth Burger contains dairy.", b"audio", evidence=[dietary], current_state_version=1).allowed
+    assert not gate.evaluate("Hearth Burger contains peanuts.", b"audio", evidence=[dietary], current_state_version=1).allowed
+
+
+def test_event_recorder_redacts_transcripts_arguments_and_personal_fields():
+    recorder = EventRecorder()
+    event = recorder.record(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "My name is Ada and my phone is 555-0100",
+            "arguments": '{"customer_phone":"555-0100"}',
+            "customer_phone": "555-0100",
+        }
+    )
+    payload = event.payload
+    assert "transcript" not in payload
+    assert "arguments" not in payload
+    assert "555-0100" not in str(payload)
+    assert payload["transcript_chars"] > 0
+    assert payload["arguments_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_interrupted_finalization_does_not_commit_turn():
+    store = InMemoryOrderStateStore()
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response": {"id": "response-cancel"}},
+            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "add a burger"},
+            {"type": "response.done", "response": {"id": "response-cancel", "status": "completed"}},
+        ]
+    )
+    adapter = None
+
+    async def extractor(turn, state):
+        await adapter.interrupt()
+        return OrderPatch(source_turn_id=turn.turn_id, items=(item("menu.hearth", "Hearth Burger", 1),))
+
+    adapter = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=transport,
+        state_store=store,
+        facts_extractor=extractor,
+    )
+    await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-cancel")
+    assert (await store.load("call-1")).finalized_turn_ids == ()
 
 
 def test_structured_menu_facts_remain_item_bound():

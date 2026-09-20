@@ -91,6 +91,9 @@ def _is_failure(value: Any) -> bool:
                 "readback_required",
                 "not applied",
                 "unchanged",
+                "proposed",
+                "not added",
+                "not saved",
                 "unavailable",
                 "not available",
                 "no matching",
@@ -297,12 +300,16 @@ class RestaurantToolExecutor:
                 )
                 return readback
             from app.services.restaurant import restaurant_service
+            from app.call_memory import get_call_memory, hydrate_call_memory
 
             readback = dict(
                 await restaurant_service.get_order_summary(
                     call_id=str(arguments.get("session_id") or "")
                 )
             )
+            session_id = str(arguments.get("session_id") or "")
+            await hydrate_call_memory(session_id)
+            readback["guest_notes"] = str(get_call_memory(session_id).get("guest_notes") or "")
             readback.setdefault("unresolved_fields", [])
             readback["state_version"] = int(readback.get("draft_version") or 0)
             readback["readback_committed"] = True
@@ -579,6 +586,30 @@ class ToolBridge:
     ) -> tuple[dict[str, Any] | None, str]:
         if name not in BOOKING_SCOPED_TOOLS:
             return dict(arguments), ""
+        if name == "add_guest_note" and self.session_id and arguments.get("booking_id") in (None, "", 0):
+            trusted, error = await self._verified_booking_identity()
+            if not error:
+                scoped = dict(arguments)
+                scoped.update(trusted or {})
+                scoped["session_id"] = self.session_id
+                scoped.pop("customer_name", None)
+                scoped.pop("customer_phone", None)
+                return scoped, ""
+            try:
+                from app.call_memory import get_call_memory, hydrate_call_memory
+
+                await hydrate_call_memory(self.session_id)
+                memory = get_call_memory(self.session_id)
+                if int(memory.get("booking_id") or 0):
+                    return None, "booking_scope_unverified"
+            except (TypeError, ValueError):
+                return None, "booking_scope_unverified"
+            scoped = dict(arguments)
+            scoped["session_id"] = self.session_id
+            scoped["booking_id"] = 0
+            scoped.pop("customer_name", None)
+            scoped.pop("customer_phone", None)
+            return scoped, ""
         trusted, error = await self._verified_booking_identity()
         if error:
             return None, error
@@ -866,7 +897,7 @@ class ToolBridge:
                 if name == "add_order_item" and arguments.get("item_name"):
                     if not any(
                         str(item.get("item_name") or "").casefold() == str(arguments["item_name"]).casefold()
-                        for item in readback["items"] + readback["proposed_items"]
+                        for item in readback["items"]
                     ):
                         return False
                 if name in {"update_order_item", "remove_order_item"} and arguments.get("order_item_id"):
@@ -926,6 +957,10 @@ class ToolBridge:
                         "price": item.get("price"),
                         "available": item.get("available"),
                         "modifier_options": item.get("modifier_options") or (),
+                        "ingredients": item.get("ingredients") or (),
+                        "allergens": item.get("allergens") or (),
+                        "dietary_tags": item.get("dietary_tags") or (),
+                        "customer_safe_answer": item.get("customer_safe_answer") or "",
                     }
                     for item in value["items"]
                     if isinstance(item, Mapping) and (item.get("item_id") or item.get("item_name") or item.get("name"))
@@ -953,7 +988,16 @@ class ToolBridge:
             if isinstance(value.get("match"), Mapping):
                 match = value["match"]
                 facts.setdefault("canonical_items", []).append(
-                    {"id": match.get("item_id"), "name": match.get("name"), "price": match.get("price"), "available": match.get("available")}
+                    {
+                        "id": match.get("item_id"),
+                        "name": match.get("name"),
+                        "price": match.get("price"),
+                        "available": match.get("available"),
+                        "ingredients": match.get("ingredients") or (),
+                        "allergens": match.get("allergens") or (),
+                        "dietary_tags": match.get("dietary_tags") or (),
+                        "customer_safe_answer": match.get("customer_safe_answer") or "",
+                    }
                 )
                 if match.get("name"):
                     facts.setdefault("items", []).append(match["name"])

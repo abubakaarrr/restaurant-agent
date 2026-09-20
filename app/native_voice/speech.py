@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 
 
 _SUCCESS = re.compile(
-    r"\b(?:confirmed|booked|reserved|placed|updated|cancelled|canceled|removed|charged)\b",
+    r"\b(?:confirmed|booked|reserved|placed|added|updated|cancelled|canceled|removed|charged)\b",
     re.IGNORECASE,
 )
 _AVAILABILITY = re.compile(
@@ -29,6 +29,12 @@ _UNAVAILABLE = re.compile(
     r"\b(?:not currently available|isn't available|is not available|not available|"
     r"unavailable|sold out|not yet available|out of stock|closed|fully booked|full|"
     r"no availability|no tables?)\b",
+    re.IGNORECASE,
+)
+_CONSEQUENTIAL_FOOD_FACT = re.compile(
+    r"\b(?:contain(?:s|ed)?|include(?:s|d)?|made\s+with|ingredient(?:s)?|allergen(?:s)?|"
+    r"allerg(?:y|ic|ies)|peanuts?|tree\s+nuts?|dairy|gluten|soy|shellfish|"
+    r"vegan|vegetarian|cross[- ]contact)\b",
     re.IGNORECASE,
 )
 
@@ -127,6 +133,18 @@ class SpeechGate:
             if not self._claim_supported(claim, evidence_list, current_state_version):
                 reasons.append(f"unsupported_claim:{claim.get('kind', 'unknown')}")
 
+        for fact_match in _CONSEQUENTIAL_FOOD_FACT.finditer(text or ""):
+            if not any(
+                item.speakable
+                and item.state_version == current_state_version
+                and self._food_fact_supported(
+                    self._claim_fragment(text, fact_match.start(), item.facts),
+                    item.facts,
+                )
+                for item in evidence_list
+            ):
+                reasons.append("food_fact_without_authority")
+
         # A response which presents a restaurant fact without a tool result is
         # blocked even when its wording does not match one of the narrow regexes.
         if _UNSAFE_FACTUAL.search(text or "") and not success_matches and not any(
@@ -157,6 +175,8 @@ class SpeechGate:
             return action == "cancel_booking"
         if word == "placed":
             return action == "confirm_order"
+        if word == "added":
+            return action == "add_order_item"
         if word == "updated":
             return action in {
                 "update_confirmed_booking",
@@ -390,9 +410,52 @@ class SpeechGate:
             required = r"\b(?:booking|reservation|order|item)\b"
         if not re.search(required, (text or ""), re.IGNORECASE):
             return False
+        if action in {"add_order_item", "update_order_item", "remove_order_item"}:
+            return SpeechGate._subject_matches(text, facts)
         subject = facts.get("subject") or {}
         numbered_subject = re.search(r"\b(?:booking|order)\s*#?\s*(\d+)\b", (text or "").casefold())
         if numbered_subject and isinstance(subject, Mapping):
             expected_id = str(subject.get("booking_id") or subject.get("order_id") or "")
             return bool(expected_id and numbered_subject.group(1) == expected_id)
         return True
+
+    @staticmethod
+    def _food_fact_supported(text: str, facts: Mapping[str, Any]) -> bool:
+        if not SpeechGate._subject_matches(text, facts):
+            return False
+        normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").casefold()).split()
+        stop_words = {
+            "contains", "contain", "contained", "includes", "include", "included", "made", "with",
+            "ingredient", "ingredients", "allergen", "allergens", "allergy", "allergic", "is", "are",
+            "not", "no", "the", "and", "has", "have", "cross", "contact",
+        }
+        subject_words = {
+            token
+            for item in facts.get("canonical_items") or ()
+            if isinstance(item, Mapping)
+            for token in re.sub(r"[^a-z0-9]+", " ", str(item.get("name") or item.get("item_name") or "").casefold()).split()
+        }
+        requested = {
+            word.rstrip("s")
+            for word in normalized
+            if len(word) > 2 and word not in stop_words and word not in subject_words
+        }
+        if not requested:
+            return False
+        for item in facts.get("canonical_items") or ():
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or item.get("item_name") or "")
+            if not name or not re.search(rf"(?<!\w){re.escape(name.casefold())}(?!\w)", (text or "").casefold()):
+                continue
+            terms: set[str] = set()
+            for key in ("ingredients", "allergens", "dietary_tags", "customer_safe_answer"):
+                value = item.get(key)
+                if isinstance(value, str):
+                    terms.update(re.sub(r"[^a-z0-9]+", " ", value.casefold()).split())
+                elif isinstance(value, (list, tuple)):
+                    for entry in value:
+                        terms.update(re.sub(r"[^a-z0-9]+", " ", str(entry).casefold()).split())
+            if requested & {term.rstrip("s") for term in terms}:
+                return True
+        return False
