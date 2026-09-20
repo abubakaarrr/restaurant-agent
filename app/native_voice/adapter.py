@@ -653,6 +653,7 @@ class NativeVoiceAdapter:
             self.recorder.record({"type": "response.create", "reason": "after_tool"})
             return None
         self._last_result = result
+        self.interruptions.active_response_id = ""
         self._response = None
         return result
 

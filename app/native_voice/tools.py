@@ -810,7 +810,9 @@ class ToolBridge:
         scoped = dict(arguments)
         scoped["session_id"] = self.session_id
         try:
-            if self.scope_resolver is not None:
+            if isinstance(self.executor, OfflineToolExecutor):
+                current = await self.scope_resolver(self.session_id) if self.scope_resolver is not None else None
+            elif self.scope_resolver is not None:
                 current = await self.scope_resolver(self.session_id)
             else:
                 from app.services.restaurant import restaurant_service
@@ -944,7 +946,7 @@ class ToolBridge:
             return outcome
         args = args or scoped_args or dict(arguments)
         fingerprint = f"{name}:{_hash(args)}"
-        operation_fingerprint = f"{fingerprint}:{state_version}"
+        operation_fingerprint = f"{self.session_id}:{turn_id}:{name}:{_hash(args)}"
         previous = self._calls.get(call_id)
         if previous is not None:
             if f"{previous.name}:{_hash(previous.arguments)}" != fingerprint:

@@ -150,7 +150,10 @@ class SpeechGate:
                 reasons.append("confirmation_envelope_mismatch")
 
         if _UNCLASSIFIED_SUCCESS.search(text or "") and not any(
-            item.speakable and item.state_version == current_state_version for item in evidence_list
+            item.speakable
+            and item.state_version == current_state_version
+            and self._success_resource_matches(text, item.action)
+            for item in evidence_list
         ):
             reasons.append("success_claim_without_matching_readback")
 
@@ -294,6 +297,27 @@ class SpeechGate:
                 "set_order_fulfillment",
                 "set_order_notes",
             }
+        return False
+
+    @staticmethod
+    def _success_resource_matches(text: str, action: str) -> bool:
+        normalized = (text or "").casefold()
+        action = action.casefold()
+        booking_actions = {"create_booking", "update_confirmed_booking", "cancel_booking"}
+        order_actions = {
+            "confirm_order",
+            "add_order_item",
+            "set_order_fulfillment",
+            "set_order_notes",
+            "update_order_item",
+            "remove_order_item",
+        }
+        if any(word in normalized for word in ("booking", "reservation", "table", "slot")):
+            return action in booking_actions
+        if "order" in normalized:
+            return action in order_actions
+        if any(word in normalized for word in ("item", "dish", "meal")):
+            return action in order_actions
         return False
 
     @staticmethod

@@ -26,7 +26,7 @@ from app.native_voice.database_guard import (
 from app.native_voice.protocol import EventRecorder, MemoryRealtimeTransport
 from app.native_voice.speech import SpeechGate, ToolEvidence
 from app.native_voice.state_store import InMemoryOrderStateStore, StateVersionConflict
-from app.native_voice.tools import ToolBridge, ToolOutcome, _order_readback_hash, realtime_tool_definitions
+from app.native_voice.tools import OfflineToolExecutor, ToolBridge, ToolOutcome, _order_readback_hash, realtime_tool_definitions
 from app.native_voice.turns import CompletedCallerTurn, TurnAssembler
 
 
@@ -231,6 +231,22 @@ async def test_tool_bridge_requires_readback_and_replays_idempotently():
 
     second_call = await bridge.invoke(call_id="tool-2", name="add_order_item", arguments=args, turn_id="turn-1", state_version=1)
     assert second_call.replayed and second_call.success and len(executor.calls) == 1
+    state_shifted_replay = await bridge.invoke(call_id="tool-3", name="add_order_item", arguments=args, turn_id="turn-1", state_version=9)
+    assert state_shifted_replay.replayed and state_shifted_replay.success and len(executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_offline_order_scope_never_contacts_restaurant_service():
+    bridge = ToolBridge(OfflineToolExecutor(), session_id="offline-call")
+    outcome = await bridge.invoke(
+        call_id="offline-order",
+        name="add_order_item",
+        arguments={"session_id": "offline-call", "item_name": "Hearth Burger"},
+        turn_id="turn-1",
+        state_version=1,
+    )
+    assert not outcome.success
+    assert outcome.error != "order_scope_unverified"
 
 
 @pytest.mark.asyncio
@@ -453,6 +469,16 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
         facts={"availability": "available", "prices": {"Hearth Burger": 21.0}, "items": ["Hearth Burger"], "status": "confirmed"},
     )
     assert gate.evaluate("Your booking is confirmed.", b"audio", evidence=[evidence], current_state_version=1).allowed
+    menu_evidence = ToolEvidence(
+        action="get_full_menu",
+        call_id="menu-1",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={"items": ["Hearth Burger"]},
+    )
+    assert not gate.evaluate("Your reservation is all set.", b"audio", evidence=[menu_evidence], current_state_version=1).allowed
     assert not gate.evaluate("The 9 PM patio slot is available.", b"audio", evidence=[evidence], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger is available.", b"audio", evidence=[evidence], current_state_version=2).allowed
     order_edit = ToolEvidence(
