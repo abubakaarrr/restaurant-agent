@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import hashlib
+import json
 import sys
 
 import pytest
@@ -16,6 +18,7 @@ from app.native_voice.contracts import (
     OrderState,
     UnresolvedField,
 )
+from app.native_voice.database_guard import NativeVoiceDatabaseGuardError, validate_native_voice_database
 from app.native_voice.protocol import EventRecorder, MemoryRealtimeTransport
 from app.native_voice.speech import SpeechGate, ToolEvidence
 from app.native_voice.state_store import InMemoryOrderStateStore, StateVersionConflict
@@ -766,6 +769,15 @@ async def test_adapter_tool_result_readback_unlocks_only_matching_final_response
     assert result.audio == b"confirmed-audio"
     assert result.tool_outcomes[0].readback_verified
     assert any(event.event_type == "database_readback_verified" for event in adapter.recorder.events)
+    tool_output = next(
+        event["item"]["output"]
+        for event in transport.sent
+        if event.get("type") == "conversation.item.create"
+    )
+    payload = json.loads(tool_output)
+    assert set(payload) == {"status", "result_id", "clarification_state", "speech"}
+    assert "result" not in payload
+    assert "customer" not in tool_output
 
 
 @pytest.mark.asyncio
@@ -854,3 +866,63 @@ def test_production_entrypoint_does_not_import_native_voice():
     import app.main  # noqa: F401
 
     assert "app.native_voice" not in sys.modules
+
+
+def test_booking_claims_require_structured_date_time_and_reference_evidence():
+    evidence = ToolEvidence(
+        action="create_booking",
+        call_id="booking-1",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={
+            "status": "confirmed",
+            "date": "2026-09-19",
+            "time": "19:00",
+            "timezone": "America/Los_Angeles",
+            "reference": "7",
+            "subject": {"booking_id": 7},
+        },
+    )
+    gate = SpeechGate()
+    assert gate.evaluate(
+        "Your reservation is confirmed for 09/19/2026 at 19:00, booking reference 7.",
+        b"audio",
+        evidence=[evidence],
+        current_state_version=1,
+    ).allowed
+    assert not gate.evaluate(
+        "Your reservation is confirmed for 09/20/2026 at 20:00, booking reference 7.",
+        b"audio",
+        evidence=[evidence],
+        current_state_version=1,
+    ).allowed
+
+
+@pytest.mark.asyncio
+async def test_malformed_readback_is_a_structured_failed_outcome():
+    bridge = ToolBridge(FakeExecutor(result={"ok": True}, readback={"booking_id": "bad"}))
+    outcome = await bridge.invoke(
+        call_id="booking-1",
+        name="create_booking",
+        arguments={},
+        turn_id="turn-1",
+        state_version=1,
+    )
+    assert not outcome.success
+    assert not outcome.readback_verified
+    assert outcome.error == "database_readback_mismatch"
+
+
+def test_native_voice_database_guard_requires_separate_approved_disposable_database(monkeypatch):
+    monkeypatch.delenv("NATIVE_VOICE_DATABASE_URL", raising=False)
+    with pytest.raises(NativeVoiceDatabaseGuardError):
+        validate_native_voice_database()
+    native_url = "postgresql://native:password@localhost:5432/native_voice"
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_URL", native_url)
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_WRITE_ENABLED", "true")
+    monkeypatch.setenv("NATIVE_VOICE_DISPOSABLE_DATABASE_FINGERPRINT", hashlib.sha256(native_url.encode()).hexdigest())
+    monkeypatch.setenv("DATABASE_URL", native_url)
+    with pytest.raises(NativeVoiceDatabaseGuardError):
+        validate_native_voice_database()

@@ -39,7 +39,28 @@ _CONSEQUENTIAL_FOOD_FACT = re.compile(
     r"grams?|milligrams?|mg|sodium|carbs?|protein|fat|sugar|portion)\b",
     re.IGNORECASE,
 )
-_TIME_TOKEN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b", re.IGNORECASE)
+_TIME_TOKEN = re.compile(
+    r"\b(?:(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*(?:a\.?m\.?|p\.?m\.?)?)?|\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?)\b)",
+    re.IGNORECASE,
+)
+_DATE_TOKEN = re.compile(
+    r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?|"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\s+\d{1,2}(?:,?\s+\d{4})?|"
+    r"\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)\s+\d{4})\b",
+    re.IGNORECASE,
+)
+_TIMEZONE_TOKEN = re.compile(
+    r"\b(?:UTC|GMT|PST|PDT|MST|MDT|CST|CDT|EST|EDT|[A-Z][a-z]+/[A-Z][a-z_]+)\b"
+)
+_BOOKING_REFERENCE_TOKEN = re.compile(
+    r"\b(?:booking|reservation)\s+(?:reference|ref(?:erence)?|number|no\.?|id)\s*[:#-]?\s*([A-Za-z0-9-]+)\b"
+    r"|\b(?:booking|reservation)\s*#\s*([A-Za-z0-9-]+)\b",
+    re.IGNORECASE,
+)
 _WEEKDAY_TOKEN = re.compile(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE)
 _FULFILLMENT_TOKEN = re.compile(r"\b(?:pickup|delivery|dine[ -]?in)\b", re.IGNORECASE)
 _EFFECT_MARKER = re.compile(
@@ -410,6 +431,48 @@ class SpeechGate:
         return hour * 60 + minute
 
     @staticmethod
+    def _date_matches(spoken: str, expected: str) -> bool:
+        expected_date = SpeechGate._parse_date(expected)
+        if expected_date is None:
+            return False
+        value = spoken.strip().replace("/", "-").replace(",", "")
+        parsed = None
+        includes_year = bool(re.search(r"\b\d{4}\b|\b\d{2}\b$", value))
+        for pattern in (
+            "%Y-%m-%d", "%m-%d-%Y", "%m-%d-%y", "%B %d %Y", "%b %d %Y",
+            "%d %B %Y", "%d %b %Y", "%B %d", "%b %d",
+        ):
+            try:
+                parsed = datetime.strptime(value, pattern).date()
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            return False
+        return parsed == expected_date if includes_year else parsed.month == expected_date.month and parsed.day == expected_date.day
+
+    @staticmethod
+    def _parse_date(value: str) -> date | None:
+        normalized = str(value or "").strip()
+        try:
+            return date.fromisoformat(normalized[:10])
+        except ValueError:
+            try:
+                return datetime.fromisoformat(normalized.replace("Z", "+00:00")).date()
+            except ValueError:
+                return None
+
+    @staticmethod
+    def _timezone_matches(spoken: str, expected: str) -> bool:
+        aliases = {
+            "america/los_angeles": {"america/los_angeles", "pst", "pdt", "pacific"},
+            "america/new_york": {"america/new_york", "est", "edt", "eastern"},
+        }
+        normalized_spoken = spoken.casefold()
+        normalized_expected = expected.casefold()
+        return normalized_spoken == normalized_expected or normalized_spoken in aliases.get(normalized_expected, set())
+
+    @staticmethod
     def _availability_matches(spoken: str, authoritative: Any) -> bool:
         if spoken not in {"available", "unavailable"}:
             return False
@@ -494,9 +557,33 @@ class SpeechGate:
             or any(cls._time_minutes(spoken) != cls._time_minutes(expected_time) for spoken in spoken_times)
         ):
             return False
-        weekdays = _WEEKDAY_TOKEN.findall(text or "")
         expected_date = str(facts.get("date") or booking.get("date") or subject.get("date") or "")
+        spoken_dates = _DATE_TOKEN.findall(text or "")
+        if spoken_dates and (
+            not expected_date
+            or any(not cls._date_matches(spoken, expected_date) for spoken in spoken_dates)
+        ):
+            return False
+        weekdays = _WEEKDAY_TOKEN.findall(text or "")
         if weekdays and (not expected_date or not any(cls._weekday_matches(day, expected_date) for day in weekdays)):
+            return False
+        expected_reference = str(
+            facts.get("reference")
+            or facts.get("booking_reference")
+            or booking.get("reference")
+            or subject.get("reference")
+            or subject.get("booking_id")
+            or ""
+        )
+        references = [match.group(1) or match.group(2) for match in _BOOKING_REFERENCE_TOKEN.finditer(text or "")]
+        if references and (not expected_reference or any(reference != expected_reference for reference in references)):
+            return False
+        expected_timezone = str(facts.get("timezone") or booking.get("timezone") or "")
+        spoken_timezones = _TIMEZONE_TOKEN.findall(text or "")
+        if spoken_timezones and (
+            not expected_timezone
+            or any(not cls._timezone_matches(spoken, expected_timezone) for spoken in spoken_timezones)
+        ):
             return False
         fulfillment = _FULFILLMENT_TOKEN.search(text or "")
         if fulfillment:

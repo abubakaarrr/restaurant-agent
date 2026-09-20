@@ -1665,11 +1665,13 @@ class RestaurantService:
             )
         return {
             "booking_id": row["id"],
+            "reference": str(row["id"]),
             "customer_name": row["customer_name"],
             "customer_phone": row["customer_phone"] or "",
             "booked_at": row["booked_at"].isoformat(),
             "date": row["booked_at"].date().isoformat(),
             "time": row["booked_at"].strftime("%H:%M"),
+            "timezone": get_restaurant_knowledge().identity["timezone"],
             "party_size": row["party_size"],
             "status": row["status"],
             "table_number": row["table_number"],

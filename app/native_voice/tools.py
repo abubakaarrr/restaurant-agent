@@ -290,6 +290,16 @@ class RestaurantToolExecutor:
                     default=str((result.get("match") or {}).get("data_version") or ""),
                 ),
             }
+        if name == "lookup_booking":
+            from app.services.restaurant import restaurant_service
+
+            return dict(
+                await restaurant_service.lookup_booking(
+                    booking_id=int(arguments.get("booking_id") or 0),
+                    customer_name=str(arguments.get("customer_name") or ""),
+                    customer_phone=str(arguments.get("customer_phone") or ""),
+                )
+            )
         tool = self._tools[name]
         args = dict(arguments)
         if hasattr(tool, "ainvoke"):
@@ -960,20 +970,28 @@ class ToolBridge:
             self._calls[call_id] = outcome
             return outcome
 
-        success = not _is_failure(result)
-        error = str(result) if not success else ""
         readback = None
         readback_verified = False
-        if success and name in MUTATING_TOOLS:
-            try:
-                readback = await self.executor.readback(name, args, result)
-            except Exception as exc:
-                error = f"readback_exception:{type(exc).__name__}"
-            else:
-                readback_verified = self._verify_readback(name, args, readback, state_version, result)
-                if not readback_verified:
-                    error = "database_readback_mismatch"
-        facts = self._facts(result, readback, args)
+        try:
+            success = not _is_failure(result)
+            error = str(result) if not success else ""
+            if success and name in MUTATING_TOOLS:
+                try:
+                    readback = await self.executor.readback(name, args, result)
+                except Exception as exc:
+                    success = False
+                    error = f"readback_exception:{type(exc).__name__}"
+                else:
+                    readback_verified = self._verify_readback(name, args, readback, state_version, result)
+                    if not readback_verified:
+                        success = False
+                        error = "database_readback_mismatch"
+            facts = self._facts(result, readback, args)
+        except Exception as exc:
+            success = False
+            error = f"bridge_schema_error:{type(exc).__name__}"
+            readback_verified = False
+            facts = {}
         outcome = ToolOutcome(
             name=name,
             call_id=call_id,
@@ -1214,7 +1232,7 @@ class ToolBridge:
         facts: dict[str, Any] = {}
         subject = {
             key: arguments[key]
-            for key in ("item_name", "date", "time", "preferred_location", "session_id", "booking_id")
+            for key in ("item_name", "date", "time", "preferred_location", "session_id", "booking_id", "reference")
             if arguments.get(key) not in (None, "", 0)
         }
         if subject:
@@ -1222,13 +1240,14 @@ class ToolBridge:
         for value in (result, readback):
             if not isinstance(value, Mapping):
                 continue
-            for key in ("booking_id", "order_id"):
+            for key in ("booking_id", "order_id", "reference", "booking_reference"):
                 if value.get(key) not in (None, "", 0):
                     facts.setdefault("subject", {})[key] = value[key]
             for key in (
                 "items", "prices", "availability", "booking", "order", "status", "date", "time",
                 "customer_name", "customer_phone", "party_size", "location", "notes", "total",
                 "fulfillment", "fulfillment_type", "fulfillment_details", "order_notes", "allergy_notes",
+                "booked_at", "timezone", "reference", "booking_reference",
             ):
                 if key in value:
                     facts[key] = value[key]

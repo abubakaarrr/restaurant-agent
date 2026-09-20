@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import hashlib
 import json
 import uuid
 import inspect
@@ -18,6 +19,10 @@ from typing import Any, Awaitable, Callable, Mapping
 
 from app.call_memory import reset_current_action_scope, reset_current_session_id, set_current_action_scope, set_current_session_id
 from app.native_voice.contracts import OrderItemState, OrderPatch, OrderState
+from app.native_voice.database_guard import (
+    activate_native_voice_database,
+    deactivate_native_voice_database,
+)
 from app.native_voice.protocol import EventRecorder, RealtimeTransport
 from app.native_voice.speech import SpeechDecision, SpeechGate
 from app.native_voice.state_store import CallSessionOrderStateStore, OrderStateStore
@@ -172,24 +177,43 @@ class NativeVoiceAdapter:
         self._input_transcript_quarantined = False
         self._memory_write_task: asyncio.Task[Any] | None = None
         self._turn_lock = asyncio.Lock()
+        self._commit_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._uses_native_database = isinstance(self.state_store, CallSessionOrderStateStore) or isinstance(
+            getattr(self.tool_bridge, "executor", None), RestaurantToolExecutor
+        )
         if hasattr(self.tool_bridge, "bind_session"):
             self.tool_bridge.bind_session(session_id)
 
     async def start(self) -> None:
         if self._started:
             return
-        self.state = await self.state_store.load(self.session_id)
-        event = self.config.session_update()
-        await self.transport.send(event)
-        self.recorder.record(event)
-        self._started = True
+        token = activate_native_voice_database() if self._uses_native_database else None
+        try:
+            self.state = await self.state_store.load(self.session_id)
+            event = self.config.session_update()
+            await self._send(event)
+            self.recorder.record(event)
+            self._started = True
+        finally:
+            if token is not None:
+                deactivate_native_voice_database(token)
 
     async def close(self) -> None:
         await self.transport.close()
 
+    async def _send(self, event: Mapping[str, Any]) -> None:
+        async with self._lifecycle_lock:
+            await self.transport.send(event)
+
     async def apply_order_patch(self, patch: OrderPatch) -> OrderState:
         """Apply facts only after a completed caller turn exists."""
-        return await self._apply_order_patch(patch)
+        token = activate_native_voice_database() if self._uses_native_database else None
+        try:
+            return await self._apply_order_patch(patch)
+        finally:
+            if token is not None:
+                deactivate_native_voice_database(token)
 
     async def _apply_order_patch(
         self,
@@ -218,20 +242,21 @@ class NativeVoiceAdapter:
         expected_version: int,
         generation: int | None = None,
     ) -> bool:
-        if generation is not None and generation != self.interruptions.generation:
-            return False
-        write_task = asyncio.create_task(
-            self.state_store.save(self.session_id, state, expected_version=expected_version)
-        )
-        self._memory_write_task = write_task
-        try:
-            await write_task
-        except asyncio.CancelledError:
-            return False
-        finally:
-            if self._memory_write_task is write_task:
-                self._memory_write_task = None
-        return generation is None or generation == self.interruptions.generation
+        async with self._commit_lock:
+            if generation is not None and generation != self.interruptions.generation:
+                return False
+            write_task = asyncio.create_task(
+                self.state_store.save(self.session_id, state, expected_version=expected_version)
+            )
+            self._memory_write_task = write_task
+            try:
+                await write_task
+            except asyncio.CancelledError:
+                return False
+            finally:
+                if self._memory_write_task is write_task:
+                    self._memory_write_task = None
+            return generation is None or generation == self.interruptions.generation
 
     async def submit_audio(
         self,
@@ -242,7 +267,12 @@ class NativeVoiceAdapter:
     ) -> VoiceTurnResult:
         """Send one synthetic PCM16 turn and drain native output until done."""
         async with self._turn_lock:
-            return await self._submit_audio(audio, turn_id=turn_id, transcript=transcript)
+            token = activate_native_voice_database() if self._uses_native_database else None
+            try:
+                return await self._submit_audio(audio, turn_id=turn_id, transcript=transcript)
+            finally:
+                if token is not None:
+                    deactivate_native_voice_database(token)
 
     async def _submit_audio(
         self,
@@ -253,7 +283,9 @@ class NativeVoiceAdapter:
     ) -> VoiceTurnResult:
         await self.start()
         if self._response is not None:
-            await self.interrupt()
+            async with self._commit_lock:
+                async with self._lifecycle_lock:
+                    await self._interrupt_unlocked()
         resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:12]}"
         if self.turns.completed(resolved_turn_id) is not None:
             self._replayed_finalized_turns.add(resolved_turn_id)
@@ -262,11 +294,11 @@ class NativeVoiceAdapter:
         self.turns.start(resolved_turn_id)
         self.recorder.record_audio("audio_received", audio, turn_id=resolved_turn_id)
         append = {"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")}
-        await self.transport.send(append)
+        await self._send(append)
         self.recorder.record_audio("input_audio_buffer.append", audio, turn_id=resolved_turn_id)
-        await self.transport.send({"type": "input_audio_buffer.commit"})
+        await self._send({"type": "input_audio_buffer.commit"})
         self.recorder.record({"type": "input_audio_buffer.commit", "turn_id": resolved_turn_id})
-        await self.transport.send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+        await self._send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
         self.recorder.record({"type": "response.create", "turn_id": resolved_turn_id})
         return await self._drain_response(transcript=transcript)
 
@@ -277,6 +309,16 @@ class NativeVoiceAdapter:
             self._response.played_audio_bytes = min(byte_count, len(self._response.audio))
 
     async def interrupt(self) -> None:
+        token = activate_native_voice_database() if self._uses_native_database else None
+        try:
+            async with self._commit_lock:
+                async with self._lifecycle_lock:
+                    await self._interrupt_unlocked()
+        finally:
+            if token is not None:
+                deactivate_native_voice_database(token)
+
+    async def _interrupt_unlocked(self) -> None:
         response = self._response
         if self._memory_write_task is not None and not self._memory_write_task.done():
             self._memory_write_task.cancel()
@@ -503,6 +545,9 @@ class NativeVoiceAdapter:
                     return VoiceTurnResult(self._completed_turn, b"", "", None)
                 outcome = await self._run_tool(call_id, name, args, generation=generation)
                 if generation != self.interruptions.generation:
+                    if outcome.success and outcome.readback_verified:
+                        self._outcomes.append(outcome)
+                        await self._sync_order_memory(generation=None)
                     self._response = None
                     self._outcomes.clear()
                     return VoiceTurnResult(self._completed_turn, b"", "", None)
@@ -512,16 +557,10 @@ class NativeVoiceAdapter:
                     "item": {
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": json.dumps({
-                            "ok": outcome.success,
-                            "error": outcome.error or None,
-                            "result": outcome.result,
-                            "readback_verified": outcome.readback_verified,
-                            "state_version": outcome.state_version,
-                        }, default=str),
+                        "output": json.dumps(self._model_tool_output(outcome), sort_keys=True),
                     },
                 }
-                await self.transport.send(output)
+                await self._send(output)
                 self.recorder.record({"type": "tool_result_sent", "call_id": call_id, "success": outcome.success})
             if generation != self.interruptions.generation:
                 self._response = None
@@ -560,12 +599,57 @@ class NativeVoiceAdapter:
                 return VoiceTurnResult(self._completed_turn, b"", "", None)
             self.interruptions.active_response_id = ""
             self._response = _ResponseBuffer(generation=generation)
-            await self.transport.send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+            await self._send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
             self.recorder.record({"type": "response.create", "reason": "after_tool"})
             return None
         self._last_result = result
         self._response = None
         return result
+
+    @staticmethod
+    def _model_tool_output(outcome: ToolOutcome) -> dict[str, Any]:
+        verified = outcome.success and outcome.readback_verified
+        clarification_required = outcome.error == "clarification_required"
+        if not verified:
+            sentence = "I could not complete that request yet."
+        elif outcome.name == "add_order_item":
+            items = [item for item in outcome.facts.get("items") or () if isinstance(item, Mapping)]
+            item = items[0] if items else {}
+            item_name = str(item.get("item_name") or item.get("name") or "the item")
+            try:
+                quantity = int(item.get("quantity") or 1)
+            except (TypeError, ValueError):
+                quantity = 1
+            sentence = f"I added {quantity} {item_name} to your order."
+        elif outcome.name == "confirm_order":
+            sentence = "Your order is confirmed."
+        elif outcome.name == "create_booking":
+            date_value = str(outcome.facts.get("date") or "")
+            time_value = str(outcome.facts.get("time") or "")
+            sentence = (
+                f"Your reservation is confirmed for {date_value} at {time_value}."
+                if date_value and time_value
+                else "Your reservation is confirmed."
+            )
+        elif outcome.name == "cancel_booking":
+            sentence = "Your reservation was cancelled."
+        elif outcome.name == "update_confirmed_booking":
+            sentence = "Your reservation was updated."
+        elif outcome.name in {"lookup_booking", "lookup_order", "get_order_summary"}:
+            sentence = "I found the requested record."
+        elif outcome.name in {"get_full_menu", "check_menu_item_availability", "check_table_availability"}:
+            sentence = "I checked the requested restaurant information."
+        else:
+            sentence = "Your request was applied."
+        result_id = hashlib.sha256(
+            f"{outcome.name}:{outcome.call_id}:{outcome.state_version}".encode("utf-8")
+        ).hexdigest()[:24]
+        return {
+            "status": "completed" if verified else "failed",
+            "result_id": result_id,
+            "clarification_state": "required" if clarification_required else "none",
+            "speech": sentence,
+        }
 
     def _remember_tool_call(self, event: Mapping[str, Any]) -> None:
         call_id = str(event.get("call_id") or event.get("id") or "")
