@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -94,6 +95,8 @@ class ToolEvidence:
     readback_verified: bool
     facts: Mapping[str, Any]
     replayed: bool = False
+    confirmation_text: str = ""
+    confirmation_hash: str = ""
 
     @property
     def speakable(self) -> bool:
@@ -126,6 +129,21 @@ class SpeechGate:
         evidence_list = list(evidence)
         reasons: list[str] = []
         claims = list(explicit_claims)
+
+        envelope_evidence = [item for item in evidence_list if item.confirmation_text]
+        if envelope_evidence:
+            normalized_text = " ".join((text or "").casefold().split())
+            if not any(
+                item.state_version == current_state_version
+                and normalized_text == " ".join(item.confirmation_text.casefold().split())
+                and item.confirmation_hash
+                and hashlib.sha256(
+                    item.confirmation_text.casefold().strip().encode("utf-8")
+                ).hexdigest()
+                == item.confirmation_hash
+                for item in envelope_evidence
+            ):
+                reasons.append("confirmation_envelope_mismatch")
 
         success_matches = list(_SUCCESS.finditer(text or ""))
         for success_match in success_matches:

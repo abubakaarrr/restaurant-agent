@@ -215,6 +215,8 @@ class ToolOutcome:
     state_version: int = 0
     replayed: bool = False
     facts: dict[str, Any] = field(default_factory=dict)
+    confirmation_text: str = ""
+    confirmation_hash: str = ""
 
     def as_evidence(self, *, turn_id: str) -> ToolEvidence:
         return ToolEvidence(
@@ -226,6 +228,8 @@ class ToolOutcome:
             readback_verified=self.readback_verified,
             facts=self.facts,
             replayed=self.replayed,
+            confirmation_text=self.confirmation_text,
+            confirmation_hash=self.confirmation_hash,
         )
 
 

@@ -585,6 +585,7 @@ class NativeVoiceAdapter:
                     self._outcomes.clear()
                     return VoiceTurnResult(self._completed_turn, b"", "", None)
                 outcome = await self._run_tool(call_id, name, args, generation=generation)
+                outcome = self._with_confirmation(outcome)
                 if generation != self.interruptions.generation:
                     if outcome.success and outcome.readback_verified:
                         self._outcomes.append(outcome)
@@ -648,7 +649,7 @@ class NativeVoiceAdapter:
         return result
 
     @staticmethod
-    def _model_tool_output(outcome: ToolOutcome) -> dict[str, Any]:
+    def _confirmation_sentence(outcome: ToolOutcome) -> str:
         verified = outcome.success and outcome.readback_verified
         clarification_required = outcome.error == "clarification_required"
         exact_item: Mapping[str, Any] | None = None
@@ -699,6 +700,19 @@ class NativeVoiceAdapter:
             sentence = "I checked the requested restaurant information."
         else:
             sentence = "Your request was applied."
+        return sentence
+
+    @staticmethod
+    def _with_confirmation(outcome: ToolOutcome) -> ToolOutcome:
+        sentence = NativeVoiceAdapter._confirmation_sentence(outcome)
+        confirmation_hash = hashlib.sha256(sentence.casefold().strip().encode("utf-8")).hexdigest()
+        return replace(outcome, confirmation_text=sentence, confirmation_hash=confirmation_hash)
+
+    @staticmethod
+    def _model_tool_output(outcome: ToolOutcome) -> dict[str, Any]:
+        sentence = outcome.confirmation_text or NativeVoiceAdapter._confirmation_sentence(outcome)
+        verified = outcome.success and outcome.readback_verified
+        clarification_required = outcome.error == "clarification_required"
         result_id = hashlib.sha256(
             f"{outcome.name}:{outcome.call_id}:{outcome.state_version}".encode("utf-8")
         ).hexdigest()[:24]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import hashlib
 import json
 import sys
 
@@ -947,21 +948,39 @@ def test_native_voice_database_guard_requires_separate_approved_disposable_datab
     with pytest.raises(NativeVoiceDatabaseGuardError):
         validate_native_voice_database()
 
+    native_url = "postgresql://native:password@127.0.0.1:5432/native_voice"
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_URL", native_url)
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_WRITE_ENABLED", "true")
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_MARKER", "preprovisioned-disposable-marker")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://app:password@localhost:5432/native_voice")
+    with pytest.raises(NativeVoiceDatabaseGuardError):
+        validate_native_voice_database()
+
 
 @pytest.mark.asyncio
 async def test_native_voice_database_marker_is_verified_server_side(monkeypatch):
+    monkeypatch.setenv("NATIVE_VOICE_DATABASE_URL", "postgresql://native:password@localhost:5432/native_voice")
     monkeypatch.setenv("NATIVE_VOICE_DATABASE_MARKER", "preprovisioned-disposable-marker")
 
     class Pool:
-        async def fetchval(self, query):
-            assert "native_voice_disposable_marker" in query
-            return "preprovisioned-disposable-marker"
+        async def fetchrow(self, query):
+            return {
+                "server_host": "127.0.0.1",
+                "server_port": 5432,
+                "database_name": "native_voice",
+                "marker": "preprovisioned-disposable-marker",
+            }
 
     await verify_native_voice_database_connection(Pool())
 
     class WrongPool:
-        async def fetchval(self, query):
-            return "customer-database"
+        async def fetchrow(self, query):
+            return {
+                "server_host": "127.0.0.1",
+                "server_port": 5432,
+                "database_name": "native_voice",
+                "marker": "customer-database",
+            }
 
     with pytest.raises(NativeVoiceDatabaseGuardError):
         await verify_native_voice_database_connection(WrongPool())
@@ -988,6 +1007,57 @@ def test_item_confirmation_uses_the_committed_operation_item():
     assert "Hearth Burger" not in payload["speech"]
 
 
+def test_consequential_speech_requires_exact_application_confirmation():
+    confirmation = "Your reservation is confirmed."
+    evidence = ToolEvidence(
+        action="create_booking",
+        call_id="booking-1",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={"status": "confirmed"},
+        confirmation_text=confirmation,
+        confirmation_hash=hashlib.sha256(confirmation.casefold().encode()).hexdigest(),
+    )
+    gate = SpeechGate()
+    assert not gate.evaluate("Your reservation is all set.", b"audio", evidence=[evidence], current_state_version=1).allowed
+    assert gate.evaluate(confirmation, b"audio", evidence=[evidence], current_state_version=1).allowed
+
+
+@pytest.mark.asyncio
+async def test_ga_function_call_done_dispatches_nested_item():
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response": {"id": "response-tool"}},
+            {
+                "type": "response.output_item.done",
+                "response_id": "response-tool",
+                "item": {
+                    "id": "item-tool",
+                    "type": "function_call",
+                    "call_id": "call-tool",
+                    "name": "get_full_menu",
+                    "arguments": "{}",
+                },
+            },
+            {"type": "response.done", "response": {"id": "response-tool", "status": "incomplete"}},
+        ]
+    )
+    adapter = NativeVoiceAdapter(
+        session_id="call-1",
+        transport=transport,
+        state_store=InMemoryOrderStateStore(),
+    )
+    await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-tool")
+    assert any(
+        event.get("type") == "tool_requested"
+        and event.get("call_id") == "call-tool"
+        and event.get("name") == "get_full_menu"
+        for event in adapter.recorder.events
+    )
+
+
 @pytest.mark.asyncio
 async def test_realtime_failure_is_terminal_and_quarantines_input():
     transport = MemoryRealtimeTransport(
@@ -1005,7 +1075,7 @@ async def test_realtime_failure_is_terminal_and_quarantines_input():
 
 
 @pytest.mark.asyncio
-async def test_unresolved_reservation_allows_only_scoped_correction():
+async def test_unresolved_reservation_allows_only_scoped_correction(monkeypatch):
     store = InMemoryOrderStateStore()
     state = OrderState().apply(
         OrderPatch(
@@ -1042,10 +1112,3 @@ async def test_unresolved_reservation_allows_only_scoped_correction():
     assert outcome.success and outcome.readback_verified
     assert not (await store.load("call-1")).unresolved_fields
     assert executor.calls
-    native_url = "postgresql://native:password@localhost:5432/native_voice"
-    monkeypatch.setenv("NATIVE_VOICE_DATABASE_URL", native_url)
-    monkeypatch.setenv("NATIVE_VOICE_DATABASE_WRITE_ENABLED", "true")
-    monkeypatch.setenv("NATIVE_VOICE_DATABASE_MARKER", "preprovisioned-disposable-marker")
-    monkeypatch.setenv("DATABASE_URL", native_url)
-    with pytest.raises(NativeVoiceDatabaseGuardError):
-        validate_native_voice_database()
