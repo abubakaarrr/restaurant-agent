@@ -27,6 +27,10 @@ MUTATING_TOOLS = frozenset(
     }
 )
 
+BOOKING_SCOPED_TOOLS = frozenset(
+    {"lookup_booking", "update_confirmed_booking", "cancel_booking", "add_guest_note"}
+)
+
 KNOWN_TOOLS = frozenset(
     {
         "check_menu_item_availability",
@@ -58,10 +62,62 @@ def _hash(value: Mapping[str, Any]) -> str:
 
 def _is_failure(value: Any) -> bool:
     if isinstance(value, Mapping):
-        return value.get("ok") is False or bool(value.get("error"))
+        return (
+            value.get("ok") is False
+            or bool(value.get("error"))
+            or bool(value.get("pending") or value.get("readback_required"))
+        )
     if isinstance(value, str):
-        return bool(re.match(r"^[a-z][a-z0-9_]*:", value.strip()))
+        lowered = value.casefold()
+        return bool(re.match(r"^[a-z][a-z0-9_]*:", value.strip())) or any(
+            phrase in lowered
+            for phrase in ("pending confirmation", "readback_required", "not applied", "unchanged")
+        )
     return False
+
+
+_ORDER_READBACK_FIELDS = (
+    "order_id",
+    "call_id",
+    "booking_id",
+    "status",
+    "draft_version",
+    "total",
+    "items",
+    "proposed_items",
+    "fulfillment",
+    "fulfillment_type",
+    "fulfillment_details",
+    "order_notes",
+    "allergy_notes",
+    "unresolved_fields",
+    "state_version",
+)
+_ORDER_ITEM_FIELDS = (
+    "order_item_id",
+    "item_id",
+    "item_name",
+    "quantity",
+    "modifiers",
+    "removals",
+    "substitutions",
+    "notes",
+)
+
+
+def _canonical_order_payload(readback: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {key: readback.get(key) for key in _ORDER_READBACK_FIELDS}
+    for key in ("items", "proposed_items"):
+        payload[key] = [
+            {field: item.get(field) for field in _ORDER_ITEM_FIELDS}
+            for item in readback.get(key) or ()
+            if isinstance(item, Mapping)
+        ]
+    return payload
+
+
+def _order_readback_hash(readback: Mapping[str, Any]) -> str:
+    return _hash(_canonical_order_payload(readback))
 
 
 def _tool_definition(name: str, description: str, properties: Mapping[str, Any], required: list[str]) -> dict[str, Any]:
@@ -142,6 +198,30 @@ class RestaurantToolExecutor:
         }
 
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
+        if name == "get_full_menu":
+            from app.services.restaurant import restaurant_service
+
+            result = await restaurant_service.list_menu(available_only=False)
+            return {
+                **result,
+                "evidence_source": "restaurant_service.list_menu",
+                "evidence_version": max(
+                    (str(item.get("data_version") or "") for item in result.get("items") or ()),
+                    default="",
+                ),
+            }
+        if name == "check_menu_item_availability":
+            from app.services.restaurant import restaurant_service
+
+            result = await restaurant_service.find_menu_item(str(arguments.get("item_name") or ""))
+            return {
+                **result,
+                "evidence_source": "restaurant_service.find_menu_item",
+                "evidence_version": max(
+                    (str(item.get("data_version") or "") for item in result.get("candidates") or ()),
+                    default=str((result.get("match") or {}).get("data_version") or ""),
+                ),
+            }
         tool = self._tools[name]
         args = dict(arguments)
         if hasattr(tool, "ainvoke"):
@@ -153,16 +233,43 @@ class RestaurantToolExecutor:
         if name in {"add_order_item", "set_order_fulfillment", "set_order_notes", "update_order_item", "remove_order_item", "confirm_order"}:
             from app.services.restaurant import restaurant_service
 
-            return await restaurant_service.get_order_summary(
+            readback = await restaurant_service.get_order_summary(
                 call_id=str(arguments.get("session_id") or "")
             )
+            readback = dict(readback)
+            readback.setdefault("unresolved_fields", [])
+            readback["state_version"] = int(readback.get("draft_version") or 0)
+            readback["readback_committed"] = True
+            readback["readback_hash"] = _order_readback_hash(readback)
+            return readback
         if name == "update_reservation_draft":
-            return await self.invoke("get_reservation_draft", {"session_id": arguments.get("session_id", "")})
+            from app.call_memory import get_reservation_draft, hydrate_call_memory
+
+            session_id = str(arguments.get("session_id") or "")
+            await hydrate_call_memory(session_id)
+            draft = dict(get_reservation_draft(session_id))
+            draft["readback_committed"] = True
+            return draft
         if name == "add_guest_note":
             booking_id = int(arguments.get("booking_id") or 0)
             if booking_id:
-                return await self.invoke("lookup_booking", {"booking_id": booking_id})
-            return await self.invoke("get_order_summary", {"session_id": arguments.get("session_id", "")})
+                from app.services.restaurant import restaurant_service
+
+                readback = dict(await restaurant_service.lookup_booking(booking_id=booking_id))
+                readback["readback_committed"] = True
+                return readback
+            from app.services.restaurant import restaurant_service
+
+            readback = dict(
+                await restaurant_service.get_order_summary(
+                    call_id=str(arguments.get("session_id") or "")
+                )
+            )
+            readback.setdefault("unresolved_fields", [])
+            readback["state_version"] = int(readback.get("draft_version") or 0)
+            readback["readback_committed"] = True
+            readback["readback_hash"] = _order_readback_hash(readback)
+            return readback
         if name in {"create_booking", "update_confirmed_booking", "cancel_booking"}:
             from app.services.restaurant import restaurant_service
 
@@ -174,7 +281,9 @@ class RestaurantToolExecutor:
             if booking_id <= 0:
                 return None
             try:
-                return await restaurant_service.lookup_booking(booking_id=booking_id)
+                readback = dict(await restaurant_service.lookup_booking(booking_id=booking_id))
+                readback["readback_committed"] = True
+                return readback
             except Exception:
                 return None
         return None
@@ -391,6 +500,63 @@ class ToolBridge:
             raise ValueError("tool bridge is already bound to another session")
         self.session_id = session_id
 
+    async def _scoped_booking_arguments(
+        self, name: str, arguments: Mapping[str, Any]
+    ) -> tuple[dict[str, Any] | None, str]:
+        if name not in BOOKING_SCOPED_TOOLS:
+            return dict(arguments), ""
+        if not self.session_id:
+            return None, "booking_scope_unverified"
+        try:
+            from app.call_memory import get_call_memory, hydrate_call_memory
+
+            await hydrate_call_memory(self.session_id)
+            memory = get_call_memory(self.session_id)
+        except Exception:
+            return None, "booking_scope_unverified"
+        try:
+            booking_id = int(memory.get("booking_id") or 0)
+        except (TypeError, ValueError):
+            booking_id = 0
+        trusted_name = str(memory.get("customer_name") or "").strip()
+        trusted_phone = str(memory.get("customer_phone") or "").strip()
+        if not booking_id or not trusted_name or not trusted_phone:
+            return None, "booking_scope_unverified"
+        try:
+            from app.services.restaurant import restaurant_service
+
+            verified_booking = await restaurant_service.lookup_booking(booking_id=booking_id)
+        except Exception:
+            return None, "booking_scope_unverified"
+        if (
+            str(verified_booking.get("customer_name") or "").casefold() != trusted_name.casefold()
+            or str(verified_booking.get("customer_phone") or "").strip() != trusted_phone
+            or str(verified_booking.get("status") or "").casefold() != "confirmed"
+        ):
+            return None, "booking_scope_unverified"
+        supplied_booking = arguments.get("booking_id")
+        if supplied_booking not in (None, "", 0):
+            try:
+                if int(supplied_booking) != booking_id:
+                    return None, "booking_scope_mismatch"
+            except (TypeError, ValueError):
+                return None, "booking_scope_mismatch"
+        for key, trusted in (("customer_name", trusted_name), ("customer_phone", trusted_phone)):
+            supplied = str(arguments.get(key) or "").strip()
+            if supplied and supplied.casefold() != trusted.casefold():
+                return None, "booking_scope_mismatch"
+        scoped = dict(arguments)
+        scoped.update({"booking_id": booking_id, "customer_name": trusted_name, "customer_phone": trusted_phone})
+        scoped["session_id"] = self.session_id
+        if name == "lookup_booking":
+            scoped.pop("session_id", None)
+        elif name == "update_confirmed_booking":
+            scoped.pop("customer_phone", None)
+        elif name == "add_guest_note":
+            scoped.pop("customer_name", None)
+            scoped.pop("customer_phone", None)
+        return scoped, ""
+
     async def invoke(
         self,
         *,
@@ -410,6 +576,16 @@ class ToolBridge:
                 result=None,
                 success=False,
                 error="session_scope_mismatch",
+                state_version=state_version,
+            )
+        if name in MUTATING_TOOLS and not turn_id:
+            return ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=args,
+                result=None,
+                success=False,
+                error="caller_turn_not_finalized",
                 state_version=state_version,
             )
         fingerprint = f"{name}:{_hash(args)}"
@@ -460,6 +636,20 @@ class ToolBridge:
             outcome = ToolOutcome(name=name, call_id=call_id, arguments=args, result=None, success=False, error="unsupported_tool", state_version=state_version)
             self._calls[call_id] = outcome
             return outcome
+        scoped_args, scope_error = await self._scoped_booking_arguments(name, args)
+        if scope_error:
+            outcome = ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=args,
+                result=None,
+                success=False,
+                error=scope_error,
+                state_version=state_version,
+            )
+            self._calls[call_id] = outcome
+            return outcome
+        args = scoped_args or args
         try:
             result = await self.executor.invoke(name, args)
         except Exception as exc:  # structured failure; never a success-like response
@@ -477,7 +667,7 @@ class ToolBridge:
             except Exception as exc:
                 error = f"readback_exception:{type(exc).__name__}"
             else:
-                readback_verified = self._verify_readback(args, readback, state_version)
+                readback_verified = self._verify_readback(name, args, readback, state_version)
                 if not readback_verified:
                     error = "database_readback_mismatch"
         facts = self._facts(result, readback, args)
@@ -497,20 +687,73 @@ class ToolBridge:
         return outcome
 
     @staticmethod
-    def _verify_readback(arguments: Mapping[str, Any], readback: Any, state_version: int) -> bool:
+    def _verify_readback(name: str, arguments: Mapping[str, Any], readback: Any, state_version: int) -> bool:
         if readback is None:
             return False
         if isinstance(readback, Mapping):
             if readback.get("ok") is False or readback.get("status") in {"failed", "error"}:
                 return False
-            if readback.get("readback_verified") is True:
-                return readback.get("state_version", state_version) == state_version
-            expected_draft = arguments.get("expected_draft_version")
-            if expected_draft is not None and readback.get("draft_version") is not None:
-                return int(readback["draft_version"]) == int(expected_draft)
-            return bool(readback.get("status") or readback.get("order_id") or readback.get("booking_id"))
+            if arguments.get("expected_draft_version") is not None:
+                try:
+                    if int(readback.get("draft_version")) != int(arguments["expected_draft_version"]):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            if "order_id" in readback:
+                if not readback.get("readback_committed"):
+                    return False
+                if not all(field in readback for field in _ORDER_READBACK_FIELDS):
+                    return False
+                if not isinstance(readback.get("items"), list) or not isinstance(readback.get("proposed_items"), list):
+                    return False
+                if not isinstance(readback.get("unresolved_fields"), list):
+                    return False
+                if not isinstance(readback.get("readback_hash"), str) or readback["readback_hash"] != _order_readback_hash(readback):
+                    return False
+                if readback.get("status") not in {"pending", "confirmed"}:
+                    return False
+                if name == "confirm_order" and readback.get("status") != "confirmed":
+                    return False
+                for item in [*readback["items"], *readback["proposed_items"]]:
+                    if not isinstance(item, Mapping) or not all(field in item for field in _ORDER_ITEM_FIELDS):
+                        return False
+                    if not item.get("order_item_id") or not item.get("item_id") or not item.get("item_name"):
+                        return False
+                    if not isinstance(item.get("quantity"), int) or item["quantity"] < 1:
+                        return False
+                if name == "set_order_fulfillment" and readback.get("fulfillment_type") != arguments.get("fulfillment_type"):
+                    return False
+                if name == "add_order_item" and arguments.get("item_name"):
+                    if not any(
+                        str(item.get("item_name") or "").casefold() == str(arguments["item_name"]).casefold()
+                        for item in readback["items"] + readback["proposed_items"]
+                    ):
+                        return False
+                if name in {"update_order_item", "remove_order_item"} and arguments.get("order_item_id"):
+                    ids = {str(item.get("order_item_id")) for item in readback["items"] + readback["proposed_items"]}
+                    if name == "update_order_item" and str(arguments["order_item_id"]) not in ids:
+                        return False
+                    if name == "remove_order_item" and str(arguments["order_item_id"]) in ids:
+                        return False
+                return bool(readback.get("order_id") and int(readback.get("draft_version") or 0) > 0)
+            if "booking_id" in readback:
+                required = ("booking_id", "customer_name", "customer_phone", "status", "date", "time", "readback_committed")
+                return bool(
+                    all(field in readback for field in required)
+                    and readback.get("booking_id")
+                    and readback.get("customer_name")
+                    and readback.get("customer_phone")
+                    and readback.get("status") not in {"failed", "error"}
+                    and (name == "cancel_booking" or readback.get("status") != "cancelled")
+                )
+            if name == "update_reservation_draft":
+                return bool(
+                    readback.get("readback_committed")
+                    and all(field in readback for field in ("customer_name", "customer_phone", "date", "time", "party_size"))
+                )
+            return False
         if isinstance(readback, str):
-            return not _is_failure(readback)
+            return False
         return False
 
     @staticmethod
@@ -532,14 +775,54 @@ class ToolBridge:
             for key in ("items", "prices", "availability", "booking", "order", "status"):
                 if key in value:
                     facts[key] = value[key]
+            for key in ("evidence_source", "evidence_version"):
+                if value.get(key) not in (None, ""):
+                    facts[key] = value[key]
             if isinstance(value.get("items"), list):
                 canonical_items = [
-                    {"id": item.get("item_id"), "name": item.get("item_name") or item.get("name")}
+                    {
+                        "id": item.get("item_id"),
+                        "name": item.get("item_name") or item.get("name"),
+                        "price": item.get("price"),
+                        "available": item.get("available"),
+                        "modifier_options": item.get("modifier_options") or (),
+                    }
                     for item in value["items"]
                     if isinstance(item, Mapping) and (item.get("item_id") or item.get("item_name") or item.get("name"))
                 ]
                 if canonical_items:
                     facts["canonical_items"] = canonical_items
+                    facts.setdefault("items", []).extend(
+                        item["name"] for item in canonical_items if item.get("name")
+                    )
+                    facts.setdefault("prices", {}).update(
+                        {
+                            item["id"] or item["name"]: item["price"]
+                            for item in canonical_items
+                            if item.get("price") is not None
+                        }
+                    )
+                    facts["availability_by_item"] = {
+                        item["name"]: ("available" if item.get("available") is True else "unavailable")
+                        for item in canonical_items
+                        if item.get("name") and item.get("available") is not None
+                    }
+                    availability = [item.get("available") for item in canonical_items]
+                    if len(availability) == 1:
+                        facts["availability"] = "available" if availability[0] is True else "unavailable"
+            if isinstance(value.get("match"), Mapping):
+                match = value["match"]
+                facts.setdefault("canonical_items", []).append(
+                    {"id": match.get("item_id"), "name": match.get("name"), "price": match.get("price"), "available": match.get("available")}
+                )
+                if match.get("name"):
+                    facts.setdefault("items", []).append(match["name"])
+                if match.get("price") is not None:
+                    facts.setdefault("prices", {})[match.get("item_id") or match.get("name")] = match["price"]
+                if match.get("available") is not None:
+                    facts["availability"] = "available" if match["available"] is True else "unavailable"
+                    if match.get("name"):
+                        facts.setdefault("availability_by_item", {})[match["name"]] = facts["availability"]
             if value.get("item"):
                 item = value["item"]
                 if isinstance(item, Mapping):
@@ -552,7 +835,7 @@ class ToolBridge:
             item_name = str(arguments.get("item_name") or "")
             if item_name and item_name.casefold() in result.casefold() and not result.casefold().startswith("no matching"):
                 facts.setdefault("items", []).append(item_name)
-            if re.search(r"\b(?:not available|unavailable|sold out|not yet available|out of stock|closed)\b", result, re.IGNORECASE):
+            if re.search(r"\b(?:not currently available|isn't available|is not available|not available|unavailable|sold out|not yet available|out of stock|closed|full|no tables?)\b", result, re.IGNORECASE):
                 facts["availability"] = "unavailable"
             elif re.search(r"\b(?:available|open|in stock)\b", result, re.IGNORECASE):
                 facts["availability"] = "available"

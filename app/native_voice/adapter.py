@@ -91,6 +91,8 @@ class _ResponseBuffer:
     tool_calls: dict[str, tuple[str, dict[str, Any]]] = field(default_factory=dict)
     assistant_item_id: str = ""
     played_audio_bytes: int = 0
+    assistant_transcript_seen: bool = False
+    assistant_transcript_done: bool = False
 
 
 class InterruptionController:
@@ -99,20 +101,31 @@ class InterruptionController:
     def __init__(self) -> None:
         self.generation = 0
         self.active_response_id = ""
+        self.cancelled_response_ids: set[str] = set()
+        self.terminal_generations: set[int] = set()
 
     def begin_response(self, response_id: str = "") -> int:
         self.active_response_id = response_id
         return self.generation
 
-    def interrupt(self) -> int:
+    def interrupt(self, response_id: str = "") -> int:
+        if response_id:
+            self.cancelled_response_ids.add(response_id)
+        self.terminal_generations.add(self.generation)
         self.generation += 1
         self.active_response_id = ""
         return self.generation
 
-    def accepts(self, *, generation: int, response_id: str = "") -> bool:
-        if generation != self.generation:
+    def accepts(self, *, generation: int, response_id: str = "", allow_new_response: bool = False) -> bool:
+        if generation != self.generation or generation in self.terminal_generations:
             return False
-        return not response_id or not self.active_response_id or response_id == self.active_response_id
+        if response_id and response_id in self.cancelled_response_ids:
+            return False
+        if allow_new_response:
+            return bool(response_id) and not self.active_response_id
+        if response_id:
+            return bool(self.active_response_id) and response_id == self.active_response_id
+        return True
 
 
 class NativeVoiceAdapter:
@@ -190,6 +203,7 @@ class NativeVoiceAdapter:
         resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:12]}"
         if self.turns.completed(resolved_turn_id) is not None:
             self._replayed_finalized_turns.add(resolved_turn_id)
+        self._completed_turn = None
         self.turns.start(resolved_turn_id)
         self.recorder.record_audio("audio_received", audio, turn_id=resolved_turn_id)
         append = {"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")}
@@ -209,7 +223,8 @@ class NativeVoiceAdapter:
 
     async def interrupt(self) -> None:
         response = self._response
-        generation = self.interruptions.interrupt()
+        response_id = response.response_id if response is not None else self.interruptions.active_response_id
+        generation = self.interruptions.interrupt(response_id)
         self.turns.reset()
         await self.transport.send({"type": "response.cancel"})
         await self.transport.send({"type": "output_audio_buffer.clear"})
@@ -236,7 +251,11 @@ class NativeVoiceAdapter:
             event = await self.transport.receive()
             event_type = str(event.get("type") or "unknown")
             response_id = str(event.get("response_id") or "")
-            if not self.interruptions.accepts(generation=generation, response_id=response_id):
+            if not self.interruptions.accepts(
+                generation=generation,
+                response_id=response_id,
+                allow_new_response=event_type == "response.created",
+            ):
                 self.recorder.record({"type": "stale_event_ignored", "original_type": event_type, "response_id": response_id})
                 if generation != self.interruptions.generation:
                     result = VoiceTurnResult(self._completed_turn, b"", "", None)
@@ -272,11 +291,20 @@ class NativeVoiceAdapter:
                     self._remember_tool_call(item)
                 continue
             if event_type == "response.output_audio_transcript.delta":
-                self._response.transcript_parts.append(str(event.get("delta") or ""))
+                if not self._response.assistant_transcript_done:
+                    delta = str(event.get("delta") or "")
+                    self._response.assistant_transcript_seen = self._response.assistant_transcript_seen or bool(delta.strip())
+                    self._response.transcript_parts.append(delta)
                 continue
             if event_type == "response.output_audio_transcript.done":
-                if event.get("transcript"):
-                    self._response.transcript_parts = [str(event["transcript"])]
+                if self._response.assistant_transcript_done:
+                    self.recorder.record({"type": "duplicate_assistant_transcript_ignored"})
+                else:
+                    self._response.assistant_transcript_done = True
+                    transcript_text = str(event.get("transcript") or "")
+                    self._response.assistant_transcript_seen = self._response.assistant_transcript_seen or bool(transcript_text.strip())
+                    if transcript_text:
+                        self._response.transcript_parts = [transcript_text]
                 continue
             if event_type == "response.function_call_arguments.done":
                 self._remember_tool_call(event)
@@ -440,6 +468,16 @@ class NativeVoiceAdapter:
                 error="clarification_required",
                 state_version=self.state.version,
             )
+        if name in MUTATING_TOOLS and self._completed_turn is None:
+            return ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=dict(args),
+                result=None,
+                success=False,
+                error="caller_turn_not_finalized",
+                state_version=self.state.version,
+            )
         session_token = set_current_session_id(self.session_id)
         scope_token = set_current_action_scope(self._completed_turn.turn_id if self._completed_turn else call_id)
         try:
@@ -471,9 +509,26 @@ class NativeVoiceAdapter:
     async def _finish_response(self, *, transcript: str | None) -> VoiceTurnResult:
         if self._response is None:
             return VoiceTurnResult(self._completed_turn, b"", "", None)
-        text = "".join(self._response.transcript_parts) or (transcript or "")
+        text = "".join(self._response.transcript_parts)
         current = await self.state_store.load(self.session_id)
         self.state = current
+        if self._response.audio and not self._response.assistant_transcript_seen:
+            decision = SpeechDecision(
+                allowed=False,
+                text="",
+                audio=b"",
+                reasons=("assistant_transcript_missing",),
+                replacement=self.speech_gate.replacement,
+            )
+            self.recorder.record({"type": "speech_suppressed", "reasons": list(decision.reasons)})
+            return VoiceTurnResult(
+                turn=self._completed_turn,
+                audio=b"",
+                transcript="",
+                speech=decision,
+                tool_outcomes=tuple(self._outcomes),
+                response_id=self._response.response_id,
+            )
         decision = self.speech_gate.evaluate(
             text,
             bytes(self._response.audio),

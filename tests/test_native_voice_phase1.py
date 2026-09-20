@@ -18,7 +18,7 @@ from app.native_voice.contracts import (
 from app.native_voice.protocol import EventRecorder, MemoryRealtimeTransport
 from app.native_voice.speech import SpeechGate, ToolEvidence
 from app.native_voice.state_store import InMemoryOrderStateStore, StateVersionConflict
-from app.native_voice.tools import ToolBridge, ToolOutcome, realtime_tool_definitions
+from app.native_voice.tools import ToolBridge, ToolOutcome, _order_readback_hash, realtime_tool_definitions
 from app.native_voice.turns import TurnAssembler
 
 
@@ -47,6 +47,30 @@ def item(item_id: str, name: str, quantity: int, *, line_id: str = "", **kwargs)
         line_id=line_id,
         **kwargs,
     )
+
+
+def order_readback(**overrides):
+    readback = {
+        "order_id": 1,
+        "call_id": "call-1",
+        "booking_id": 0,
+        "status": "pending",
+        "draft_version": 1,
+        "total": 0.0,
+        "items": [],
+        "proposed_items": [],
+        "fulfillment": "pickup",
+        "fulfillment_type": "pickup",
+        "fulfillment_details": {},
+        "order_notes": "",
+        "allergy_notes": "",
+        "unresolved_fields": [],
+        "state_version": 1,
+        "readback_committed": True,
+    }
+    readback.update(overrides)
+    readback["readback_hash"] = _order_readback_hash(readback)
+    return readback
 
 
 def test_turn_deltas_are_provisional_until_one_versioned_completion():
@@ -163,7 +187,23 @@ async def test_structured_state_survives_adapter_restart_without_model_history()
 async def test_tool_bridge_requires_readback_and_replays_idempotently():
     executor = FakeExecutor(
         result={"ok": True, "order_id": 7, "status": "pending", "draft_version": 2},
-        readback={"order_id": 7, "status": "pending", "draft_version": 2},
+        readback=order_readback(
+            order_id=7,
+            draft_version=2,
+            state_version=2,
+            items=[
+                {
+                    "order_item_id": 1,
+                    "item_id": "menu.na.lemonade",
+                    "item_name": "House Lemonade",
+                    "quantity": 2,
+                    "modifiers": [],
+                    "removals": [],
+                    "substitutions": [],
+                    "notes": "",
+                }
+            ],
+        ),
     )
     bridge = ToolBridge(executor)
     args = {"session_id": "call-1", "item_name": "House Lemonade", "quantity": 2}
@@ -178,6 +218,31 @@ async def test_tool_bridge_requires_readback_and_replays_idempotently():
 
     second_call = await bridge.invoke(call_id="tool-2", name="add_order_item", arguments=args, turn_id="turn-1", state_version=1)
     assert not second_call.success and second_call.error == "replayed_finalized_turn"
+
+
+@pytest.mark.asyncio
+async def test_tool_bridge_rejects_mutation_before_turn_finalization_and_incomplete_readback():
+    executor = FakeExecutor(
+        result={"ok": True, "order_id": 7, "status": "pending"},
+        readback={"order_id": 7, "status": "pending"},
+    )
+    bridge = ToolBridge(executor)
+    not_finalized = await bridge.invoke(
+        call_id="tool-before-turn",
+        name="set_order_notes",
+        arguments={"session_id": "call-1", "order_notes": "birthday"},
+        turn_id="",
+        state_version=1,
+    )
+    assert not not_finalized.success and not executor.calls
+    incomplete = await bridge.invoke(
+        call_id="tool-incomplete-readback",
+        name="confirm_order",
+        arguments={"session_id": "call-1", "expected_draft_version": 2},
+        turn_id="turn-1",
+        state_version=1,
+    )
+    assert not incomplete.readback_verified
 
 
 @pytest.mark.asyncio
@@ -263,6 +328,7 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     )
     assert not gate.evaluate("Hearth Burger is available.", b"audio", evidence=[unavailable], current_state_version=1).allowed
     assert gate.evaluate("Hearth Burger is unavailable.", b"audio", evidence=[unavailable], current_state_version=1).allowed
+    assert not gate.evaluate("Hearth Burger is not currently available.", b"audio", evidence=[evidence], current_state_version=1).allowed
     alias = ToolEvidence(
         action="check_menu_item_availability",
         call_id="tool-6",
@@ -274,6 +340,52 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     )
     assert not gate.evaluate("Dragon Burger costs $21.", b"audio", evidence=[alias], current_state_version=1).allowed
     assert gate.evaluate("The Dragon Burger costs $99.00.", b"audio", evidence=[evidence], current_state_version=1).allowed is False
+
+
+def test_structured_menu_facts_remain_item_bound():
+    outcome = ToolBridge(
+        FakeExecutor(
+            result={
+                "status": "current",
+                "items": [
+                    {"item_id": "menu.hearth", "name": "Hearth Burger", "price": 21.0, "available": True},
+                    {"item_id": "menu.dragon", "name": "Dragon Burger", "price": 24.0, "available": False},
+                ],
+            }
+        )
+    )
+
+    async def run():
+        return await outcome.invoke(
+            call_id="menu-1",
+            name="get_full_menu",
+            arguments={},
+            turn_id="turn-1",
+            state_version=1,
+        )
+
+    import asyncio
+
+    evidence = asyncio.run(run()).as_evidence(turn_id="turn-1")
+    gate = SpeechGate()
+    assert gate.evaluate("Hearth Burger costs $21.", b"audio", evidence=[evidence], current_state_version=1).allowed
+    assert not gate.evaluate("Dragon Burger is available.", b"audio", evidence=[evidence], current_state_version=1).allowed
+
+
+@pytest.mark.asyncio
+async def test_booking_tools_fail_closed_without_verified_server_scope():
+    executor = FakeExecutor(result="Booking #7")
+    bridge = ToolBridge(executor)
+    bridge.bind_session("call-1")
+    outcome = await bridge.invoke(
+        call_id="booking-1",
+        name="lookup_booking",
+        arguments={"booking_id": 7},
+        turn_id="turn-1",
+        state_version=1,
+    )
+    assert not outcome.success and outcome.error == "booking_scope_unverified"
+    assert not executor.calls
 
 
 def test_realtime_config_is_native_audio_and_strictly_development_scoped():
@@ -313,10 +425,27 @@ async def test_adapter_emits_native_audio_after_final_turn_and_records_protocol_
 
 
 @pytest.mark.asyncio
+async def test_adapter_suppresses_audio_without_assistant_transcript():
+    output = b"unsupported-audio"
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response_id": "response-1"},
+            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "hello"},
+            {"type": "response.output_audio.delta", "response_id": "response-1", "delta": base64.b64encode(output).decode()},
+            {"type": "response.done", "response_id": "response-1"},
+        ]
+    )
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
+    result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-1", transcript="caller text")
+    assert result.audio == b""
+    assert result.speech and "assistant_transcript_missing" in result.speech.reasons
+
+
+@pytest.mark.asyncio
 async def test_adapter_tool_result_readback_unlocks_only_matching_final_response():
     executor = FakeExecutor(
         result={"ok": True, "status": "confirmed", "order_id": 3, "draft_version": 2},
-        readback={"status": "confirmed", "order_id": 3, "draft_version": 2},
+        readback=order_readback(order_id=3, status="confirmed", draft_version=2, state_version=2),
     )
     transport = MemoryRealtimeTransport(
         [
@@ -353,6 +482,18 @@ async def test_interruption_cancels_audio_and_rejects_stale_generation():
     assert {event["type"] for event in transport.sent} >= {"response.cancel", "output_audio_buffer.clear"}
     assert not adapter.interruptions.accepts(generation=generation, response_id="old-response")
     assert any(event.event_type == "interruption" for event in adapter.recorder.events)
+
+
+def test_interruption_rejects_cancelled_response_until_new_response_created():
+    controller = InterruptionController()
+    generation = controller.begin_response("response-1")
+    next_generation = controller.interrupt("response-1")
+    assert not controller.accepts(generation=next_generation, response_id="response-1")
+    assert controller.accepts(
+        generation=next_generation,
+        response_id="response-2",
+        allow_new_response=True,
+    )
 
 
 @pytest.mark.asyncio

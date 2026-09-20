@@ -25,7 +25,12 @@ _SUBJECT_WORDS = re.compile(
     re.IGNORECASE,
 )
 _AVAILABLE = re.compile(r"\b(?:available|open|in stock)\b", re.IGNORECASE)
-_UNAVAILABLE = re.compile(r"\b(?:not available|unavailable|sold out|not yet available|out of stock|closed)\b", re.IGNORECASE)
+_UNAVAILABLE = re.compile(
+    r"\b(?:not currently available|isn't available|is not available|not available|"
+    r"unavailable|sold out|not yet available|out of stock|closed|fully booked|full|"
+    r"no availability|no tables?)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -108,7 +113,10 @@ class SpeechGate:
             if not any(
                 item.speakable
                 and item.state_version == current_state_version
-                and self._availability_matches(spoken_availability, item.facts.get("availability"))
+                and self._availability_matches(
+                    spoken_availability,
+                    self._fact_availability(text, item.facts),
+                )
                 and self._subject_matches(text, item.facts)
                 for item in evidence_list
             ):
@@ -266,6 +274,16 @@ class SpeechGate:
         return ""
 
     @staticmethod
+    def _fact_availability(text: str, facts: Mapping[str, Any]) -> Any:
+        by_item = facts.get("availability_by_item")
+        if isinstance(by_item, Mapping):
+            normalized = " ".join((text or "").casefold().split())
+            for item, value in by_item.items():
+                if re.search(rf"(?<!\w){re.escape(str(item).casefold())}(?!\w)", normalized):
+                    return value
+        return facts.get("availability")
+
+    @staticmethod
     def _time_minutes(value: str) -> int | None:
         match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", value.casefold())
         if not match:
@@ -289,7 +307,7 @@ class SpeechGate:
         value = str(authoritative or "").casefold()
         if value in {"available", "open", "in stock"}:
             return spoken == "available"
-        if value in {"unavailable", "closed", "sold out", "not available", "not yet available", "out of stock"}:
+        if value in {"unavailable", "closed", "sold out", "not available", "not yet available", "out of stock", "full", "fully booked", "no availability", "no tables"}:
             return spoken == "unavailable"
         return False
 
