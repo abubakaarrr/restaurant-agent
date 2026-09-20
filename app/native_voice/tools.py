@@ -806,8 +806,10 @@ class ToolBridge:
             current_booking_id = int(current.get("booking_id") or 0)
             if not current_booking_id:
                 scoped.pop("booking_id", None)
-                scoped.pop("customer_name", None)
-                scoped.pop("customer_phone", None)
+                if "customer_name" in scoped:
+                    scoped["customer_name"] = " ".join(str(scoped["customer_name"]).split())
+                if "customer_phone" in scoped:
+                    scoped["customer_phone"] = _canonical_phone(scoped["customer_phone"])
                 return scoped, ""
             trusted, error = await self._verified_booking_identity()
             if error or current_booking_id != int(trusted["booking_id"]):
@@ -832,9 +834,11 @@ class ToolBridge:
             elif name == "set_order_fulfillment":
                 scoped["booking_id"] = trusted["booking_id"]
         elif name == "add_order_item":
-            scoped.pop("customer_name", None)
-            scoped.pop("customer_phone", None)
             scoped.pop("booking_id", None)
+            if "customer_name" in scoped:
+                scoped["customer_name"] = " ".join(str(scoped["customer_name"]).split())
+            if "customer_phone" in scoped:
+                scoped["customer_phone"] = _canonical_phone(scoped["customer_phone"])
         return scoped, ""
 
     async def invoke(
@@ -1221,7 +1225,11 @@ class ToolBridge:
             for key in ("booking_id", "order_id"):
                 if value.get(key) not in (None, "", 0):
                     facts.setdefault("subject", {})[key] = value[key]
-            for key in ("items", "prices", "availability", "booking", "order", "status"):
+            for key in (
+                "items", "prices", "availability", "booking", "order", "status", "date", "time",
+                "customer_name", "customer_phone", "party_size", "location", "notes", "total",
+                "fulfillment", "fulfillment_type", "fulfillment_details", "order_notes", "allergy_notes",
+            ):
                 if key in value:
                     facts[key] = value[key]
             for key in ("evidence_source", "evidence_version"):

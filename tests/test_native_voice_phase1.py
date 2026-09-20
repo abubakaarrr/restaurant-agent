@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import sys
 
 import pytest
@@ -318,6 +319,56 @@ async def test_tool_bridge_rejects_proposed_order_items_as_uncommitted():
 
 
 @pytest.mark.asyncio
+async def test_anonymous_pickup_scope_keeps_contact_data_server_bound(monkeypatch):
+    from app.services.restaurant import restaurant_service
+
+    async def current_order(*, call_id):
+        assert call_id == "call-1"
+        return {"order_id": 7, "booking_id": 0}
+
+    monkeypatch.setattr(restaurant_service, "get_order_summary", current_order)
+    executor = FakeExecutor(
+        result={"ok": True, "order_id": 7, "order_item_id": 1, "status": "pending", "draft_version": 2},
+        readback=order_readback(
+            order_id=7,
+            call_id="call-1",
+            draft_version=2,
+            state_version=2,
+            items=[
+                {
+                    "order_item_id": 1,
+                    "item_id": "menu.na.lemonade",
+                    "item_name": "House Lemonade",
+                    "quantity": 1,
+                    "modifiers": [],
+                    "removals": [],
+                    "substitutions": [],
+                    "notes": "",
+                }
+            ],
+        ),
+    )
+    bridge = ToolBridge(executor)
+    bridge.bind_session("call-1")
+    outcome = await bridge.invoke(
+        call_id="tool-contact",
+        name="add_order_item",
+        arguments={
+            "session_id": "call-1",
+            "item_name": "House Lemonade",
+            "customer_name": "  Ada   Lovelace ",
+            "customer_phone": "415 555 0123",
+        },
+        turn_id="turn-contact",
+        state_version=1,
+    )
+    assert outcome.success and outcome.readback_verified
+    assert executor.calls[0][1]["customer_name"] == "Ada Lovelace"
+    assert executor.calls[0][1]["customer_phone"] == "+14155550123"
+    assert executor.calls[0][1]["session_id"] == "call-1"
+
+
+@pytest.mark.asyncio
 async def test_anonymous_guest_note_stays_bound_to_current_session():
     bridge = ToolBridge(FakeExecutor(result={"saved": True}, readback=order_readback()), session_id="call-1")
 
@@ -382,7 +433,7 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
         state_version=1,
         success=True,
         readback_verified=True,
-        facts={"availability": "available", "prices": {"Hearth Burger": 21.0}, "items": ["Hearth Burger"]},
+        facts={"availability": "available", "prices": {"Hearth Burger": 21.0}, "items": ["Hearth Burger"], "status": "confirmed"},
     )
     assert gate.evaluate("Your booking is confirmed.", b"audio", evidence=[evidence], current_state_version=1).allowed
     assert not gate.evaluate("The 9 PM patio slot is available.", b"audio", evidence=[evidence], current_state_version=1).allowed
@@ -397,6 +448,41 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
         facts={"items": ["Hearth Burger"]},
     )
     assert not gate.evaluate("Your order was submitted.", b"audio", evidence=[order_edit], current_state_version=1).allowed
+    booking_details = ToolEvidence(
+        action="create_booking",
+        call_id="tool-booking-details",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={"status": "confirmed", "date": "2025-05-09", "time": "7:00 PM", "subject": {"booking_id": 7}},
+    )
+    assert not gate.evaluate(
+        "Your booking is confirmed for 9 PM on Friday.",
+        b"audio",
+        evidence=[booking_details],
+        current_state_version=1,
+    ).allowed
+    assert gate.evaluate(
+        "Your booking is confirmed for 7 PM on Friday.",
+        b"audio",
+        evidence=[booking_details],
+        current_state_version=1,
+    ).allowed
+    order_details = ToolEvidence(
+        action="add_order_item",
+        call_id="tool-order-details",
+        turn_id="turn-1",
+        state_version=1,
+        success=True,
+        readback_verified=True,
+        facts={
+            "items": [{"item_name": "Hearth Burger", "quantity": 2, "modifiers": ["side fries"]}],
+            "status": "pending",
+        },
+    )
+    assert gate.evaluate("Two Hearth Burgers with side fries were added.", b"audio", evidence=[order_details], current_state_version=1).allowed
+    assert not gate.evaluate("Three Hearth Burgers with bacon were added.", b"audio", evidence=[order_details], current_state_version=1).allowed
     unavailable = ToolEvidence(
         action="check_menu_item_availability",
         call_id="tool-5",
@@ -439,6 +525,29 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     assert not gate.evaluate("Hearth Burger contains dairy and peanuts.", b"audio", evidence=[dietary], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger has 900 calories.", b"audio", evidence=[dietary], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger does not contain dairy.", b"audio", evidence=[dietary], current_state_version=1).allowed
+
+
+@pytest.mark.asyncio
+async def test_concurrent_audio_submissions_are_serialized():
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response": {"id": "response-1"}},
+            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "first"},
+            {"type": "response.output_audio_transcript.done", "response_id": "response-1", "transcript": "first reply"},
+            {"type": "response.done", "response": {"id": "response-1", "status": "completed"}},
+            {"type": "response.created", "response": {"id": "response-2"}},
+            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "second"},
+            {"type": "response.output_audio_transcript.done", "response_id": "response-2", "transcript": "second reply"},
+            {"type": "response.done", "response": {"id": "response-2", "status": "completed"}},
+        ]
+    )
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
+    first, second = await asyncio.gather(
+        adapter.submit_audio(b"first", turn_id="turn-1"),
+        adapter.submit_audio(b"second", turn_id="turn-2"),
+    )
+    assert first.turn and first.turn.transcript == "first"
+    assert second.turn and second.turn.transcript == "second"
 
 
 def test_event_recorder_redacts_transcripts_arguments_and_personal_fields():

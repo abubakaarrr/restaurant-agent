@@ -171,6 +171,7 @@ class NativeVoiceAdapter:
         self._require_input_item_id = False
         self._input_transcript_quarantined = False
         self._memory_write_task: asyncio.Task[Any] | None = None
+        self._turn_lock = asyncio.Lock()
         if hasattr(self.tool_bridge, "bind_session"):
             self.tool_bridge.bind_session(session_id)
 
@@ -240,6 +241,16 @@ class NativeVoiceAdapter:
         transcript: str | None = None,
     ) -> VoiceTurnResult:
         """Send one synthetic PCM16 turn and drain native output until done."""
+        async with self._turn_lock:
+            return await self._submit_audio(audio, turn_id=turn_id, transcript=transcript)
+
+    async def _submit_audio(
+        self,
+        audio: bytes,
+        *,
+        turn_id: str | None = None,
+        transcript: str | None = None,
+    ) -> VoiceTurnResult:
         await self.start()
         if self._response is not None:
             await self.interrupt()

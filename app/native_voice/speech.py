@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any, Iterable, Mapping
 
 
@@ -38,6 +39,25 @@ _CONSEQUENTIAL_FOOD_FACT = re.compile(
     r"grams?|milligrams?|mg|sodium|carbs?|protein|fat|sugar|portion)\b",
     re.IGNORECASE,
 )
+_TIME_TOKEN = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b", re.IGNORECASE)
+_WEEKDAY_TOKEN = re.compile(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE)
+_FULFILLMENT_TOKEN = re.compile(r"\b(?:pickup|delivery|dine[ -]?in)\b", re.IGNORECASE)
+_EFFECT_MARKER = re.compile(
+    r"\b(?:with|without|no|extra|substitute(?:d)?|swap(?:ped)?|instead of)\b",
+    re.IGNORECASE,
+)
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
 
 
 @dataclass(frozen=True)
@@ -92,6 +112,7 @@ class SpeechGate:
                 and (fragment := self._claim_fragment(text, success_match.start(), item.facts))
                 and (fragment_match := _SUCCESS.search(fragment)) is not None
                 and self._success_subject_matches(fragment, item.facts, item.action, fragment_match)
+                and self._success_details_match(fragment, item.facts, item.action, fragment_match)
                 for item in evidence_list
             ):
                 reasons.append("success_claim_without_matching_readback")
@@ -109,7 +130,10 @@ class SpeechGate:
                 and self._subject_matches(fragment, item.facts)
                 and any(
                     abs(float(value) - spoken_price) < 0.005
-                    for value in (item.facts.get("prices") or {}).values()
+                    for value in (
+                        list((item.facts.get("prices") or {}).values())
+                        + ([item.facts["total"]] if item.facts.get("total") is not None else [])
+                    )
                 )
                 for item in evidence_list
             ):
@@ -270,7 +294,8 @@ class SpeechGate:
             for item_name in item_names:
                 if not item_name:
                     continue
-                pattern = rf"(?<!\w){re.escape(item_name)}(?!\w)"
+                plural = "" if item_name.endswith("s") else "s?"
+                pattern = rf"(?<!\w){re.escape(item_name)}{plural}(?!\w)"
                 match = re.search(pattern, normalized)
                 if not match:
                     continue
@@ -430,6 +455,8 @@ class SpeechGate:
         else:
             required = r"\b(?:booking|reservation|order|item)\b"
         if not re.search(required, (text or ""), re.IGNORECASE):
+            if action in {"add_order_item", "update_order_item", "remove_order_item"}:
+                return SpeechGate._subject_matches(text, facts)
             return False
         if action in {"add_order_item", "update_order_item", "remove_order_item"}:
             return SpeechGate._subject_matches(text, facts)
@@ -439,6 +466,116 @@ class SpeechGate:
             expected_id = str(subject.get("booking_id") or subject.get("order_id") or "")
             return bool(expected_id and numbered_subject.group(1) == expected_id)
         return True
+
+    @classmethod
+    def _success_details_match(
+        cls,
+        text: str,
+        facts: Mapping[str, Any],
+        action: str,
+        match: re.Match[str],
+    ) -> bool:
+        action = action.casefold()
+        subject = facts.get("subject") if isinstance(facts.get("subject"), Mapping) else {}
+        booking = facts.get("booking") if isinstance(facts.get("booking"), Mapping) else {}
+        status = str(facts.get("status") or booking.get("status") or "").casefold()
+        word = match.group(0).casefold()
+        if action in {"create_booking", "update_confirmed_booking", "cancel_booking"}:
+            expected_status = "cancelled" if word in {"cancelled", "canceled"} else "confirmed"
+            if status != expected_status:
+                return False
+        if action == "confirm_order" and word in {"placed", "submitted", "processed", "completed", "confirmed"}:
+            if status != "confirmed":
+                return False
+        expected_time = str(facts.get("time") or booking.get("time") or subject.get("time") or "")
+        spoken_times = _TIME_TOKEN.findall(text or "")
+        if spoken_times and (
+            not expected_time
+            or any(cls._time_minutes(spoken) != cls._time_minutes(expected_time) for spoken in spoken_times)
+        ):
+            return False
+        weekdays = _WEEKDAY_TOKEN.findall(text or "")
+        expected_date = str(facts.get("date") or booking.get("date") or subject.get("date") or "")
+        if weekdays and (not expected_date or not any(cls._weekday_matches(day, expected_date) for day in weekdays)):
+            return False
+        fulfillment = _FULFILLMENT_TOKEN.search(text or "")
+        if fulfillment:
+            expected_fulfillment = str(
+                facts.get("fulfillment_type") or facts.get("fulfillment") or ""
+            ).replace("-", "").replace(" ", "").casefold()
+            spoken_fulfillment = fulfillment.group(0).replace("-", "").replace(" ", "").casefold()
+            if not expected_fulfillment or spoken_fulfillment != expected_fulfillment:
+                return False
+        if action in {
+            "add_order_item",
+            "update_order_item",
+            "remove_order_item",
+            "set_order_fulfillment",
+            "set_order_notes",
+            "confirm_order",
+        }:
+            items = [item for item in facts.get("items") or () if isinstance(item, Mapping)]
+            for item in items:
+                name = str(item.get("item_name") or item.get("name") or "").strip()
+                if not name:
+                    continue
+                item_pattern = re.escape(name) + ("" if name.casefold().endswith("s") else "s?")
+                if not re.search(rf"(?<!\w){item_pattern}(?!\w)", text or "", re.IGNORECASE):
+                    continue
+                quantity = re.search(
+                    rf"(?:\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:x\s+)?{item_pattern}\b|\b{item_pattern}\s+(?:x\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b)",
+                    text or "",
+                    re.IGNORECASE,
+                )
+                if quantity:
+                    spoken_quantity = quantity.group(1) or quantity.group(2)
+                    spoken_quantity = (
+                        _NUMBER_WORDS[spoken_quantity.casefold()]
+                        if spoken_quantity.casefold() in _NUMBER_WORDS
+                        else int(spoken_quantity)
+                    )
+                    if item.get("quantity") is None or int(item["quantity"]) != spoken_quantity:
+                        return False
+                effects = cls._effect_terms(text)
+                if effects:
+                    authoritative_effects: set[str] = set()
+                    for key in ("modifiers", "removals", "substitutions", "notes"):
+                        values = item.get(key) or ()
+                        values = values if isinstance(values, (list, tuple)) else (values,)
+                        for value in values:
+                            if isinstance(value, Mapping):
+                                value = value.get("name") or value.get("option_id") or value.get("id") or value.get("selection")
+                            authoritative_effects.update(str(value or "").casefold().replace("-", " ").split())
+                    if not authoritative_effects or not effects <= authoritative_effects:
+                        return False
+        return True
+
+    @staticmethod
+    def _effect_terms(text: str) -> set[str]:
+        terms: set[str] = set()
+        stop_words = {
+            "a", "an", "and", "are", "at", "added", "confirmed", "for", "is", "item", "of",
+            "on", "order", "placed", "removed", "saved", "the", "to", "updated", "was", "were", "your",
+        }
+        for marker in _EFFECT_MARKER.finditer(text or ""):
+            tail = re.split(r"[,.;!?]", (text or "")[marker.end():], maxsplit=1)[0]
+            words = [word.casefold() for word in re.findall(r"[a-z][a-z-]*", tail)[:3]]
+            terms.update(word.replace("-", " ") for word in words if word not in stop_words)
+        return terms
+
+    @staticmethod
+    def _weekday_matches(spoken: str, expected: str) -> bool:
+        normalized = expected.strip().casefold()
+        if normalized == spoken.casefold():
+            return True
+        try:
+            parsed = date.fromisoformat(normalized[:10])
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00")).date()
+            except ValueError:
+                return False
+        return parsed.strftime("%A").casefold() == spoken.casefold()
 
     @staticmethod
     def _food_fact_supported(text: str, facts: Mapping[str, Any]) -> bool:
