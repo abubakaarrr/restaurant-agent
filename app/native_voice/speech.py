@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping
 
 
 _SUCCESS = re.compile(
-    r"\b(?:confirmed|booked|reserved|placed|added|updated|cancelled|canceled|removed|charged)\b",
+    r"\b(?:confirmed|booked|reserved|placed|added|updated|cancelled|canceled|removed|charged|saved|set|completed|submitted|processed)\b",
     re.IGNORECASE,
 )
 _AVAILABILITY = re.compile(
@@ -190,6 +190,19 @@ class SpeechGate:
             return action == "remove_order_item"
         if word == "confirmed":
             return action in {"confirm_order", "create_booking", "update_confirmed_booking"}
+        if word in {"saved", "set", "completed", "submitted", "processed"}:
+            return action in {
+                "create_booking",
+                "update_confirmed_booking",
+                "update_reservation_draft",
+                "add_guest_note",
+                "add_order_item",
+                "set_order_fulfillment",
+                "set_order_notes",
+                "update_order_item",
+                "remove_order_item",
+                "confirm_order",
+            }
         return False
 
     @staticmethod
@@ -422,6 +435,11 @@ class SpeechGate:
 
     @staticmethod
     def _food_fact_supported(text: str, facts: Mapping[str, Any]) -> bool:
+        if re.search(
+            r"\b(?:not|never|no|without|free\s+of|doesn['’]?t|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t)\b",
+            (text or "").casefold(),
+        ):
+            return False
         if not SpeechGate._subject_matches(text, facts):
             return False
         normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").casefold()).split()

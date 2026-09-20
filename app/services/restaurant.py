@@ -1631,12 +1631,14 @@ class RestaurantService:
                     FROM bookings b
                     LEFT JOIN tables t ON t.id = b.table_id
                     WHERE b.id = $1
+                      AND ($2 = '' OR b.customer_phone = $2)
                     """,
                     booking_id,
+                    phone,
                 )
             elif customer_name and phone:
                 name = self._validate_name(customer_name)
-                row = await conn.fetchrow(
+                rows = await conn.fetch(
                     """
                     SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
                            b.party_size, b.status, b.notes, t.table_number, t.location
@@ -1645,11 +1647,11 @@ class RestaurantService:
                     WHERE LOWER(b.customer_name) = LOWER($1)
                       AND b.customer_phone = $2
                     ORDER BY b.booked_at DESC
-                    LIMIT 1
                     """,
                     name,
                     phone,
                 )
+                row = rows[0] if len(rows) == 1 else None
             else:
                 raise RestaurantServiceError(
                     "Provide the booking ID, or both the exact name and phone number.",

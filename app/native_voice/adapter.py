@@ -297,6 +297,8 @@ class NativeVoiceAdapter:
         self._response = _ResponseBuffer(generation=generation)
         self._outcomes = []
         self._seen_tool_calls = set()
+        pending_response_id = ""
+        pending_response_status = ""
         while True:
             event = await self.transport.receive()
             event_type = str(event.get("type") or "unknown")
@@ -375,6 +377,17 @@ class NativeVoiceAdapter:
                     str(event.get("transcript") or transcript or ""),
                     generation=generation,
                 )
+                if pending_response_status:
+                    result = await self._handle_completed_response(
+                        response_id=pending_response_id,
+                        status=pending_response_status,
+                        transcript=transcript,
+                        generation=generation,
+                    )
+                    pending_response_id = ""
+                    pending_response_status = ""
+                    if result is not None:
+                        return result
                 continue
             if event_type == "response.output_audio.delta":
                 self._response.assistant_item_id = str(event.get("item_id") or self._response.assistant_item_id)
@@ -413,93 +426,115 @@ class NativeVoiceAdapter:
                 self.recorder.record({"type": "tool_or_response_failure", "code": (event.get("error") or {}).get("code", "realtime_error")})
                 continue
             if event_type == "response.done":
-                if str(response.get("status") or event.get("status") or "") != "completed":
-                    self.recorder.record({
-                        "type": "incomplete_response_ignored",
-                        "response_id": response_id,
-                        "status": response.get("status") or event.get("status") or "",
-                    })
-                    self._response = None
-                    self._outcomes.clear()
-                    return VoiceTurnResult(self._completed_turn, b"", "", None, response_id=response_id)
-                result = await self._finish_response(transcript=transcript)
+                pending_response_id = response_id
+                pending_response_status = str(response.get("status") or event.get("status") or "")
+                if self._completed_turn is None and pending_response_status == "completed":
+                    continue
+                result = await self._handle_completed_response(
+                    response_id=pending_response_id,
+                    status=pending_response_status,
+                    transcript=transcript,
+                    generation=generation,
+                )
+                pending_response_id = ""
+                pending_response_status = ""
+                if result is not None:
+                    return result
+                continue
+
+    async def _handle_completed_response(
+        self,
+        *,
+        response_id: str,
+        status: str,
+        transcript: str | None,
+        generation: int,
+    ) -> VoiceTurnResult | None:
+        if status != "completed":
+            self.recorder.record({
+                "type": "incomplete_response_ignored",
+                "response_id": response_id,
+                "status": status,
+            })
+            self._response = None
+            self._outcomes.clear()
+            return VoiceTurnResult(self._completed_turn, b"", "", None, response_id=response_id)
+        result = await self._finish_response(transcript=transcript)
+        if generation != self.interruptions.generation:
+            self._response = None
+            self._outcomes.clear()
+            return VoiceTurnResult(self._completed_turn, b"", "", None)
+        if self._response is not None and self._response.tool_calls:
+            for call_id, (name, args) in list(self._response.tool_calls.items()):
                 if generation != self.interruptions.generation:
                     self._response = None
                     self._outcomes.clear()
                     return VoiceTurnResult(self._completed_turn, b"", "", None)
-                if self._response is not None and self._response.tool_calls:
-                    for call_id, (name, args) in list(self._response.tool_calls.items()):
-                        if generation != self.interruptions.generation:
-                            self._response = None
-                            self._outcomes.clear()
-                            return VoiceTurnResult(self._completed_turn, b"", "", None)
-                        outcome = await self._run_tool(call_id, name, args, generation=generation)
-                        if generation != self.interruptions.generation:
-                            self._response = None
-                            self._outcomes.clear()
-                            return VoiceTurnResult(self._completed_turn, b"", "", None)
-                        self._outcomes.append(outcome)
-                        output = {
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": json.dumps({
-                                    "ok": outcome.success,
-                                    "error": outcome.error or None,
-                                    "result": outcome.result,
-                                    "readback_verified": outcome.readback_verified,
-                                    "state_version": outcome.state_version,
-                                }, default=str),
-                            },
-                        }
-                        await self.transport.send(output)
-                        self.recorder.record({"type": "tool_result_sent", "call_id": call_id, "success": outcome.success})
-                    if generation != self.interruptions.generation:
-                        self._response = None
-                        self._outcomes.clear()
-                        return VoiceTurnResult(self._completed_turn, b"", "", None)
-                    synced = await self._sync_order_memory(generation=generation)
-                    if synced is not None and generation == self.interruptions.generation:
-                        order_mutations = {
-                            "add_order_item",
-                            "set_order_fulfillment",
-                            "set_order_notes",
-                            "update_order_item",
-                            "remove_order_item",
-                            "confirm_order",
-                            "add_guest_note",
-                        }
-                        current_readback = next(
-                            (
-                                outcome.readback
-                                for outcome in reversed(self._outcomes)
-                                if outcome.name in order_mutations
-                                and outcome.readback_verified
-                                and isinstance(outcome.readback, Mapping)
-                            ),
-                            None,
-                        )
-                        self._outcomes = [
-                            replace(outcome, state_version=synced.version)
-                            if outcome.readback is current_readback
-                            else outcome
-                            for outcome in self._outcomes
-                        ]
-                    if generation != self.interruptions.generation:
-                        self._response = None
-                        self._outcomes.clear()
-                        return VoiceTurnResult(self._completed_turn, b"", "", None)
-                    # The next response has a new server response id.  Clear
-                    # the old id before accepting its ``response.created``.
-                    self.interruptions.active_response_id = ""
-                    self._response = _ResponseBuffer(generation=generation)
-                    await self.transport.send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
-                    self.recorder.record({"type": "response.create", "reason": "after_tool"})
-                    continue
-                self._last_result = result
+                outcome = await self._run_tool(call_id, name, args, generation=generation)
+                if generation != self.interruptions.generation:
+                    self._response = None
+                    self._outcomes.clear()
+                    return VoiceTurnResult(self._completed_turn, b"", "", None)
+                self._outcomes.append(outcome)
+                output = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({
+                            "ok": outcome.success,
+                            "error": outcome.error or None,
+                            "result": outcome.result,
+                            "readback_verified": outcome.readback_verified,
+                            "state_version": outcome.state_version,
+                        }, default=str),
+                    },
+                }
+                await self.transport.send(output)
+                self.recorder.record({"type": "tool_result_sent", "call_id": call_id, "success": outcome.success})
+            if generation != self.interruptions.generation:
                 self._response = None
-                return result
+                self._outcomes.clear()
+                return VoiceTurnResult(self._completed_turn, b"", "", None)
+            synced = await self._sync_order_memory(generation=generation)
+            if synced is not None and generation == self.interruptions.generation:
+                order_mutations = {
+                    "add_order_item",
+                    "set_order_fulfillment",
+                    "set_order_notes",
+                    "update_order_item",
+                    "remove_order_item",
+                    "confirm_order",
+                    "add_guest_note",
+                }
+                current_readback = next(
+                    (
+                        outcome.readback
+                        for outcome in reversed(self._outcomes)
+                        if outcome.name in order_mutations
+                        and outcome.readback_verified
+                        and isinstance(outcome.readback, Mapping)
+                    ),
+                    None,
+                )
+                self._outcomes = [
+                    replace(outcome, state_version=synced.version)
+                    if outcome.readback is current_readback
+                    else outcome
+                    for outcome in self._outcomes
+                ]
+            if generation != self.interruptions.generation:
+                self._response = None
+                self._outcomes.clear()
+                return VoiceTurnResult(self._completed_turn, b"", "", None)
+            self.interruptions.active_response_id = ""
+            self._response = _ResponseBuffer(generation=generation)
+            await self.transport.send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+            self.recorder.record({"type": "response.create", "reason": "after_tool"})
+            return None
+        self._last_result = result
+        self._response = None
+        return result
 
     def _remember_tool_call(self, event: Mapping[str, Any]) -> None:
         call_id = str(event.get("call_id") or event.get("id") or "")
@@ -608,16 +643,46 @@ class NativeVoiceAdapter:
         else:
             items = current.items
             remove_line_ids = ()
+        order_notes = (
+            str(readback.get("order_notes") or "")
+            if "order_notes" in readback
+            else current.order_notes
+        )
+        allergy_notes = (
+            str(readback.get("allergy_notes") or "")
+            if "allergy_notes" in readback
+            else current.allergy_notes
+        )
+        guest_notes = (
+            str(readback.get("guest_notes") or "")
+            if "guest_notes" in readback
+            else current.guest_notes
+        )
+        fulfillment = (
+            str(readback.get("fulfillment") or "")
+            if "fulfillment" in readback
+            else current.fulfillment
+        )
+        fulfillment_details = (
+            dict(readback.get("fulfillment_details") or {})
+            if "fulfillment_details" in readback
+            else dict(current.fulfillment_details)
+        )
+        status = (
+            str(readback.get("status") or "")
+            if "status" in readback
+            else current.status
+        )
         patch = OrderPatch(
             source_turn_id=self._completed_turn.turn_id,
             items=items,
             remove_line_ids=remove_line_ids,
-            order_notes=str(readback.get("order_notes") or current.order_notes),
-            allergy_notes=str(readback.get("allergy_notes") or current.allergy_notes),
-            guest_notes=str(readback.get("guest_notes") or current.guest_notes),
-            fulfillment=str(readback.get("fulfillment") or current.fulfillment),
-            fulfillment_details=readback.get("fulfillment_details") or current.fulfillment_details,
-            status=str(readback.get("status") or current.status),
+            order_notes=order_notes,
+            allergy_notes=allergy_notes,
+            guest_notes=guest_notes,
+            fulfillment=fulfillment,
+            fulfillment_details=fulfillment_details,
+            status=status,
         )
         if not items and not remove_line_ids and not patch.order_notes and not patch.allergy_notes and not patch.guest_notes and not patch.fulfillment:
             return None

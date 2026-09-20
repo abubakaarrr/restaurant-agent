@@ -186,7 +186,7 @@ async def test_structured_state_survives_adapter_restart_without_model_history()
 @pytest.mark.asyncio
 async def test_tool_bridge_requires_readback_and_replays_idempotently():
     executor = FakeExecutor(
-        result={"ok": True, "order_id": 7, "status": "pending", "draft_version": 2},
+        result={"ok": True, "order_id": 7, "order_item_id": 1, "status": "pending", "draft_version": 2},
         readback=order_readback(
             order_id=7,
             draft_version=2,
@@ -428,6 +428,7 @@ def test_speech_gate_blocks_hallucinated_items_prices_availability_and_success()
     assert not gate.evaluate("Hearth Burger contains peanuts.", b"audio", evidence=[dietary], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger contains dairy and peanuts.", b"audio", evidence=[dietary], current_state_version=1).allowed
     assert not gate.evaluate("Hearth Burger has 900 calories.", b"audio", evidence=[dietary], current_state_version=1).allowed
+    assert not gate.evaluate("Hearth Burger does not contain dairy.", b"audio", evidence=[dietary], current_state_version=1).allowed
 
 
 def test_event_recorder_redacts_transcripts_arguments_and_personal_fields():
@@ -558,6 +559,24 @@ async def test_adapter_emits_native_audio_after_final_turn_and_records_protocol_
     assert any(event.event_type == "success_speakable" for event in adapter.recorder.events)
     assert transport.sent[0]["type"] == "session.update"
     assert transport.sent[-1]["type"] == "response.create"
+
+
+@pytest.mark.asyncio
+async def test_adapter_reconciles_input_transcript_after_response_done():
+    output = b"late-transcript-audio"
+    transport = MemoryRealtimeTransport(
+        [
+            {"type": "response.created", "response": {"id": "response-late"}},
+            {"type": "response.output_audio.delta", "response_id": "response-late", "delta": base64.b64encode(output).decode()},
+            {"type": "response.output_audio_transcript.done", "response_id": "response-late", "transcript": "How can I help?"},
+            {"type": "response.done", "response": {"id": "response-late", "status": "completed"}},
+            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "hello"},
+        ]
+    )
+    adapter = NativeVoiceAdapter(session_id="call-1", transport=transport, state_store=InMemoryOrderStateStore())
+    result = await adapter.submit_audio(b"synthetic-pcm", turn_id="turn-late")
+    assert result.audio == output
+    assert result.turn and result.turn.transcript == "hello"
 
 
 @pytest.mark.asyncio

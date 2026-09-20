@@ -73,6 +73,38 @@ def _hash(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _canonical_effect_values(value: Any) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    values = value if isinstance(value, (list, tuple)) else (value,)
+    result: list[str] = []
+    for entry in values:
+        if isinstance(entry, Mapping):
+            option_id = str(entry.get("option_id") or entry.get("id") or entry.get("name") or "").strip()
+            selection = str(entry.get("selection") or "").strip()
+            result.append(f"{option_id}:{selection}" if selection else option_id)
+        else:
+            result.append(str(entry).strip())
+    return tuple(sorted(result))
+
+
+def _canonical_phone(value: Any) -> str:
+    from app.security import normalize_caller_phone
+
+    raw = str(value or "").strip()
+    normalized = normalize_caller_phone(raw)
+    if normalized:
+        return normalized
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return digits
+
+
+def _canonical_name(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
 def _is_failure(value: Any) -> bool:
     if isinstance(value, Mapping):
         return (
@@ -578,8 +610,8 @@ class ToolBridge:
         except Exception:
             return None, "booking_scope_unverified"
         if (
-            str(verified_booking.get("customer_name") or "").casefold() != trusted_name.casefold()
-            or str(verified_booking.get("customer_phone") or "").strip() != trusted_phone
+            _canonical_name(verified_booking.get("customer_name")) != _canonical_name(trusted_name)
+            or _canonical_phone(verified_booking.get("customer_phone")) != _canonical_phone(trusted_phone)
             or str(verified_booking.get("status") or "").casefold() != "confirmed"
         ):
             return None, "booking_scope_unverified"
@@ -587,6 +619,54 @@ class ToolBridge:
             "booking_id": booking_id,
             "customer_name": trusted_name,
             "customer_phone": trusted_phone,
+        }, ""
+
+    async def _initial_booking_identity(
+        self, arguments: Mapping[str, Any]
+    ) -> tuple[dict[str, Any] | None, str]:
+        if not self.session_id:
+            return None, "booking_scope_unverified"
+        try:
+            booking_id = int(arguments.get("booking_id") or 0)
+        except (TypeError, ValueError):
+            booking_id = 0
+        customer_name = str(arguments.get("customer_name") or "").strip()
+        customer_phone = str(arguments.get("customer_phone") or "").strip()
+        if not customer_phone or (not booking_id and not customer_name):
+            return None, "booking_scope_unverified"
+        try:
+            from app.services.restaurant import restaurant_service
+
+            verified = await restaurant_service.lookup_booking(
+                booking_id=booking_id,
+                customer_name="" if booking_id else customer_name,
+                customer_phone=customer_phone,
+            )
+            if customer_name and _canonical_name(verified.get("customer_name")) != _canonical_name(customer_name):
+                return None, "booking_scope_unverified"
+            await restaurant_service.persist_call_state(
+                self.session_id,
+                {
+                    "booking_id": verified["booking_id"],
+                    "customer_name": verified["customer_name"],
+                    "customer_phone": verified["customer_phone"],
+                    "booking_date": verified.get("date") or "",
+                    "booking_time": verified.get("time") or "",
+                    "party_size": verified.get("party_size") or 0,
+                    "draft_status": "confirmed",
+                },
+                caller_phone=str(verified.get("customer_phone") or ""),
+            )
+            from app.call_memory import apply_live_booking_to_memory, hydrate_call_memory
+
+            await hydrate_call_memory(self.session_id)
+            apply_live_booking_to_memory(self.session_id, verified)
+        except Exception:
+            return None, "booking_scope_unverified"
+        return {
+            "booking_id": int(verified["booking_id"]),
+            "customer_name": str(verified.get("customer_name") or ""),
+            "customer_phone": str(verified.get("customer_phone") or ""),
         }, ""
 
     async def _scoped_booking_arguments(
@@ -603,26 +683,39 @@ class ToolBridge:
                 scoped.pop("customer_name", None)
                 scoped.pop("customer_phone", None)
                 return scoped, ""
-            try:
-                from app.call_memory import get_call_memory, hydrate_call_memory
+            from app.call_memory import get_call_memory, hydrate_call_memory
 
+            try:
                 await hydrate_call_memory(self.session_id)
                 memory = get_call_memory(self.session_id)
                 if int(memory.get("booking_id") or 0):
                     return None, "booking_scope_unverified"
+            except Exception:
+                return None, "booking_scope_unverified"
+            try:
                 from app.services.restaurant import restaurant_service
 
                 await restaurant_service.get_order_summary(call_id=self.session_id)
+            except Exception as exc:
+                if getattr(exc, "code", "") != "order_not_found":
+                    return None, "booking_scope_unverified"
+            else:
                 return None, "booking_scope_unverified"
-            except (TypeError, ValueError):
-                return None, "booking_scope_unverified"
-            except Exception:
-                pass
             scoped = dict(arguments)
             scoped["session_id"] = self.session_id
             scoped["booking_id"] = 0
             scoped.pop("customer_name", None)
             scoped.pop("customer_phone", None)
+            return scoped, ""
+        if name == "lookup_booking":
+            trusted, error = await self._verified_booking_identity()
+            if error:
+                trusted, error = await self._initial_booking_identity(arguments)
+            if error:
+                return None, error
+            scoped = dict(arguments)
+            scoped.update(trusted or {})
+            scoped.pop("session_id", None)
             return scoped, ""
         trusted, error = await self._verified_booking_identity()
         if error:
@@ -637,7 +730,13 @@ class ToolBridge:
                 return None, "booking_scope_mismatch"
         for key in ("customer_name", "customer_phone"):
             supplied = str(arguments.get(key) or "").strip()
-            if supplied and supplied.casefold() != str(trusted[key]).casefold():
+            if not supplied:
+                continue
+            if key == "customer_phone":
+                matches = _canonical_phone(supplied) == _canonical_phone(trusted[key])
+            else:
+                matches = _canonical_name(supplied) == _canonical_name(trusted[key])
+            if not matches:
                 return None, "booking_scope_mismatch"
         scoped = dict(arguments)
         scoped.update(trusted)
@@ -664,7 +763,9 @@ class ToolBridge:
             from app.services.restaurant import restaurant_service
 
             current = await restaurant_service.get_order_summary(call_id=self.session_id)
-        except Exception:
+        except Exception as exc:
+            if getattr(exc, "code", "") != "order_not_found":
+                return None, "order_scope_unverified"
             current = None
         if name == "lookup_order":
             if not isinstance(current, Mapping):
@@ -915,23 +1016,58 @@ class ToolBridge:
                         return False
                 if name == "set_order_fulfillment" and readback.get("fulfillment_type") != arguments.get("fulfillment_type"):
                     return False
+                if name == "set_order_fulfillment":
+                    details = readback.get("fulfillment_details")
+                    if not isinstance(details, Mapping):
+                        return False
+                    for argument_key, readback_key in (
+                        ("delivery_address", "address"),
+                        ("delivery_instructions", "instructions"),
+                    ):
+                        if argument_key in arguments and arguments[argument_key] is not None:
+                            if str(details.get(readback_key) or "").strip() != str(arguments[argument_key] or "").strip():
+                                return False
+                    if "booking_id" in arguments and arguments["booking_id"] not in (None, "", 0):
+                        if int(readback.get("booking_id") or 0) != int(arguments["booking_id"]):
+                            return False
                 if name == "set_order_notes":
                     for field in ("order_notes", "allergy_notes"):
-                        if field in arguments and arguments[field] is not None and readback.get(field) != arguments[field]:
+                        if field in arguments and arguments[field] is not None and str(readback.get(field) or "").strip() != str(arguments[field] or "").strip():
                             return False
                 if name == "add_order_item" and arguments.get("item_name"):
+                    result_item_id = result.get("order_item_id") if isinstance(result, Mapping) else None
                     committed = [
                         item
                         for item in readback["items"]
-                        if str(item.get("item_name") or "").casefold() == str(arguments["item_name"]).casefold()
+                        if (
+                            result_item_id not in (None, "")
+                            and str(item.get("order_item_id")) == str(result_item_id)
+                        )
+                        or (
+                            result_item_id in (None, "")
+                            and str(item.get("item_name") or "").casefold()
+                            == str(arguments["item_name"]).casefold()
+                        )
                     ]
                     if not committed:
                         return False
-                    if arguments.get("quantity") is not None and not any(
-                        int(item.get("quantity") or 0) >= int(arguments["quantity"])
-                        for item in committed
-                    ):
+                    item = committed[0]
+                    if str(item.get("item_name") or "").casefold() != str(arguments["item_name"]).casefold():
                         return False
+                    if arguments.get("quantity") is not None and int(item.get("quantity") or 0) != int(arguments["quantity"]):
+                        return False
+                    for argument_key, readback_key in (
+                        ("modifier_ids", "modifiers"),
+                        ("removals", "removals"),
+                        ("substitutions", "substitutions"),
+                    ):
+                        if argument_key in arguments and _canonical_effect_values(arguments[argument_key]) != _canonical_effect_values(item.get(readback_key)):
+                            return False
+                    if "notes" in arguments and arguments["notes"] is not None and str(item.get("notes") or "").strip() != str(arguments["notes"] or "").strip():
+                        return False
+                    for field in ("order_notes", "allergy_notes"):
+                        if field in arguments and arguments[field] is not None and str(readback.get(field) or "").strip() != str(arguments[field] or "").strip():
+                            return False
                 if name == "update_order_item" and arguments.get("order_item_id"):
                     matching = [
                         item
@@ -943,7 +1079,7 @@ class ToolBridge:
                     item = matching[0]
                     if arguments.get("quantity") is not None and int(item.get("quantity") or 0) != int(arguments["quantity"]):
                         return False
-                    if "notes" in arguments and arguments["notes"] is not None and item.get("notes") != arguments["notes"]:
+                    if "notes" in arguments and arguments["notes"] is not None and str(item.get("notes") or "").strip() != str(arguments["notes"] or "").strip():
                         return False
                 if name == "remove_order_item" and arguments.get("order_item_id"):
                     ids = {str(item.get("order_item_id")) for item in readback["items"] + readback["proposed_items"]}
@@ -970,8 +1106,56 @@ class ToolBridge:
                 if name in {"create_booking", "update_confirmed_booking"} and readback.get("status") != "confirmed":
                     return False
                 for argument_key, readback_key in (("name", "customer_name"), ("customer_name", "customer_name"), ("phone", "customer_phone"), ("customer_phone", "customer_phone"), ("date", "date"), ("time", "time"), ("party_size", "party_size")):
-                    if argument_key in arguments and arguments[argument_key] not in (None, "") and readback.get(readback_key) != arguments[argument_key]:
+                    if argument_key not in arguments or arguments[argument_key] in (None, ""):
+                        continue
+                    expected = arguments[argument_key]
+                    actual = readback.get(readback_key)
+                    if readback_key == "customer_name":
+                        matches = _canonical_name(actual) == _canonical_name(expected)
+                    elif readback_key == "customer_phone":
+                        matches = _canonical_phone(actual) == _canonical_phone(expected)
+                    elif readback_key == "party_size":
+                        try:
+                            matches = int(actual) == int(expected)
+                        except (TypeError, ValueError):
+                            matches = False
+                    else:
+                        matches = str(actual or "").strip().casefold() == str(expected).strip().casefold()
+                    if not matches:
                         return False
+                if isinstance(result, Mapping):
+                    for field in ("booking_id", "customer_name", "customer_phone", "date", "time", "party_size", "location", "notes", "table_number"):
+                        if field not in result or field not in readback or result[field] in (None, ""):
+                            continue
+                        if field == "customer_name":
+                            matches = _canonical_name(result[field]) == _canonical_name(readback[field])
+                        elif field == "customer_phone":
+                            matches = _canonical_phone(result[field]) == _canonical_phone(readback[field])
+                        elif field == "party_size":
+                            matches = int(result[field]) == int(readback[field])
+                        else:
+                            matches = str(result[field]).strip().casefold() == str(readback[field]).strip().casefold()
+                        if not matches:
+                            return False
+                if arguments.get("preferred_location"):
+                    if _canonical_name(readback.get("location")) != _canonical_name(arguments["preferred_location"]):
+                        return False
+                stored_notes = str(readback.get("notes") or "").casefold()
+                for argument_key in ("notes", "extra_notes"):
+                    if arguments.get(argument_key):
+                        if str(arguments[argument_key]).strip().casefold() not in stored_notes:
+                            return False
+                for argument_key, marker in (
+                    ("seating_preference", "seating"),
+                    ("seating_backup", "backup seating"),
+                    ("seating_avoid", "avoid"),
+                    ("dietary", "dietary"),
+                    ("occasion", "occasion"),
+                ):
+                    if arguments.get(argument_key):
+                        expected_note = f"{marker}: {arguments[argument_key]}".casefold()
+                        if expected_note not in stored_notes:
+                            return False
                 if name == "add_guest_note":
                     note = str(arguments.get("note") or "").casefold()
                     stored = " ".join(str(readback.get(key) or "") for key in ("notes", "guest_notes")).casefold()
