@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import hashlib
 import json
 import re
@@ -1750,7 +1752,7 @@ class ToolBridge:
                 "pending_confirmation_hash", "booked_at", "timezone", "reference", "booking_reference", "table_number",
             ):
                 if key in value:
-                    facts[key] = value[key]
+                    facts[key] = deepcopy(value[key])
             for key in ("evidence_source", "evidence_version"):
                 if value.get(key) not in (None, ""):
                     facts[key] = value[key]
@@ -1801,7 +1803,7 @@ class ToolBridge:
                             if item.get("name") and item.get("available") is not None
                         }
                         availability = [item.get("available") for item in canonical_items]
-                        if len(availability) == 1:
+                        if len(availability) == 1 and availability[0] is not None:
                             facts["availability"] = "available" if availability[0] is True else "unavailable"
             if isinstance(value.get("match"), Mapping):
                 match = value["match"]

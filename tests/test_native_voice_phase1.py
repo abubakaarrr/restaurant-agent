@@ -1744,9 +1744,9 @@ def test_native_order_confirmation_reads_back_all_item_effects():
         )
     )
 
-    assert "modifiers ['fries']" in sentence
-    assert "removals ['onion jam']" in sentence
-    assert "substitutions ['gluten-free bun']" in sentence
+    assert "with fries" in sentence
+    assert "without onion jam" in sentence
+    assert "substitutions gluten-free bun" in sentence
     assert "note cut in half" in sentence
 
 
@@ -1982,3 +1982,40 @@ def test_failed_write_does_not_silence_grounded_recovery_or_authorize_success():
                              evidence=evidence, current_state_version=2)
     assert not rejected.allowed
     assert "success_claim_without_matching_readback" in rejected.reasons
+
+
+def test_menu_facts_do_not_mutate_authoritative_readback():
+    readback = {"items": [{"item_id": "burger", "item_name": "Hearth Burger", "modifiers": [
+        {"option_id": "modifier.side-fries", "name": "hearth fries", "kind": "side_choice"}
+    ]}]}
+    before = json.dumps(readback, sort_keys=True)
+    facts = ToolBridge._facts({}, readback, {})
+    assert json.dumps(readback, sort_keys=True) == before
+    assert "availability" not in facts
+    safe = NativeVoiceAdapter._safe_model_facts(facts)
+    assert safe["canonical_items"][0]["modifiers"][0]["name"] == "hearth fries"
+    speech = NativeVoiceAdapter._format_order_item(safe["canonical_items"][0])
+    assert "with hearth fries" in speech
+    assert "option_id" not in speech and "{" not in speech
+
+
+@pytest.mark.asyncio
+async def test_unchanged_readback_preserves_newer_summary_evidence_version():
+    store = InMemoryOrderStateStore()
+    adapter = NativeVoiceAdapter(
+        session_id="call-1", transport=MemoryRealtimeTransport(),
+        state_store=store, tool_bridge=ToolBridge(FakeExecutor()),
+    )
+    adapter._completed_turn = CompletedCallerTurn("same-turn", 1, "one burger please", 0.0)
+    adapter._outcomes = [ToolOutcome(
+        name="add_order_item", call_id="add", arguments={}, result={},
+        success=True, readback_verified=True,
+        readback=order_readback(items=[{
+            "item_id": "burger", "item_name": "Hearth Burger", "quantity": 1,
+            "order_item_id": 1, "modifiers": ["fries"],
+        }]),
+    )]
+    first = await adapter._sync_order_memory()
+    second = await adapter._sync_order_memory()
+    assert first == second
+    assert first.version == (await store.load("call-1")).version
