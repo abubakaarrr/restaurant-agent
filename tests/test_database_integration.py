@@ -80,7 +80,7 @@ async def isolated_database(monkeypatch: pytest.MonkeyPatch):
 
 
 def _future_date() -> str:
-    candidate = (datetime.now() + timedelta(days=30)).date()
+    candidate = date(2026, 9, 8) + timedelta(days=30)
     excluded = {"2026-10-18", "2026-11-26", "2026-12-24"}
     while candidate.weekday() == 0 or candidate.isoformat() in excluded:
         candidate += timedelta(days=1)

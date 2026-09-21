@@ -28,6 +28,8 @@ from app.reservation_draft import (
     DRAFT_STATUS_CONFIRMED,
     compose_notes,
     coerce_draft,
+    draft_from_booking,
+    AmbiguousBookingNotes,
     flatten_draft,
     merge_note_text,
     normalize_preferred_location,
@@ -51,6 +53,7 @@ from app.pending_confirmation import (
     get_pending_confirmation,
     order_confirmation_payload,
     pending_state_patch,
+    payload_hash,
     register_pending_confirmation,
     require_pending_confirmation,
     update_booking_confirmation_payload,
@@ -92,6 +95,17 @@ class RestaurantServiceError(Exception):
         self.message = message
         self.code = code
         self.status = status
+
+
+def _native_booking_draft(
+    booking: Mapping[str, Any], note_updates: Mapping[str, Any]
+) -> JsonDict:
+    try:
+        return draft_from_booking(booking, note_updates=note_updates)
+    except AmbiguousBookingNotes as exc:
+        raise RestaurantServiceError(
+            str(exc), code="booking_notes_ambiguous", status=409
+        ) from exc
 
 
 class WritesDisabledError(RestaurantServiceError):
@@ -317,8 +331,12 @@ def _ensure_order_item_available_at(
 class RestaurantService:
     """Database-backed, provider-neutral restaurant operations."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, pool_provider: Callable[[], Awaitable[Any]] | None = None) -> None:
         self._seating_limits: JsonDict | None = None
+        self._pool_provider = pool_provider
+
+    async def _get_pool(self) -> Any:
+        return await (self._pool_provider or get_pool)()
 
     @staticmethod
     def _require_call_id(call_id: str) -> str:
@@ -468,11 +486,89 @@ class RestaurantService:
         caller_phone: str = "",
     ) -> None:
         call_id = self._require_call_id(call_id)
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             await self._merge_session_state(
                 conn, call_id, patch, caller_phone=caller_phone
             )
+
+    async def load_call_state(self, call_id: str) -> dict[str, Any]:
+        call_id = self._require_call_id(call_id)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT caller_phone, state FROM call_sessions WHERE session_id = $1",
+                call_id,
+            )
+        if not row:
+            return {"caller_phone": "", "state": {}}
+        return {
+            "caller_phone": str(row["caller_phone"] or ""),
+            "state": self._coerce_state(row["state"]),
+        }
+
+    async def hydrate_native_call_memory(self, call_id: str) -> dict[str, Any]:
+        state = await self.load_call_state(call_id)
+        from app.call_memory import update_call_memory
+
+        persisted = state.get("state") or {}
+        update_call_memory(
+            call_id,
+            pending_confirmations=persisted.get("pending_confirmations") or {},
+            confirmation_turn=persisted.get("confirmation_turn") or 0,
+            last_turn_affirmation=persisted.get("last_turn_affirmation") or "unclear",
+        )
+        return state
+
+    async def get_reservation_draft(
+        self, call_id: str, *, arm_confirmation: bool = False
+    ) -> JsonDict:
+        state = (await self.load_call_state(call_id)).get("state") or {}
+        draft = coerce_draft(state.get("reservation_draft") or state)
+        if arm_confirmation and not int(draft.get("booking_id") or 0):
+            required = {
+                "customer_name": str(draft.get("customer_name") or "").strip(),
+                "customer_phone": str(draft.get("customer_phone") or "").strip(),
+                "date": str(draft.get("date") or "").strip(),
+                "time": str(draft.get("time") or "").strip(),
+                "party_size": int(draft.get("party_size") or 0),
+            }
+            if all(required[key] for key in ("customer_name", "customer_phone", "date", "time")) and required["party_size"] > 0:
+                payload = booking_confirmation_payload(
+                    **required,
+                    notes=compose_notes(draft),
+                )
+                digest = register_pending_confirmation(call_id, ACTION_CREATE_BOOKING, payload)
+                draft = {
+                    **draft,
+                    "readback_required": True,
+                    "pending_confirmation_hash": digest,
+                    "proposed": payload,
+                }
+        return draft
+
+    async def update_reservation_draft_native(
+        self, call_id: str, updates: Mapping[str, Any]
+    ) -> JsonDict:
+        state = (await self.load_call_state(call_id)).get("state") or {}
+        current = coerce_draft(state.get("reservation_draft") or state)
+        if (
+            int(current.get("booking_id") or 0) > 0
+            and str(current.get("status") or "") == DRAFT_STATUS_CONFIRMED
+        ):
+            raise RestaurantServiceError(
+                "This reservation is already confirmed; use the confirmed booking flow.",
+                code="confirmed_booking_draft",
+            )
+        draft = patch_draft(current, dict(updates))
+        await self.persist_call_state(
+            call_id,
+            {
+                **flatten_draft(draft, guest_notes=str(state.get("guest_notes") or "")),
+            },
+            caller_phone=str(draft.get("customer_phone") or ""),
+        )
+        return draft
 
     def _table_select_sql(self, *, for_update: bool, require_location_match: bool) -> str:
         lock = "FOR UPDATE OF t SKIP LOCKED" if for_update else ""
@@ -516,7 +612,7 @@ class RestaurantService:
         call_id = self._require_call_id(call_id)
         request_hash = canonical_request_hash(payload)
 
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 inserted = await conn.fetchrow(
@@ -639,7 +735,7 @@ class RestaurantService:
         if conn is not None:
             rows = await conn.fetch(sql, *args)
             return [dict(row) for row in rows]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as acquired:
             rows = await acquired.fetch(sql, *args)
         return [dict(row) for row in rows]
@@ -655,7 +751,7 @@ class RestaurantService:
         if conn is not None:
             rows = await conn.fetch(sql)
         else:
-            pool = await get_pool()
+            pool = await self._get_pool()
             async with pool.acquire() as acquired:
                 rows = await acquired.fetch(sql)
         by_location = {
@@ -1181,31 +1277,123 @@ class RestaurantService:
                 "Provide a new date, time, party size, name, or note field to update.",
                 code="empty_update",
             )
+        effective_date = date
+        effective_time = time
+        effective_party = party_size
+        effective_name = new_name
+        effective_location = preferred_location or ""
+        effective_notes = extra_notes if extra_notes is not None else notes
+        native_live_booking: JsonDict | None = None
+        native_proposed_draft: JsonDict | None = None
+        current_party = 0
+        if self._pool_provider is not None:
+            native_live_booking = await self.lookup_booking(booking_id=booking_id)
+            if str(native_live_booking.get("status") or "") != DRAFT_STATUS_CONFIRMED:
+                raise RestaurantServiceError(
+                    "Only a confirmed booking can be updated.",
+                    code="booking_not_updatable",
+                    status=409,
+                )
+            effective_date = effective_date or str(native_live_booking.get("date") or "")
+            effective_time = effective_time or str(native_live_booking.get("time") or "")
+            current_party = int(native_live_booking.get("party_size") or 0)
+            effective_party = effective_party or current_party
+            effective_name = effective_name or str(native_live_booking.get("customer_name") or "")
+            effective_location = (
+                effective_location
+                or draft_preferred_location(seating_preference or "")
+                or str(native_live_booking.get("location") or "")
+            )
+            base_draft = _native_booking_draft(native_live_booking, note_updates)
+            native_patch_updates = {
+                **note_updates,
+                **({"customer_name": new_name} if new_name else {}),
+                **({"date": date} if date else {}),
+                **({"time": time} if time else {}),
+                **({"party_size": party_size} if party_size else {}),
+                **(
+                    {"require_approval_for_paid_items": require_approval_for_paid_items}
+                    if require_approval_for_paid_items is not None
+                    else {}
+                ),
+            }
+            native_proposed_draft = patch_draft(
+                base_draft,
+                native_patch_updates,
+            )
+            effective_date = str(native_proposed_draft.get("date") or "")
+            effective_time = str(native_proposed_draft.get("time") or "")
+            effective_party = int(native_proposed_draft.get("party_size") or 0)
+            effective_name = str(native_proposed_draft.get("customer_name") or "")
+            effective_location = (
+                preferred_location
+                or draft_preferred_location(native_proposed_draft)
+                or str(native_live_booking.get("location") or "")
+            )
+            effective_notes = compose_notes(native_proposed_draft)
+            date = effective_date
+            time = effective_time
+            party_size = effective_party
         confirmation_payload = update_booking_confirmation_payload(
             booking_id=booking_id,
-            date=date,
-            time=time,
-            party_size=party_size,
-            preferred_location=preferred_location or "",
-            seating_preference=seating_preference,
-            seating_backup=seating_backup,
-            seating_avoid=seating_avoid,
-            dietary=dietary,
-            occasion=occasion,
-            extra_notes=extra_notes if extra_notes is not None else notes,
-            customer_name=new_name,
-            require_approval_for_paid_items=require_approval_for_paid_items,
+            date=effective_date,
+            time=effective_time,
+            party_size=effective_party,
+            preferred_location=effective_location,
+            seating_preference=(
+                native_proposed_draft.get("seating_preference")
+                if native_proposed_draft is not None
+                else seating_preference
+            ),
+            seating_backup=(
+                native_proposed_draft.get("seating_backup")
+                if native_proposed_draft is not None
+                else seating_backup
+            ),
+            seating_avoid=(
+                native_proposed_draft.get("seating_avoid")
+                if native_proposed_draft is not None
+                else seating_avoid
+            ),
+            dietary=(
+                native_proposed_draft.get("dietary")
+                if native_proposed_draft is not None
+                else dietary
+            ),
+            occasion=(
+                native_proposed_draft.get("occasion")
+                if native_proposed_draft is not None
+                else occasion
+            ),
+            extra_notes=(
+                native_proposed_draft.get("extra_notes")
+                if native_proposed_draft is not None
+                else extra_notes if extra_notes is not None else notes
+            ),
+            notes=effective_notes if native_proposed_draft is not None else None,
+            customer_name=effective_name,
+            customer_phone=(
+                native_live_booking.get("customer_phone")
+                if native_live_booking is not None
+                else None
+            ),
+            require_approval_for_paid_items=(
+                native_proposed_draft.get("require_approval_for_paid_items")
+                if native_proposed_draft is not None
+                else require_approval_for_paid_items
+            ),
         )
         # Party-size edits must cite a fresh check_table_availability for that size.
         if party_size > 0:
             from app.availability_offer import require_fresh_availability_for_party_change
             from app.call_memory import get_reservation_draft as _load_draft
 
-            draft_now = _load_draft(call_id)
-            current_party = int(draft_now.get("party_size") or 0)
+            if self._pool_provider is None:
+                draft_now = _load_draft(call_id)
+                current_party = int(draft_now.get("party_size") or 0)
             if party_size != current_party:
-                slot_date = date or str(draft_now.get("date") or "")
-                slot_time = time or str(draft_now.get("time") or "")
+                slot_date = effective_date
+                slot_time = effective_time
                 require_fresh_availability_for_party_change(
                     call_id,
                     date=slot_date,
@@ -1246,9 +1434,14 @@ class RestaurantService:
             "date": date,
             "time": time,
             "party_size": party_size,
-            "preferred_location": preferred_location or "",
-            "customer_name": new_name,
-            "require_approval_for_paid_items": require_approval_for_paid_items,
+            "preferred_location": effective_location,
+            "customer_name": effective_name,
+            "require_approval_for_paid_items": (
+                native_proposed_draft.get("require_approval_for_paid_items")
+                if native_proposed_draft is not None
+                else require_approval_for_paid_items
+            ),
+            "notes": effective_notes,
             **note_updates,
         }
         # Fail closed before opening a DB transaction when the gate is not satisfied.
@@ -1263,7 +1456,8 @@ class RestaurantService:
             row = await conn.fetchrow(
                 """
                 SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
-                       b.party_size, b.status, b.notes, b.table_id,
+                       b.party_size, b.status, b.notes,
+                       b.require_approval_for_paid_items, b.table_id,
                        t.table_number, t.location
                 FROM bookings b
                 LEFT JOIN tables t ON t.id = b.table_id
@@ -1300,11 +1494,63 @@ class RestaurantService:
                         raw = {}
                 if isinstance(raw, dict):
                     session_state = dict(raw)
-            draft = coerce_draft(session_state.get("reservation_draft") or session_state)
+            if self._pool_provider is not None:
+                draft = _native_booking_draft(
+                    {
+                        "booking_id": booking_id,
+                        "customer_name": row["customer_name"] or "",
+                        "customer_phone": row["customer_phone"] or "",
+                        "booked_at": row["booked_at"],
+                        "party_size": int(row["party_size"] or 0),
+                        "status": row["status"],
+                        "notes": row["notes"] or "",
+                        "require_approval_for_paid_items": row[
+                            "require_approval_for_paid_items"
+                        ],
+                    },
+                    note_updates,
+                )
+                draft = patch_draft(draft, native_patch_updates)
+                locked_payload = update_booking_confirmation_payload(
+                    booking_id=booking_id,
+                    date=draft["date"],
+                    time=draft["time"],
+                    party_size=draft["party_size"],
+                    preferred_location=(
+                        preferred_location
+                        or draft_preferred_location(draft)
+                        or str(row["location"] or "")
+                    ),
+                    seating_preference=draft.get("seating_preference"),
+                    seating_backup=draft.get("seating_backup"),
+                    seating_avoid=draft.get("seating_avoid"),
+                    dietary=draft.get("dietary"),
+                    occasion=draft.get("occasion"),
+                    extra_notes=draft.get("extra_notes"),
+                    notes=compose_notes(draft),
+                    customer_name=draft.get("customer_name") or "",
+                    customer_phone=draft.get("customer_phone") or "",
+                    require_approval_for_paid_items=draft.get(
+                        "require_approval_for_paid_items"
+                    ),
+                )
+                if payload_hash(locked_payload) != payload_hash(confirmation_payload):
+                    raise RestaurantServiceError(
+                        "The booking changed after its readback. Read it back again before approving.",
+                        code="pending_confirmation_mismatch",
+                        status=409,
+                    )
+            else:
+                draft = coerce_draft(session_state.get("reservation_draft") or session_state)
             booked_at = row["booked_at"]
-            new_date = date or booked_at.date().isoformat()
-            new_time = time or booked_at.strftime("%H:%M")
-            new_party = party_size or int(row["party_size"])
+            if self._pool_provider is not None:
+                new_date = draft.get("date") or booked_at.date().isoformat()
+                new_time = draft.get("time") or booked_at.strftime("%H:%M")
+                new_party = int(draft.get("party_size") or row["party_size"])
+            else:
+                new_date = date or booked_at.date().isoformat()
+                new_time = time or booked_at.strftime("%H:%M")
+                new_party = party_size or int(row["party_size"])
             location_pref = preferred_location or draft_preferred_location(
                 seating_preference if seating_preference is not None else draft
             )
@@ -1395,19 +1641,20 @@ class RestaurantService:
                     booking_id,
                 )
 
-            draft = patch_draft(
-                draft,
-                {
-                    "customer_name": updated_name,
-                    "customer_phone": row["customer_phone"] or "",
-                    "date": new_date,
-                    "time": new_time,
-                    "party_size": new_party,
-                    "booking_id": booking_id,
-                    "status": DRAFT_STATUS_CONFIRMED,
-                    **note_updates,
-                },
-            )
+            if self._pool_provider is None:
+                draft = patch_draft(
+                    draft,
+                    {
+                        "customer_name": updated_name,
+                        "customer_phone": row["customer_phone"] or "",
+                        "date": new_date,
+                        "time": new_time,
+                        "party_size": new_party,
+                        "booking_id": booking_id,
+                        "status": DRAFT_STATUS_CONFIRMED,
+                        **note_updates,
+                    },
+                )
             rebuilt_notes = compose_notes(draft)
             if require_approval_for_paid_items is not None:
                 draft = patch_draft(
@@ -1621,13 +1868,14 @@ class RestaurantService:
         customer_phone: str = "",
     ) -> JsonDict:
         phone = self._validate_phone(customer_phone) if customer_phone else ""
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             if booking_id:
                 row = await conn.fetchrow(
                     """
                     SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
-                           b.party_size, b.status, b.notes, t.table_number, t.location
+                           b.party_size, b.status, b.notes,
+                           b.require_approval_for_paid_items, t.table_number, t.location
                     FROM bookings b
                     LEFT JOIN tables t ON t.id = b.table_id
                     WHERE b.id = $1
@@ -1639,7 +1887,8 @@ class RestaurantService:
                 row = await conn.fetchrow(
                     """
                     SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
-                           b.party_size, b.status, b.notes, t.table_number, t.location
+                           b.party_size, b.status, b.notes,
+                           b.require_approval_for_paid_items, t.table_number, t.location
                     FROM bookings b
                     LEFT JOIN tables t ON t.id = b.table_id
                     WHERE LOWER(b.customer_name) = LOWER($1)
@@ -1673,6 +1922,9 @@ class RestaurantService:
             "table_number": row["table_number"],
             "location": row["location"] or "",
             "notes": row["notes"] or "",
+            "require_approval_for_paid_items": bool(
+                row["require_approval_for_paid_items"]
+            ),
         }
 
     async def sync_confirmed_draft_from_booking(
@@ -1952,7 +2204,7 @@ class RestaurantService:
                     local_date,
                 )
             if conn is None:
-                pool = await get_pool()
+                pool = await self._get_pool()
                 async with pool.acquire() as active_conn:
                     rows = await fetch_rows(active_conn)
             else:
@@ -2620,9 +2872,11 @@ class RestaurantService:
             "allergy_notes": order["allergy_notes"] or "",
         }
 
-    async def get_order_summary(self, *, call_id: str) -> JsonDict:
+    async def get_order_summary(
+        self, *, call_id: str, arm_confirmation: bool = True
+    ) -> JsonDict:
         call_id = self._require_call_id(call_id)
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             order = await conn.fetchrow(
                 """
@@ -2640,7 +2894,7 @@ class RestaurantService:
                     status=404,
                 )
             result = await self._order_summary_with_conn(conn, order["id"])
-            if result.get("status") == "pending" and result.get("items"):
+            if arm_confirmation and result.get("status") == "pending" and result.get("items"):
                 if result.get("fulfillment") in {"pickup", "delivery"}:
                     _future_fulfillment_at(
                         str(result["fulfillment"]),
@@ -2692,7 +2946,7 @@ class RestaurantService:
                 resolved_booking = None
         if fulfillment == "dine_in" and not resolved_booking:
             # Fall back to active booking in session when switching to dine-in.
-            pool = await get_pool()
+            pool = await self._get_pool()
             async with pool.acquire() as conn:
                 resolved_booking = await self._booking_id_from_session(conn, call_id) or None
             if not resolved_booking:
@@ -3153,7 +3407,7 @@ class RestaurantService:
         if order_id <= 0:
             raise RestaurantServiceError("A valid order_id is required.")
         name = self._validate_name(customer_name)
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             order = await conn.fetchrow(
                 "SELECT id, customer_name FROM orders WHERE id = $1",
@@ -3307,7 +3561,7 @@ class RestaurantService:
         faq_rows: list[JsonDict] = []
         faq_unavailable = False
         try:
-            pool = await get_pool()
+            pool = await self._get_pool()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
@@ -3380,7 +3634,7 @@ class RestaurantService:
         excerpt = " ".join(context_excerpt.split())[:500]
         reply = " ".join(agent_response.split())[:500]
         restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -3412,7 +3666,7 @@ class RestaurantService:
 
     async def list_knowledge_gaps(self) -> JsonDict:
         restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             gaps = await conn.fetch(
                 """
@@ -3480,7 +3734,7 @@ class RestaurantService:
             )
         resolved_by = " ".join(resolved_by.split())[:80] or "admin"
         restaurant_id = get_restaurant_knowledge().identity["restaurant_id"]
-        pool = await get_pool()
+        pool = await self._get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 gap = await conn.fetchrow(

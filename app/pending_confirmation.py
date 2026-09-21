@@ -141,7 +141,9 @@ def update_booking_confirmation_payload(
     dietary: str | None = None,
     occasion: str | None = None,
     extra_notes: str | None = None,
+    notes: str | None = None,
     customer_name: str = "",
+    customer_phone: str | None = None,
     require_approval_for_paid_items: bool | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -159,6 +161,8 @@ def update_booking_confirmation_payload(
         "dietary": dietary,
         "occasion": occasion,
         "extra_notes": extra_notes,
+        "notes": notes,
+        "customer_phone": customer_phone,
         "require_approval_for_paid_items": require_approval_for_paid_items,
     }
     for key, value in optional.items():
@@ -278,6 +282,50 @@ def get_pending_confirmation(
     pending = _pending_map(session_id)
     record = pending.get(action_type)
     return dict(record) if isinstance(record, dict) else None
+
+
+def release_pending_confirmation(
+    session_id: str,
+    action_type: str,
+    confirmation_hash: str,
+    *,
+    response_id: str = "",
+) -> bool:
+    sid = resolve_session_id(session_id)
+    if not sid or not confirmation_hash:
+        return False
+    pending = _pending_map(sid)
+    record = pending.get(action_type)
+    if not isinstance(record, dict) or str(record.get("payload_hash") or "") != confirmation_hash:
+        return False
+    record = dict(record)
+    record["readback_released"] = True
+    record["released_turn"] = current_confirmation_turn(sid)
+    if response_id:
+        record["released_response_id"] = response_id
+    pending[action_type] = record
+    update_call_memory(sid, pending_confirmations=pending)
+    return True
+
+
+def revoke_released_confirmations(session_id: str) -> bool:
+    sid = resolve_session_id(session_id)
+    if not sid:
+        return False
+    pending = _pending_map(sid)
+    changed = False
+    for action, value in list(pending.items()):
+        if not isinstance(value, dict) or not value.get("readback_released"):
+            continue
+        record = dict(value)
+        record.pop("readback_released", None)
+        record.pop("released_turn", None)
+        record.pop("released_response_id", None)
+        pending[action] = record
+        changed = True
+    if changed:
+        update_call_memory(sid, pending_confirmations=pending)
+    return changed
 
 
 def pending_state_patch(session_id: str) -> dict[str, Any]:

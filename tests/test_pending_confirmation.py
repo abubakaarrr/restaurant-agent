@@ -18,7 +18,10 @@ from app.pending_confirmation import (
     clear_pending_confirmation,
     order_confirmation_payload,
     pending_state_patch,
+    get_pending_confirmation,
     register_pending_confirmation,
+    release_pending_confirmation,
+    revoke_released_confirmations,
     require_pending_confirmation,
 )
 
@@ -120,6 +123,26 @@ def test_require_pending_accepts_after_yes_on_later_turn() -> None:
     begin_caller_turn("pc-ok", "yes")
     require_pending_confirmation("pc-ok", ACTION_CREATE_BOOKING, payload)
     assert get_call_memory("pc-ok")["last_turn_affirmation"] == "affirmative"
+
+
+def test_negative_turn_revokes_released_confirmation() -> None:
+    session_id = "pc-revoke-released"
+    clear_call_memory(session_id)
+    payload = booking_confirmation_payload(
+        customer_name="Sam",
+        customer_phone="+14155550100",
+        date="2026-09-01",
+        time="19:00",
+        party_size=2,
+        notes="",
+    )
+    begin_caller_turn(session_id, "please read it back")
+    digest = register_pending_confirmation(session_id, ACTION_CREATE_BOOKING, payload)
+    assert release_pending_confirmation(session_id, ACTION_CREATE_BOOKING, digest)
+    begin_caller_turn(session_id, "no, change the time")
+    assert revoke_released_confirmations(session_id)
+    assert not get_pending_confirmation(session_id, ACTION_CREATE_BOOKING).get("readback_released")
+    clear_call_memory(session_id)
 
 
 def test_cancellation_confirmation_is_not_durable() -> None:

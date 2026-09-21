@@ -1,4 +1,7 @@
 -r requirements.txt
 
+# Development-only server-to-server OpenAI Realtime WebSocket transport.
+websockets>=14.0,<16.0
+
 pytest
 pytest-asyncio
