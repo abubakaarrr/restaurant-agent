@@ -1,0 +1,477 @@
+{
+  "source_freeze": "08b98ab3bfb082728fe5f162d1941eea107cae21",
+  "model": "gpt-realtime",
+  "synthetic_data_only": true,
+  "production_enabled": false,
+  "scenarios": [
+    {
+      "scenario": "simple_order",
+      "source_head": "6e42193173b11e1b8c88ffb46088f1d86b698b02",
+      "report_sha256": "d4118b9346e6a610b0be04912a2487dbcb25c22b89ce0b9542cd32f08cbcad29",
+      "report_directory": "live-contact-safe-diagnostic",
+      "passed": true,
+      "field_checks": {
+        "one_burger": true,
+        "quantity_one": true,
+        "fries_side": true,
+        "pickup": true,
+        "no_unresolved_fields": true
+      },
+      "readback_delivered": true,
+      "interruption_checks": null,
+      "cross_session_denial": null,
+      "turns": [
+        {
+          "input": "warmup",
+          "input_seconds": 1.129,
+          "input_sha256": "8201c13b79c62b95a4f9f0297431f09e38187d94314531bbc6c7df14abfd2df1",
+          "caller_transcript": "Hello.",
+          "assistant_transcript": "Hello. How can I help you today?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 1249.5,
+          "commit_to_provider_first_audio_ms": 655.0,
+          "commit_to_application_audio_ms": 1151.8,
+          "output_audio_seconds": 2.3,
+          "tools": []
+        },
+        {
+          "input": "safe-order",
+          "input_seconds": 15.474,
+          "input_sha256": "3dd8d738ab2df22f574c8078d18f427ba9d88bef209b909c84bdaf3eccb8d00b",
+          "caller_transcript": "I would like one Hearth Burger with fries for pickup. My name is Synthetic Test Guest, and my phone number is 503-555-0112. I have no food allergies. Please read back the full order before placing it.",
+          "assistant_transcript": "Your order is 1 Hearth Burger (with hearth fries); allergy note no food allergies; pickup (scheduled for September 23 at 06:30 PM); total $21.00. Would you like me to confirm this order?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 9473.5,
+          "commit_to_provider_first_audio_ms": 6655.2,
+          "commit_to_application_audio_ms": 9402.3,
+          "output_audio_seconds": 12.45,
+          "tools": [
+            {
+              "name": "check_menu_item_availability",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            },
+            {
+              "name": "add_order_item",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            },
+            {
+              "name": "set_order_notes",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            },
+            {
+              "name": "set_order_fulfillment",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            },
+            {
+              "name": "get_order_summary",
+              "success": true,
+              "readback_verified": true,
+              "pending": true
+            }
+          ]
+        },
+        {
+          "input": "confirm-order",
+          "input_seconds": 4.054,
+          "input_sha256": "d717f2a1cbec8be76b400f3f5b8fabe95538eae335558a2be740238b7a658535",
+          "caller_transcript": "Yes, that is correct. Please place that order.",
+          "assistant_transcript": "Your order is confirmed.",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 2112.2,
+          "commit_to_provider_first_audio_ms": 1608.4,
+          "commit_to_application_audio_ms": 2097.9,
+          "output_audio_seconds": 2.35,
+          "tools": [
+            {
+              "name": "confirm_order",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": "compound_order",
+      "source_head": "6e42193173b11e1b8c88ffb46088f1d86b698b02",
+      "report_sha256": "bbb1b9bfe15fbc437248d4456146eb527820d460d4b67a4b706b14e46ae9cbf7",
+      "report_directory": "live-contact-compound",
+      "passed": true,
+      "field_checks": {
+        "one_burger_line": true,
+        "corrected_quantity_one": true,
+        "fries_side": true,
+        "onion_jam_removed": true,
+        "cut_in_half_note": true,
+        "no_utensils_note": true,
+        "sesame_allergy_note": true,
+        "pickup": true,
+        "no_unresolved_fields": true
+      },
+      "readback_delivered": true,
+      "interruption_checks": null,
+      "cross_session_denial": null,
+      "turns": [
+        {
+          "input": "warmup",
+          "input_seconds": 1.129,
+          "input_sha256": "8201c13b79c62b95a4f9f0297431f09e38187d94314531bbc6c7df14abfd2df1",
+          "caller_transcript": "Hello.",
+          "assistant_transcript": "Hello. How can I help you today?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 1497.6,
+          "commit_to_provider_first_audio_ms": 896.2,
+          "commit_to_application_audio_ms": 1410.8,
+          "output_audio_seconds": 2.2,
+          "tools": []
+        },
+        {
+          "input": "compound-order",
+          "input_seconds": 26.349,
+          "input_sha256": "2644f4141bb3e9aea837fa53f852dee92d0f0a2d44aca08ffe1901ec867a98b8",
+          "caller_transcript": "Hi, I'd like a pickup order. Please add two hearth burgers, each with hearth fries, and remove the onion jam. Actually, make that one burger, not two. Please cut it in half. Put no utensils in the bag. I have a sesame allergy, so record that allergy and check the ingredients. Do not assume removing an ingredient makes it safe. Before placing the order, read back what you have.",
+          "assistant_transcript": "What name and callback phone number should I use for this order?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 2618.7,
+          "commit_to_provider_first_audio_ms": 1917.8,
+          "commit_to_application_audio_ms": 2491.2,
+          "output_audio_seconds": 3.65,
+          "tools": []
+        },
+        {
+          "input": "identity",
+          "input_seconds": 11.188,
+          "input_sha256": "3b7032b363e507b66f7a51753528847856ffe1a8cdd93047ef83a1b8e552a1ae",
+          "caller_transcript": "My name is Synthetic Test Guest. My phone number is 503-555-0112. Please keep all the order changes and notes I already gave you.",
+          "assistant_transcript": "Your order is 1 Hearth Burger (with hearth fries; without onion jam; note cut in half); note no utensils; allergy note sesame allergy; pickup (scheduled for September 23 at 06:30 PM); total $21.00. Would you like me to confirm this order?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 7714.3,
+          "commit_to_provider_first_audio_ms": 4360.0,
+          "commit_to_application_audio_ms": 7666.3,
+          "output_audio_seconds": 16.9,
+          "tools": [
+            {
+              "name": "check_menu_item_availability",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            },
+            {
+              "name": "add_order_item",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            },
+            {
+              "name": "get_order_summary",
+              "success": true,
+              "readback_verified": true,
+              "pending": true
+            }
+          ]
+        },
+        {
+          "input": "confirm-order",
+          "input_seconds": 4.054,
+          "input_sha256": "d717f2a1cbec8be76b400f3f5b8fabe95538eae335558a2be740238b7a658535",
+          "caller_transcript": "Yes, that is correct. Please place that order.",
+          "assistant_transcript": "Your order is confirmed.",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 2182.0,
+          "commit_to_provider_first_audio_ms": 1735.7,
+          "commit_to_application_audio_ms": 2166.1,
+          "output_audio_seconds": 2.25,
+          "tools": [
+            {
+              "name": "confirm_order",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": "negative_grounding",
+      "source_head": "d5d5fda57c9e89b48e46cdec975d542ee6b04688",
+      "report_sha256": "e7659729755d03cf3dcce87a7ba4fbb314d93cd53062658227753095d98b92a1",
+      "report_directory": "live-authoritative-grounding",
+      "passed": true,
+      "field_checks": null,
+      "readback_delivered": null,
+      "interruption_checks": null,
+      "cross_session_denial": null,
+      "turns": [
+        {
+          "input": "warmup",
+          "input_seconds": 1.129,
+          "input_sha256": "8201c13b79c62b95a4f9f0297431f09e38187d94314531bbc6c7df14abfd2df1",
+          "caller_transcript": "Hello.",
+          "assistant_transcript": "Hello. How can I help you today?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 1578.0,
+          "commit_to_provider_first_audio_ms": 792.6,
+          "commit_to_application_audio_ms": 1459.2,
+          "output_audio_seconds": 1.95,
+          "tools": []
+        },
+        {
+          "input": "missing-menu",
+          "input_seconds": 5.004,
+          "input_sha256": "104b1866289d573cf104257114e76e41aa7359a9159cfc46a3990d33801e62d4",
+          "caller_transcript": "Do you sell a Moonstone Dragon Burger? Please check the menu before answering.",
+          "assistant_transcript": "Could you give me the exact menu item name?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 2654.2,
+          "commit_to_provider_first_audio_ms": 2243.9,
+          "commit_to_application_audio_ms": 2627.3,
+          "output_audio_seconds": 2.15,
+          "tools": [
+            {
+              "name": "check_menu_item_availability",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            }
+          ]
+        },
+        {
+          "input": "negative-availability",
+          "input_seconds": 9.163,
+          "input_sha256": "203ee0c4b5d3136d9b5ac2e25776f4f9e35a7270bcc3d135e0e3d8e3d768a143",
+          "caller_transcript": "Can I book a table for two on Monday, September 28th, 2026, at 7 in the evening? Please check whether you are open.",
+          "assistant_transcript": "The restaurant is closed on September 28, 2026. Would you like a different date?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 3309.2,
+          "commit_to_provider_first_audio_ms": 2117.3,
+          "commit_to_application_audio_ms": 3265.1,
+          "output_audio_seconds": 5.35,
+          "tools": [
+            {
+              "name": "check_table_availability",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            }
+          ]
+        }
+      ],
+      "verdict_method": "Manual evidence review: exact safe clarification, exact authoritative closed date, audio released, no booking mutation. Original harness leaves acceptance=false pending this review."
+    },
+    {
+      "scenario": "interruption",
+      "source_head": "6e42193173b11e1b8c88ffb46088f1d86b698b02",
+      "report_sha256": "946f38df6f881733182c1f149f85fad4bc5c5b83d9b01d12f61fa3c26781b762",
+      "report_directory": "live-final-interruption",
+      "passed": true,
+      "field_checks": null,
+      "readback_delivered": null,
+      "interruption_checks": {
+        "generation_advanced": true,
+        "cancelled_turn_released_no_audio": true,
+        "following_turn_responsive": true
+      },
+      "cross_session_denial": null,
+      "turns": [
+        {
+          "input": "warmup",
+          "input_seconds": 1.129,
+          "input_sha256": "8201c13b79c62b95a4f9f0297431f09e38187d94314531bbc6c7df14abfd2df1",
+          "caller_transcript": "Hello.",
+          "assistant_transcript": "Hello. How can I help you today?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 1425.5,
+          "commit_to_provider_first_audio_ms": 779.5,
+          "commit_to_application_audio_ms": 1346.0,
+          "output_audio_seconds": 2.45,
+          "tools": []
+        },
+        {
+          "input": "readback",
+          "input_seconds": 5.544,
+          "input_sha256": "4a70a040239e3f380d8e295871aa963201eb05176dfc4167d3134b96e1e2d5a4",
+          "caller_transcript": "Please read back my complete order, including every change and note, before placing it.",
+          "assistant_transcript": "",
+          "speech_allowed": false,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 2755.1,
+          "commit_to_provider_first_audio_ms": 2682.8,
+          "commit_to_application_audio_ms": null,
+          "output_audio_seconds": 0.0,
+          "tools": []
+        },
+        {
+          "input": "warmup",
+          "input_seconds": 1.129,
+          "input_sha256": "8201c13b79c62b95a4f9f0297431f09e38187d94314531bbc6c7df14abfd2df1",
+          "caller_transcript": "Hello.",
+          "assistant_transcript": "Hello. How can I help you today?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 1153.6,
+          "commit_to_provider_first_audio_ms": 58.5,
+          "commit_to_application_audio_ms": 1149.8,
+          "output_audio_seconds": 2.05,
+          "tools": []
+        }
+      ]
+    },
+    {
+      "scenario": "booking_security",
+      "source_head": "08b98ab3bfb082728fe5f162d1941eea107cae21",
+      "report_sha256": "fcf2b37b1a3eda3f3dd53802432ee24917e2c418776a31ff612bec1452ea8fab",
+      "report_directory": "live-verified-booking",
+      "passed": true,
+      "field_checks": null,
+      "readback_delivered": true,
+      "interruption_checks": null,
+      "cross_session_denial": {
+        "success": false,
+        "error": "booking_scope_unverified",
+        "result_empty": true
+      },
+      "turns": [
+        {
+          "input": "warmup",
+          "input_seconds": 1.129,
+          "input_sha256": "8201c13b79c62b95a4f9f0297431f09e38187d94314531bbc6c7df14abfd2df1",
+          "caller_transcript": "Hello.",
+          "assistant_transcript": "Hello. How can I help you today?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 1210.6,
+          "commit_to_provider_first_audio_ms": 655.9,
+          "commit_to_application_audio_ms": 1104.7,
+          "output_audio_seconds": 2.1,
+          "tools": []
+        },
+        {
+          "input": "booking-request",
+          "input_seconds": 19.083,
+          "input_sha256": "cd62e7d2e4d8ec22e03f8601bcbb982420272741783f94e5dbb1d15bc66f43b7",
+          "caller_transcript": "I'd like to book a table for two on Friday, September 25th, 2026, at 7 p.m. My name is Synthetic Booking Guest and my callback number is 503-555-0108. No special requests. Please read back the details before booking.",
+          "assistant_transcript": "Would you like me to confirm your reservation for 2026-09-25 at 19:00, for 2 guests, under Synthetic Booking Guest, using callback phone +15035550108, with notes No special requests.?",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 7057.1,
+          "commit_to_provider_first_audio_ms": 3428.7,
+          "commit_to_application_audio_ms": 6967.7,
+          "output_audio_seconds": 15.7,
+          "tools": [
+            {
+              "name": "update_reservation_draft",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            },
+            {
+              "name": "get_reservation_draft",
+              "success": true,
+              "readback_verified": true,
+              "pending": true
+            }
+          ]
+        },
+        {
+          "input": "booking-confirm",
+          "input_seconds": 4.769,
+          "input_sha256": "60bc900f7b134127acec29392aadb324b6fdc3ba2438c6eb05e92e97ff1cd133",
+          "caller_transcript": "Yes, those reservation details are correct. Please book it.",
+          "assistant_transcript": "Your reservation is confirmed for 2026-09-25 at 19:00 at main at table 2 for 2 guests.",
+          "speech_allowed": true,
+          "suppression_reasons": [],
+          "turn_elapsed_ms": 3678.4,
+          "commit_to_provider_first_audio_ms": 2155.3,
+          "commit_to_application_audio_ms": 3651.3,
+          "output_audio_seconds": 7.45,
+          "tools": [
+            {
+              "name": "create_booking",
+              "success": true,
+              "readback_verified": true,
+              "pending": false
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "regressions": [
+    {
+      "suite": "native_with_postgresql",
+      "passed": 90,
+      "source_head": "08b98ab3bfb082728fe5f162d1941eea107cae21",
+      "tested_patch_sha256": "cd608c4073836a5e027ad2129a90cf6d5625f70b79b10611610739f0bd2f7bd5",
+      "note": "Exact pre-commit patch; includes six public booking lifecycle variants and cross-session denial."
+    },
+    {
+      "suite": "legacy_database",
+      "passed": 28,
+      "source_head": "6e42193173b11e1b8c88ffb46088f1d86b698b02",
+      "note": "Subsequent changes are confined to native availability rendering and booking access denial."
+    },
+    {
+      "suite": "full_offline_network_disabled",
+      "passed": 352,
+      "skipped": 54,
+      "source_head": "08b98ab3bfb082728fe5f162d1941eea107cae21"
+    }
+  ],
+  "limitations": [
+    "Development-only WebSocket adapter; no production routing, telephony, merge or deployment.",
+    "Small synthetic voice sample, not a human/noise/accent benchmark or a statistical latency campaign.",
+    "Full output buffering before claim verification remains; complete order readbacks took about 7.7-9.5 seconds after caller audio commit in accepted samples.",
+    "One simple-order attempt at 6e42193 ended with RuntimeError before any write. Earlier harness did not retain its terminal cause. One instrumented diagnostic rerun passed; root cause remains unclassified and is retained as a reliability follow-up.",
+    "New sessions cannot look up existing bookings from supplied identity details; trusted ownership provisioning is required outside this development flow."
+  ],
+  "prior_attempts_preserved": [
+    "live-9f2fecb-safe-order",
+    "live-authoritative-booking",
+    "live-authoritative-grounding",
+    "live-b2198f3-safe-order",
+    "live-budget-safe-order",
+    "live-canonical-safe-order",
+    "live-contact-compound",
+    "live-contact-safe-diagnostic",
+    "live-contact-safe-order",
+    "live-evidence-compound",
+    "live-evidence-grounding",
+    "live-evidence-safe-order",
+    "live-final-grounding",
+    "live-final-interruption",
+    "live-isolated-compound",
+    "live-isolated-grounding",
+    "live-isolated-interruption",
+    "live-isolated-safe-order",
+    "live-readable-safe-order",
+    "live-readback-trace",
+    "live-script-grounding",
+    "live-script-interruption",
+    "live-script-safe-order",
+    "live-session-binding-safe-order",
+    "live-verified-booking",
+    "live-version-grounding",
+    "live-version-safe-order"
+  ]
+}
