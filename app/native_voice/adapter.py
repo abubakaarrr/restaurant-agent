@@ -666,6 +666,9 @@ class NativeVoiceAdapter:
                 and (latest.pending or latest.name in {"confirm_order", "create_booking", "cancel_booking", "update_confirmed_booking"})
             ):
                 response_options.update(
+                    # Render this authoritative utterance without competing
+                    # conversational instructions; keep the output in history.
+                    input=[],
                     tool_choice="none",
                     instructions=(
                         "Read the following server-verified restaurant response exactly as written. "
