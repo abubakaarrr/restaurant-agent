@@ -101,6 +101,7 @@ class ToolEvidence:
     replayed: bool = False
     confirmation_text: str = ""
     confirmation_hash: str = ""
+    pending: bool = False
 
     @property
     def speakable(self) -> bool:
@@ -135,10 +136,23 @@ class SpeechGate:
         claims = list(explicit_claims)
 
         envelope_evidence = [item for item in evidence_list if item.confirmation_text]
+        pending_envelope_match = any(
+            item.pending
+            and item.state_version == current_state_version
+            and " ".join((text or "").casefold().split())
+            == " ".join(item.confirmation_text.casefold().split())
+            and item.confirmation_hash
+            and hashlib.sha256(
+                item.confirmation_text.casefold().strip().encode("utf-8")
+            ).hexdigest()
+            == item.confirmation_hash
+            for item in envelope_evidence
+        )
         if envelope_evidence:
             normalized_text = " ".join((text or "").casefold().split())
             if not any(
                 item.state_version == current_state_version
+                and (item.speakable or item.pending)
                 and normalized_text == " ".join(item.confirmation_text.casefold().split())
                 and item.confirmation_hash
                 and hashlib.sha256(
@@ -148,6 +162,8 @@ class SpeechGate:
                 for item in envelope_evidence
             ):
                 reasons.append("confirmation_envelope_mismatch")
+        if pending_envelope_match:
+            return SpeechDecision(allowed=True, text=text, audio=audio)
 
         if _UNCLASSIFIED_SUCCESS.search(text or "") and not any(
             item.speakable
@@ -159,7 +175,7 @@ class SpeechGate:
 
         success_matches = list(_SUCCESS.finditer(text or ""))
         for success_match in success_matches:
-            if not any(
+            if not pending_envelope_match and not any(
                 item.speakable
                 and item.state_version == current_state_version
                 and self._success_action_supports(item.action, success_match.group(0).casefold())
@@ -208,7 +224,7 @@ class SpeechGate:
             ):
                 reasons.append("availability_without_authoritative_evidence")
 
-        if _DATE_TOKEN.search(text or "") or _TIME_TOKEN.search(text or "") or _WEEKDAY_TOKEN.search(text or "") or _BOOKING_REFERENCE_TOKEN.search(text or "") or _PARTY_SIZE_TOKEN.search(text or "") or _LOCATION_TOKEN.search(text or "") or _TABLE_NUMBER_TOKEN.search(text or ""):
+        if not pending_envelope_match and (_DATE_TOKEN.search(text or "") or _TIME_TOKEN.search(text or "") or _WEEKDAY_TOKEN.search(text or "") or _BOOKING_REFERENCE_TOKEN.search(text or "") or _PARTY_SIZE_TOKEN.search(text or "") or _LOCATION_TOKEN.search(text or "") or _TABLE_NUMBER_TOKEN.search(text or "")):
             if not any(
                 item.speakable
                 and item.state_version == current_state_version
@@ -235,7 +251,7 @@ class SpeechGate:
 
         # A response which presents a restaurant fact without a tool result is
         # blocked even when its wording does not match one of the narrow regexes.
-        if _UNSAFE_FACTUAL.search(text or "") and not success_matches and not any(
+        if _UNSAFE_FACTUAL.search(text or "") and not success_matches and not pending_envelope_match and not any(
             item.speakable
             and item.state_version == current_state_version
             and self._subject_matches(text, item.facts)

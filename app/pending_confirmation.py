@@ -280,6 +280,30 @@ def get_pending_confirmation(
     return dict(record) if isinstance(record, dict) else None
 
 
+def release_pending_confirmation(
+    session_id: str,
+    action_type: str,
+    confirmation_hash: str,
+    *,
+    response_id: str = "",
+) -> bool:
+    sid = resolve_session_id(session_id)
+    if not sid or not confirmation_hash:
+        return False
+    pending = _pending_map(sid)
+    record = pending.get(action_type)
+    if not isinstance(record, dict) or str(record.get("payload_hash") or "") != confirmation_hash:
+        return False
+    record = dict(record)
+    record["readback_released"] = True
+    record["released_turn"] = current_confirmation_turn(sid)
+    if response_id:
+        record["released_response_id"] = response_id
+    pending[action_type] = record
+    update_call_memory(sid, pending_confirmations=pending)
+    return True
+
+
 def pending_state_patch(session_id: str) -> dict[str, Any]:
     """Fields to merge into call_sessions.state for cross-request durability."""
     mem = get_call_memory(session_id)

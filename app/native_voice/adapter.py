@@ -189,6 +189,7 @@ class NativeVoiceAdapter:
         self._lifecycle_lock = asyncio.Lock()
         if hasattr(self.tool_bridge, "bind_session"):
             self.tool_bridge.bind_session(session_id)
+        self._native_service = getattr(getattr(self.tool_bridge, "executor", None), "_native_service", None)
 
     async def start(self) -> None:
         if self._started:
@@ -656,6 +657,46 @@ class NativeVoiceAdapter:
 
     @staticmethod
     def _confirmation_sentence(outcome: ToolOutcome) -> str:
+        if outcome.pending:
+            proposed = outcome.result.get("proposed") if isinstance(outcome.result, Mapping) else {}
+            proposed = proposed if isinstance(proposed, Mapping) else {}
+            if outcome.name == "cancel_booking":
+                booking_id = proposed.get("booking_id") or outcome.facts.get("booking_id") or ""
+                customer_name = proposed.get("customer_name") or outcome.facts.get("customer_name") or "the guest"
+                return f"Would you like me to cancel booking reference {booking_id} for {customer_name}?"
+            if outcome.name == "update_confirmed_booking":
+                booking_id = proposed.get("booking_id") or outcome.facts.get("booking_id") or ""
+                return f"Would you like me to apply these changes to booking reference {booking_id}?"
+            if outcome.name == "create_booking":
+                date_value = proposed.get("date") or outcome.facts.get("date") or ""
+                time_value = proposed.get("time") or outcome.facts.get("time") or ""
+                party_size = proposed.get("party_size") or outcome.facts.get("party_size") or ""
+                return f"Would you like me to confirm your reservation for {date_value} at {time_value} for {party_size} guests?"
+            if outcome.name == "get_order_summary":
+                item_text = ", ".join(
+                    f"{int(item.get('quantity') or 1)} {item.get('name') or item.get('item_name') or 'item'}"
+                    for item in outcome.facts.get("canonical_items") or ()
+                    if isinstance(item, Mapping)
+                )
+                details = []
+                if item_text:
+                    details.append(item_text)
+                if outcome.facts.get("order_notes"):
+                    details.append(f"note {outcome.facts['order_notes']}")
+                if outcome.facts.get("allergy_notes"):
+                    details.append(f"allergy note {outcome.facts['allergy_notes']}")
+                if outcome.facts.get("guest_notes"):
+                    details.append(f"guest note {outcome.facts['guest_notes']}")
+                if outcome.facts.get("fulfillment"):
+                    details.append(str(outcome.facts["fulfillment"]))
+                total = outcome.facts.get("total")
+                if total is not None:
+                    details.append(f"total ${float(total):.2f}")
+                order_id = outcome.facts.get("order_id") or proposed.get("order_id") or ""
+                summary = "; ".join(details) or "the current order"
+                return f"Your order is {summary}. Would you like me to confirm order {order_id}?"
+            order_id = outcome.facts.get("order_id") or proposed.get("order_id") or ""
+            return f"Would you like me to confirm order {order_id}?"
         verified = outcome.success and outcome.readback_verified
         clarification_required = outcome.error == "clarification_required"
         exact_item: Mapping[str, Any] | None = None
@@ -710,7 +751,7 @@ class NativeVoiceAdapter:
 
     @staticmethod
     def _with_confirmation(outcome: ToolOutcome) -> ToolOutcome:
-        if outcome.name not in MUTATING_TOOLS:
+        if outcome.name not in MUTATING_TOOLS and not outcome.pending:
             return outcome
         sentence = NativeVoiceAdapter._confirmation_sentence(outcome)
         confirmation_hash = hashlib.sha256(sentence.casefold().strip().encode("utf-8")).hexdigest()
@@ -725,12 +766,22 @@ class NativeVoiceAdapter:
             f"{outcome.name}:{outcome.call_id}:{outcome.state_version}".encode("utf-8")
         ).hexdigest()[:24]
         output = {
-            "status": "completed" if verified else "failed",
+            "status": "pending_confirmation" if outcome.pending else ("completed" if verified else "failed"),
             "result_id": result_id,
             "clarification_state": "required" if clarification_required else "none",
             "speech": sentence,
         }
         safe_facts = NativeVoiceAdapter._safe_model_facts(outcome.facts)
+        safe_facts.setdefault("evidence_version", outcome.state_version)
+        if outcome.pending and isinstance(outcome.result, Mapping):
+            action = "confirm_order" if outcome.name == "get_order_summary" else outcome.name
+            safe_facts["confirmation"] = {
+                "action": action,
+                "resource": NativeVoiceAdapter._operation_resource(outcome),
+                "state_version": outcome.state_version,
+                "payload_hash": str(outcome.result.get("pending_confirmation_hash") or ""),
+                "response_generation": outcome.call_id,
+            }
         if safe_facts:
             output["facts"] = safe_facts
         return output
@@ -743,18 +794,21 @@ class NativeVoiceAdapter:
             "reference", "booking_reference", "booking_id", "party_size",
             "location", "table_number", "order_id", "draft_version", "total",
             "fulfillment", "fulfillment_type", "fulfillment_details", "evidence_version",
+            "order_notes", "allergy_notes", "guest_notes", "unresolved_fields", "proposed_items",
+            "state_version", "readback_required", "pending_confirmation_hash",
         }
         item_allowed = {
             "id", "name", "price", "available", "modifier_options", "ingredients",
             "allergens", "dietary_tags", "customer_safe_answer", "item_name",
             "item_id", "quantity", "order_item_id", "modifiers", "removals", "substitutions",
+            "notes", "unit_price", "subtotal",
         }
 
         def clean(value: Any, *, item: bool = False) -> Any:
             if isinstance(value, Mapping):
                 keys = item_allowed if item else allowed
                 return {
-                    str(key): clean(entry, item=str(key) in {"canonical_items", "items"})
+                    str(key): clean(entry, item=str(key) in {"canonical_items", "items", "proposed_items"})
                     for key, entry in value.items()
                     if str(key) in keys
                 }
@@ -763,10 +817,54 @@ class NativeVoiceAdapter:
             return value
 
         return {
-            key: clean(value, item=key == "canonical_items")
+            key: clean(value, item=key in {"canonical_items", "proposed_items"})
             for key, value in facts.items()
             if key in allowed
         }
+
+    def _native_confirmation_released(self, name: str, arguments: Mapping[str, Any]) -> bool:
+        from app.pending_confirmation import current_confirmation_turn, get_pending_confirmation
+
+        action = "confirm_order" if name == "confirm_order" else name
+        record = get_pending_confirmation(self.session_id, action)
+        if not record or not record.get("readback_released"):
+            return False
+        try:
+            if current_confirmation_turn(self.session_id) <= int(record.get("released_turn") or 0):
+                return False
+        except (AttributeError, TypeError, ValueError):
+            return False
+        payload = record.get("payload") if isinstance(record.get("payload"), Mapping) else {}
+        for key in ("booking_id", "order_id", "reference"):
+            supplied = arguments.get(key)
+            expected = payload.get(key)
+            if supplied not in (None, "", 0) and expected not in (None, "", 0) and str(supplied) != str(expected):
+                return False
+        return True
+
+    async def _release_pending_readbacks(self, text: str, state_version: int) -> None:
+        from app.pending_confirmation import release_pending_confirmation
+
+        normalized = " ".join((text or "").casefold().split())
+        released = False
+        for outcome in self._outcomes:
+            if not outcome.pending or not outcome.confirmation_text:
+                continue
+            if normalized != " ".join(outcome.confirmation_text.casefold().split()):
+                continue
+            if outcome.state_version != state_version or not isinstance(outcome.result, Mapping):
+                continue
+            action = "confirm_order" if outcome.name == "get_order_summary" else outcome.name
+            digest = str(outcome.result.get("pending_confirmation_hash") or "")
+            if release_pending_confirmation(
+                self.session_id,
+                action,
+                digest,
+                response_id=self._response.response_id if self._response else "",
+            ):
+                released = True
+        if released:
+            await self._persist_native_confirmation_state()
 
     def _operation_id(self, name: str, arguments: Mapping[str, Any], turn_id: str) -> str:
         payload = json.dumps(
@@ -1103,6 +1201,21 @@ class NativeVoiceAdapter:
                 error="caller_turn_not_finalized",
                 state_version=self.state.version,
             )
+        if (
+            self._native_service is not None
+            and name in {"create_booking", "update_confirmed_booking", "cancel_booking", "confirm_order"}
+            and bool(args.get("caller_confirmed"))
+            and not self._native_confirmation_released(name, args)
+        ):
+            return ToolOutcome(
+                name=name,
+                call_id=call_id,
+                arguments=dict(args),
+                result=None,
+                success=False,
+                error="confirmation_readback_not_released",
+                state_version=self.state.version,
+            )
         session_token = set_current_session_id(self.session_id)
         scope_token = set_current_action_scope(self._completed_turn.turn_id if self._completed_turn else call_id)
         try:
@@ -1205,6 +1318,8 @@ class NativeVoiceAdapter:
             evidence=[outcome.as_evidence(turn_id=self._completed_turn.turn_id if self._completed_turn else "") for outcome in self._outcomes],
             current_state_version=current.version,
         )
+        if decision.allowed:
+            await self._release_pending_readbacks(text, current.version)
         self.recorder.record({"type": "success_speakable" if decision.allowed else "speech_suppressed", "reasons": list(decision.reasons)})
         return VoiceTurnResult(
             turn=self._completed_turn,

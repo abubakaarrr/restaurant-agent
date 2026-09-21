@@ -105,12 +105,20 @@ def _canonical_name(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
 
 
-def _is_failure(value: Any, *, allow_negative_availability: bool = False) -> bool:
+def _is_failure(
+    value: Any,
+    *,
+    allow_negative_availability: bool = False,
+    authoritative_read: bool = False,
+) -> bool:
     if isinstance(value, Mapping):
         return (
             value.get("ok") is False
             or bool(value.get("error"))
-            or bool(value.get("pending") or value.get("readback_required"))
+            or bool(
+                (value.get("pending") or value.get("readback_required"))
+                and not authoritative_read
+            )
             or bool((value.get("unavailable") and not allow_negative_availability) or value.get("no_op") or value.get("proposed"))
             or any(key in value and value[key] is False for key in ("added", "updated", "removed", "cancelled", "saved"))
         )
@@ -241,6 +249,7 @@ class ToolOutcome:
     confirmation_text: str = ""
     confirmation_hash: str = ""
     operation_id: str = ""
+    pending: bool = False
 
     def as_evidence(self, *, turn_id: str) -> ToolEvidence:
         return ToolEvidence(
@@ -254,6 +263,7 @@ class ToolOutcome:
             replayed=self.replayed,
             confirmation_text=self.confirmation_text,
             confirmation_hash=self.confirmation_hash,
+            pending=self.pending,
         )
 
 
@@ -350,7 +360,11 @@ class RestaurantToolExecutor:
                 customer_name=str(args.get("customer_name") or ""),
             )
         if name == "get_order_summary":
-            return await self._service.get_order_summary(call_id=session_id)
+            result = await self._service.get_order_summary(call_id=session_id)
+            if self._native_service is not None and hasattr(self._service, "load_call_state"):
+                state = (await self._service.load_call_state(session_id)).get("state") or {}
+                result["guest_notes"] = str(state.get("guest_notes") or "")
+            return result
         if name == "create_booking":
             return await self._service.create_booking(
                 call_id=session_id,
@@ -1260,6 +1274,7 @@ class ToolBridge:
                     state_version=prior.state_version,
                     replayed=True,
                     facts=prior.facts,
+                    pending=prior.pending,
                 )
         scoped_args, scope_error = await self._scoped_booking_arguments(name, args)
         if scope_error:
@@ -1314,6 +1329,7 @@ class ToolBridge:
                 state_version=previous.state_version,
                 replayed=True,
                 facts=previous.facts,
+                pending=previous.pending,
             )
 
         if name in MUTATING_TOOLS and turn_id:
@@ -1332,6 +1348,7 @@ class ToolBridge:
                     state_version=prior.state_version,
                     replayed=True,
                     facts=prior.facts,
+                    pending=prior.pending,
                 )
 
         bind_operation_scope = getattr(self.executor, "bind_operation_scope", None)
@@ -1354,6 +1371,7 @@ class ToolBridge:
             success = not _is_failure(
                 result,
                 allow_negative_availability=name in {"check_menu_item_availability", "check_table_availability"},
+                authoritative_read=name not in MUTATING_TOOLS,
             )
             error = str(result) if not success else ""
             if success and name in MUTATING_TOOLS:
@@ -1385,6 +1403,11 @@ class ToolBridge:
             state_version=state_version,
             facts=facts,
             operation_id=operation_id,
+            pending=(
+                isinstance(result, Mapping)
+                and bool(result.get("pending") or result.get("readback_required"))
+                and bool(result.get("pending_confirmation_hash") or result.get("proposed"))
+            ),
         )
         self._calls[call_id] = outcome
         if name in MUTATING_TOOLS and turn_id and outcome.success and outcome.readback_verified:
@@ -1627,17 +1650,20 @@ class ToolBridge:
                 if value.get(key) not in (None, "", 0):
                     facts.setdefault("subject", {})[key] = value[key]
             for key in (
-                "items", "prices", "availability", "booking", "order", "status", "date", "time",
+                "items", "proposed_items", "prices", "availability", "booking", "order", "status", "date", "time",
                 "customer_name", "customer_phone", "party_size", "location", "notes", "total",
                 "fulfillment", "fulfillment_type", "fulfillment_details", "order_notes", "allergy_notes",
-                "booked_at", "timezone", "reference", "booking_reference", "table_number",
+                "guest_notes", "unresolved_fields", "state_version", "readback_required",
+                "pending_confirmation_hash", "booked_at", "timezone", "reference", "booking_reference", "table_number",
             ):
                 if key in value:
                     facts[key] = value[key]
             for key in ("evidence_source", "evidence_version"):
                 if value.get(key) not in (None, ""):
                     facts[key] = value[key]
-            if isinstance(value.get("items"), list):
+            for item_key in ("items", "proposed_items"):
+                if not isinstance(value.get(item_key), list):
+                    continue
                 canonical_items = [
                     {
                         "id": item.get("item_id"),
@@ -1649,30 +1675,39 @@ class ToolBridge:
                         "allergens": item.get("allergens") or (),
                         "dietary_tags": item.get("dietary_tags") or (),
                         "customer_safe_answer": item.get("customer_safe_answer") or "",
+                        "quantity": item.get("quantity"),
+                        "order_item_id": item.get("order_item_id"),
+                        "modifiers": item.get("modifiers") or (),
+                        "removals": item.get("removals") or (),
+                        "substitutions": item.get("substitutions") or (),
+                        "notes": item.get("notes") or "",
+                        "unit_price": item.get("unit_price"),
+                        "subtotal": item.get("subtotal"),
                     }
-                    for item in value["items"]
+                    for item in value[item_key]
                     if isinstance(item, Mapping) and (item.get("item_id") or item.get("item_name") or item.get("name"))
                 ]
                 if canonical_items:
-                    facts["canonical_items"] = canonical_items
-                    facts.setdefault("items", []).extend(
-                        item["name"] for item in canonical_items if item.get("name")
-                    )
-                    facts.setdefault("prices", {}).update(
-                        {
-                            item["id"] or item["name"]: item["price"]
+                    facts["canonical_items" if item_key == "items" else "proposed_items"] = canonical_items
+                    if item_key == "items":
+                        facts.setdefault("items", []).extend(
+                            item["name"] for item in canonical_items if item.get("name")
+                        )
+                        facts.setdefault("prices", {}).update(
+                            {
+                                item["id"] or item["name"]: item["price"]
+                                for item in canonical_items
+                                if item.get("price") is not None
+                            }
+                        )
+                        facts["availability_by_item"] = {
+                            item["name"]: ("available" if item.get("available") is True else "unavailable")
                             for item in canonical_items
-                            if item.get("price") is not None
+                            if item.get("name") and item.get("available") is not None
                         }
-                    )
-                    facts["availability_by_item"] = {
-                        item["name"]: ("available" if item.get("available") is True else "unavailable")
-                        for item in canonical_items
-                        if item.get("name") and item.get("available") is not None
-                    }
-                    availability = [item.get("available") for item in canonical_items]
-                    if len(availability) == 1:
-                        facts["availability"] = "available" if availability[0] is True else "unavailable"
+                        availability = [item.get("available") for item in canonical_items]
+                        if len(availability) == 1:
+                            facts["availability"] = "available" if availability[0] is True else "unavailable"
             if isinstance(value.get("match"), Mapping):
                 match = value["match"]
                 facts.setdefault("canonical_items", []).append(

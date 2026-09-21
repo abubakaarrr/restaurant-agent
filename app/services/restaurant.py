@@ -1240,10 +1240,22 @@ class RestaurantService:
                 "Provide a new date, time, party size, name, or note field to update.",
                 code="empty_update",
             )
+        effective_date = date
+        effective_time = time
+        current_party = 0
+        if self._pool_provider is not None:
+            native_state = (await self.load_call_state(call_id)).get("state") or {}
+            native_draft = coerce_draft(native_state.get("reservation_draft") or native_state)
+            current_party = int(native_draft.get("party_size") or 0)
+            if not native_draft.get("date") or not native_draft.get("time") or not current_party:
+                live_booking = await self.lookup_booking(booking_id=booking_id)
+                effective_date = effective_date or str(live_booking.get("date") or "")
+                effective_time = effective_time or str(live_booking.get("time") or "")
+                current_party = current_party or int(live_booking.get("party_size") or 0)
         confirmation_payload = update_booking_confirmation_payload(
             booking_id=booking_id,
-            date=date,
-            time=time,
+            date=effective_date,
+            time=effective_time,
             party_size=party_size,
             preferred_location=preferred_location or "",
             seating_preference=seating_preference,
@@ -1260,11 +1272,12 @@ class RestaurantService:
             from app.availability_offer import require_fresh_availability_for_party_change
             from app.call_memory import get_reservation_draft as _load_draft
 
-            draft_now = _load_draft(call_id)
-            current_party = int(draft_now.get("party_size") or 0)
+            if self._pool_provider is None:
+                draft_now = _load_draft(call_id)
+                current_party = int(draft_now.get("party_size") or 0)
             if party_size != current_party:
-                slot_date = date or str(draft_now.get("date") or "")
-                slot_time = time or str(draft_now.get("time") or "")
+                slot_date = effective_date
+                slot_time = effective_time
                 require_fresh_availability_for_party_change(
                     call_id,
                     date=slot_date,
