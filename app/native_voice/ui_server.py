@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import logging
 import os
@@ -17,7 +17,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.native_voice.adapter import NativeVoiceAdapter, connect_development_adapter
+from app.native_voice.adapter import NativeVoiceAdapter, RealtimeConfig, connect_development_adapter
 from app.native_voice.database_guard import close_native_voice_pool
 
 LOG = logging.getLogger(__name__)
@@ -41,8 +41,36 @@ class BrowserVoiceAdapter(NativeVoiceAdapter):
             await super()._release_pending_readbacks(*pending)
 
 
-async def connect_browser_adapter(session_id: str) -> BrowserVoiceAdapter:
-    return await connect_development_adapter(session_id=session_id, adapter_class=BrowserVoiceAdapter)
+def browser_realtime_config(language: str = "en") -> RealtimeConfig:
+    if language != "en":
+        raise ValueError("unsupported_call_language")
+    from app.config import get_settings
+    settings = get_settings()
+    base = RealtimeConfig(
+        model=settings.native_voice_realtime_model,
+        voice=settings.native_voice_realtime_voice,
+    )
+    return replace(
+        base,
+        language=language,
+        instructions=base.instructions + (
+            "\n\nCALL LANGUAGE: ENGLISH ONLY. "
+            "Speak only English throughout this call, including greetings, clarifications, "
+            "tool-related replies and final answers. Do not switch languages based on "
+            "accent, names, short foreign words, background audio or uncertain speech. "
+            "If the caller is unclear, ask them to repeat in English rather than guessing "
+            "another language. This call is configured for English; do not translate "
+            "verified restaurant readbacks."
+        ),
+    )
+
+
+async def connect_browser_adapter(session_id: str, *, language: str = "en") -> BrowserVoiceAdapter:
+    return await connect_development_adapter(
+        session_id=session_id,
+        config=browser_realtime_config(language),
+        adapter_class=BrowserVoiceAdapter,
+    )
 
 
 def same_local_origin(socket: WebSocket) -> bool:
@@ -102,7 +130,8 @@ def create_app(*, connector=connect_browser_adapter, turn_timeout: float = 120) 
 
     @app.websocket("/voice")
     async def voice(socket: WebSocket):
-        if not same_local_origin(socket) or app.state.active_sessions >= 2:
+        language = socket.query_params.get("language", "en")
+        if language != "en" or not same_local_origin(socket) or app.state.active_sessions >= 2:
             await socket.close(code=1008)
             return
         await socket.accept()
@@ -153,9 +182,9 @@ def create_app(*, connector=connect_browser_adapter, turn_timeout: float = 120) 
                 await socket.close(code=1011)
 
         try:
-            adapter = await asyncio.wait_for(connector("browser-" + uuid.uuid4().hex), 20)
+            adapter = await asyncio.wait_for(connector("browser-" + uuid.uuid4().hex, language=language), 20)
             await asyncio.wait_for(adapter.start(), 20)
-            await send({"type": "ready"})
+            await send({"type": "ready", "language": language})
             while True:
                 message = await asyncio.wait_for(socket.receive(), timeout=600)
                 if message["type"] == "websocket.disconnect":

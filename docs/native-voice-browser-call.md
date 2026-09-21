@@ -1,6 +1,9 @@
 # Local native voice call
 
 Open **http://localhost:8765**, click **Start call**, and grant microphone access.
+Choose **English** in **Call language** before starting. English is the only enabled
+language for now; both input transcription and reply instructions use English.
+End the current call and start a new one after updating this setting.
 Speak naturally; a 1.4-second pause sends your turn. The agent speaks back and
 keeps the same session until you end the call. Speaking during its reply stops
 playback and requests cancellation. Use headphones to reduce speaker echo.

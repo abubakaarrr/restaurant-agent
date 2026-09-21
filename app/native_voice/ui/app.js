@@ -47,13 +47,13 @@ async function receive(event){
   else if(data.type==='notice'){$('notice').textContent=data.message;}
 }
 async function startCall(){
-  $('start').disabled=true;$('notice').textContent='';status('Connecting…','Allow microphone access when your browser asks.');
+  $('start').disabled=true;$('language').disabled=true;$('notice').textContent='';status('Connecting…','Allow microphone access when your browser asks.');
   try{
     if(!navigator.mediaDevices?.getUserMedia)throw new Error('Microphone access requires localhost in Chrome or Edge.');
     stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
     context=new AudioContext();await context.resume();await context.audioWorklet.addModule('/assets/capture.js');
     vad=new VoiceActivity(context.sampleRate);source=context.createMediaStreamSource(stream);node=new AudioWorkletNode(context,'microphone-capture');gain=context.createGain();gain.gain.value=0;source.connect(node);node.connect(gain);gain.connect(context.destination);node.port.onmessage=e=>capture(e.data);
-    socket=new WebSocket('ws://'+location.host+'/voice');live=true;connected=false;ready=false;interrupting=false;pending=null;muted=false;turns=0;startedAt=Date.now();
+    socket=new WebSocket('ws://'+location.host+'/voice?language='+encodeURIComponent($('language').value));live=true;connected=false;ready=false;interrupting=false;pending=null;muted=false;turns=0;startedAt=Date.now();
     $('messages').replaceChildren();$('state').textContent='Waiting for your first turn.';$('turns').textContent='0 turns';$('latency').textContent='—';$('mute').textContent='Mute';
     socket.onmessage=e=>receive(e).catch(()=>endCall('Audio playback failed. Check your output device and start a new call.'));
     socket.onerror=()=>{$('notice').textContent='Could not connect to the local voice server.';};
@@ -66,7 +66,7 @@ async function startCall(){
 async function endCall(reason='Call ended'){
   live=false;connected=false;ready=false;pending=null;stopAudio();clearInterval(timer);send({type:'end'});socket?.close();
   stream?.getTracks().forEach(t=>t.stop());node?.disconnect();source?.disconnect();gain?.disconnect();if(context&&context.state!=='closed')await context.close();
-  $('start').disabled=false;$('end').disabled=true;$('mute').disabled=true;$('stop').disabled=true;$('level').value=0;$('orb').classList.remove('active');status('Call ended','Start another call for a fresh conversation.');$('notice').textContent=reason==='Call ended'?'':reason;
+  $('start').disabled=false;$('language').disabled=false;$('end').disabled=true;$('mute').disabled=true;$('stop').disabled=true;$('level').value=0;$('orb').classList.remove('active');status('Call ended','Start another call for a fresh conversation.');$('notice').textContent=reason==='Call ended'?'':reason;
 }
 $('start').onclick=startCall;$('end').onclick=()=>endCall();$('stop').onclick=interrupt;
 $('mute').onclick=()=>{muted=!muted;stream?.getAudioTracks().forEach(t=>t.enabled=!muted);vad.reset();$('mute').textContent=muted?'Unmute':'Mute';if(ready)status(muted?'Microphone muted':'Listening…');};

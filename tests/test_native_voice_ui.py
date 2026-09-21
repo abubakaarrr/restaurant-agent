@@ -60,8 +60,9 @@ class FakeAdapter:
 
 
 def client_for(fake):
-    async def connector(session_id):
+    async def connector(session_id, *, language="en"):
         assert session_id.startswith("browser-")
+        assert language == "en"
         return fake
     return TestClient(create_app(connector=connector), base_url="http://localhost")
 
@@ -199,3 +200,34 @@ def test_invalid_audio_cannot_reach_provider(audio):
             assert ws.receive_json()["type"] == "notice"
             assert ws.receive_json()["type"] == "ready"
             assert fake.submissions == 0
+
+
+def test_english_setting_controls_provider_input_and_reply_policy():
+    from app.native_voice.ui_server import browser_realtime_config
+    config = browser_realtime_config("en")
+    session = config.session_update()["session"]
+    assert session["audio"]["input"]["transcription"]["language"] == "en"
+    assert "Speak only English throughout this call" in session["instructions"]
+    assert "accent, names" in session["instructions"]
+    assert "exact_speech_required=true" in session["instructions"]
+
+
+def test_language_selector_and_explicit_english_session():
+    with client_for(FakeAdapter()) as client:
+        page = client.get("/")
+        assert 'id="language"' in page.text and 'value="en" selected>English' in page.text
+        with client.websocket_connect("ws://localhost/voice?language=en", headers=ORIGIN) as ws:
+            assert ws.receive_json()["language"] == "en"
+
+
+@pytest.mark.parametrize("language", ["fr", "auto", "ignore-instructions"])
+def test_unapproved_language_is_rejected_before_provider_connection(language):
+    called = []
+    async def connector(session_id, **kwargs):
+        called.append(session_id)
+        return FakeAdapter()
+    with TestClient(create_app(connector=connector), base_url="http://localhost") as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("ws://localhost/voice?language=" + language, headers=ORIGIN):
+                pass
+    assert not called
