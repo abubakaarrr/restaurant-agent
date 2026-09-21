@@ -157,8 +157,24 @@ def compose_notes(draft: dict[str, Any], *, limit: int = 500) -> str:
     return "; ".join(parts)[:limit]
 
 
-def draft_from_booking(booking: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the canonical draft represented by a persisted booking."""
+class AmbiguousBookingNotes(ValueError):
+    """Persisted note entries require an explicit caller resolution."""
+
+    def __init__(self, fields: list[str]) -> None:
+        self.fields = tuple(fields)
+        labels = ", ".join(field.replace("_", " ") for field in fields)
+        super().__init__(
+            f"The booking has multiple different {labels} entries. "
+            "Please specify the complete values to keep, or explicitly clear those fields. "
+            "No booking details have been changed."
+        )
+
+
+def draft_from_booking(
+    booking: Mapping[str, Any], *, note_updates: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Resolve stored fields without confusing ambiguity with an explicit clear."""
+    note_updates = note_updates or {}
     notes = " ".join(str(booking.get("notes") or "").split())
     parsed: dict[str, str] = {}
     extra: list[str] = []
@@ -169,23 +185,31 @@ def draft_from_booking(booking: Mapping[str, Any]) -> dict[str, Any]:
         "dietary": "dietary",
         "avoid": "seating_avoid",
     }
-    duplicate = False
+    entries: dict[str, list[str]] = {}
     for part in (segment.strip() for segment in notes.split(";")):
         matched = False
         for prefix, field in note_prefixes.items():
             marker = f"{prefix}:"
             if part.casefold().startswith(marker):
                 matched = True
-                if field in parsed:
-                    duplicate = True
-                else:
-                    parsed[field] = part[len(marker) :].strip()
+                value = part[len(marker) :].strip()
+                values = entries.setdefault(field, [])
+                if value.casefold() not in {entry.casefold() for entry in values}:
+                    values.append(value)
                 break
         if not matched:
             extra.append(part)
-    if duplicate:
-        parsed = {}
-        extra = [notes] if notes else []
+    ambiguous = []
+    for field, values in entries.items():
+        if note_updates.get(field) is not None:
+            # A provided empty string explicitly clears every old entry for this field.
+            parsed[field] = str(note_updates[field])
+        elif len(values) > 1:
+            ambiguous.append(field)
+        else:
+            parsed[field] = values[0]
+    if ambiguous:
+        raise AmbiguousBookingNotes(sorted(ambiguous))
     booked_at = booking.get("booked_at")
     booked_date = (
         booked_at.date().isoformat() if hasattr(booked_at, "date") else ""

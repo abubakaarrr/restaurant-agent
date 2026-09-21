@@ -76,7 +76,8 @@ class ToolSpeechTransport(MemoryRealtimeTransport):
 )
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_alias_whitespace", [False, True])
-async def test_public_native_booking_lifecycle(with_alias_whitespace):
+@pytest.mark.parametrize("note_resolution", ["normal", "clear", "replace"])
+async def test_public_native_booking_lifecycle(with_alias_whitespace, note_resolution):
     session_id = "public-booking-flow-" + uuid.uuid4().hex
     moment = _restaurant_now() + timedelta(days=2)
     while moment.weekday() == 0:
@@ -206,9 +207,41 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
         assert renamed.success and renamed.readback_verified, renamed.error
         assert await pool.fetchval("SELECT customer_name FROM bookings WHERE id = $1", booking_id) == "Synthetic Updated Guest"
 
+        if note_resolution != "normal":
+            _, appended = await call(
+                "add_guest_note",
+                {"booking_id": booking_id, "note": "dietary: sesame allergy"},
+                "Please add this guest note: dietary: sesame allergy.",
+                "duplicate-dietary-note",
+            )
+            assert appended.success and appended.readback_verified, appended.error
+            ambiguous_notes = await pool.fetchval(
+                "SELECT notes FROM bookings WHERE id = $1", booking_id
+            )
+            assert "dietary: vegan" in ambiguous_notes
+            assert "dietary: sesame allergy" in ambiguous_notes
+            blocked_readback, blocked = await call(
+                "update_confirmed_booking",
+                {**rename_args, "customer_name": "Another Synthetic Name"},
+                "Please change only the reservation name.",
+                "ambiguous-name-change",
+            )
+            assert not blocked.success and not blocked.pending
+            assert "booking_notes_ambiguous" in str(blocked.error)
+            assert "cleared" not in blocked_readback.transcript.casefold()
+            assert "multiple different dietary" in blocked_readback.transcript
+            assert blocked_readback.audio and blocked_readback.speech.allowed, blocked_readback.speech
+            assert await pool.fetchval(
+                "SELECT notes FROM bookings WHERE id = $1", booking_id
+            ) == ambiguous_notes
+            assert await pool.fetchval(
+                "SELECT customer_name FROM bookings WHERE id = $1", booking_id
+            ) == "Synthetic Updated Guest"
+
+        replacement_dietary = "sesame allergy" if note_resolution == "replace" else ""
         clear_args = {
             "booking_id": booking_id,
-            "dietary": "",
+            "dietary": replacement_dietary,
             "caller_confirmed": False,
         }
         cleared_readback, cleared_proposal = await call(
@@ -218,7 +251,10 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
             "dietary-clear-proposal",
         )
         assert cleared_proposal.pending
-        assert "dietary request cleared" in cleared_readback.transcript
+        assert (
+            "dietary request sesame allergy" if replacement_dietary
+            else "dietary request cleared"
+        ) in cleared_readback.transcript
         _, cleared = await call(
             "update_confirmed_booking",
             {**clear_args, "caller_confirmed": True},
@@ -231,7 +267,12 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
             booking_id,
         )
         assert "occasion: birthday" in cleared_row["notes"]
-        assert "dietary:" not in cleared_row["notes"]
+        assert "dietary: vegan" not in cleared_row["notes"]
+        if replacement_dietary:
+            assert cleared_row["notes"].count("dietary:") == 1
+            assert "dietary: sesame allergy" in cleared_row["notes"]
+        else:
+            assert "dietary:" not in cleared_row["notes"]
         assert cleared_row["require_approval_for_paid_items"] is True
     finally:
         await adapter.close()
@@ -241,3 +282,51 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
                 await conn.execute("DELETE FROM bookings WHERE id = $1", booking_id)
             await conn.execute("DELETE FROM call_sessions WHERE session_id = $1", session_id)
         await close_native_voice_pool()
+
+
+def test_booking_notes_ambiguity_requires_explicit_resolution():
+    from app.reservation_draft import AmbiguousBookingNotes, compose_notes, draft_from_booking
+
+    booking = {"notes": "occasion: birthday; dietary: vegan; dietary: sesame allergy"}
+    for omitted in ({}, {"dietary": None}, {"occasion": ""}):
+        with pytest.raises(AmbiguousBookingNotes) as error:
+            draft_from_booking(booking, note_updates=omitted)
+        assert error.value.fields == ("dietary",)
+    cleared = draft_from_booking(booking, note_updates={"dietary": ""})
+    assert cleared["occasion"] == "birthday"
+    assert cleared["dietary"] == ""
+    assert compose_notes(cleared) == "occasion: birthday"
+    replaced = draft_from_booking(booking, note_updates={"dietary": "sesame allergy"})
+    assert compose_notes(replaced) == "occasion: birthday; dietary: sesame allergy"
+
+
+def test_identical_booking_note_entries_do_not_create_ambiguity():
+    from app.reservation_draft import compose_notes, draft_from_booking
+
+    draft = draft_from_booking(
+        {"notes": "occasion: birthday; dietary: vegan; dietary: vegan; bring a card"}
+    )
+    assert compose_notes(draft) == "occasion: birthday; dietary: vegan; bring a card"
+
+
+def test_booking_clarification_cannot_authorize_other_speech():
+    import hashlib
+    from dataclasses import replace
+    from app.native_voice.speech import SpeechGate, ToolEvidence
+
+    text = "Please specify the complete dietary values to keep."
+    evidence = ToolEvidence(
+        action="update_confirmed_booking", call_id="clarify", turn_id="turn",
+        state_version=3, success=False, readback_verified=False,
+        facts={"safe_clarification": text}, confirmation_text=text,
+        confirmation_hash=hashlib.sha256(text.casefold().encode()).hexdigest(),
+    )
+    gate = SpeechGate()
+    assert gate.evaluate(text, b"audio", evidence=[evidence], current_state_version=3).allowed
+    for candidate in (replace(evidence, facts={}), replace(evidence, state_version=2),
+                      replace(evidence, replayed=True), replace(evidence, confirmation_hash="bad")):
+        assert not gate.evaluate(text, b"audio", evidence=[candidate], current_state_version=3).allowed
+    assert not gate.evaluate(
+        text + " Your reservation is confirmed.", b"audio",
+        evidence=[evidence], current_state_version=3
+    ).allowed

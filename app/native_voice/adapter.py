@@ -657,6 +657,12 @@ class NativeVoiceAdapter:
 
     @staticmethod
     def _confirmation_sentence(outcome: ToolOutcome) -> str:
+        if (
+            not outcome.success
+            and isinstance(outcome.result, Mapping)
+            and outcome.result.get("error") == "booking_notes_ambiguous"
+        ):
+            return str(outcome.result["message"])
         if outcome.pending:
             proposed = outcome.result.get("proposed") if isinstance(outcome.result, Mapping) else {}
             proposed = proposed if isinstance(proposed, Mapping) else {}

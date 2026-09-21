@@ -500,7 +500,14 @@ class RestaurantToolExecutor:
 
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
         if self._native_service is not None:
-            return await self._invoke_native(name, arguments)
+            from app.services.restaurant import RestaurantServiceError
+
+            try:
+                return await self._invoke_native(name, arguments)
+            except RestaurantServiceError as exc:
+                if exc.code == "booking_notes_ambiguous":
+                    return {"ok": False, "error": exc.code, "message": exc.message}
+                raise
         if name == "lookup_order":
             return await self._service.get_order_summary(
                 call_id=str(arguments.get("session_id") or "")
@@ -1410,6 +1417,13 @@ class ToolBridge:
                         success = False
                         error = "database_readback_mismatch"
             facts = self._facts(result, readback, args)
+            if (
+                name == "update_confirmed_booking"
+                and not success
+                and isinstance(result, Mapping)
+                and result.get("error") == "booking_notes_ambiguous"
+            ):
+                facts["safe_clarification"] = str(result["message"])
         except Exception as exc:
             success = False
             error = f"bridge_schema_error:{type(exc).__name__}"

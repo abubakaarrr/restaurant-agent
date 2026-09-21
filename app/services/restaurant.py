@@ -29,6 +29,7 @@ from app.reservation_draft import (
     compose_notes,
     coerce_draft,
     draft_from_booking,
+    AmbiguousBookingNotes,
     flatten_draft,
     merge_note_text,
     normalize_preferred_location,
@@ -94,6 +95,17 @@ class RestaurantServiceError(Exception):
         self.message = message
         self.code = code
         self.status = status
+
+
+def _native_booking_draft(
+    booking: Mapping[str, Any], note_updates: Mapping[str, Any]
+) -> JsonDict:
+    try:
+        return draft_from_booking(booking, note_updates=note_updates)
+    except AmbiguousBookingNotes as exc:
+        raise RestaurantServiceError(
+            str(exc), code="booking_notes_ambiguous", status=409
+        ) from exc
 
 
 class WritesDisabledError(RestaurantServiceError):
@@ -1292,7 +1304,7 @@ class RestaurantService:
                 or draft_preferred_location(seating_preference or "")
                 or str(native_live_booking.get("location") or "")
             )
-            base_draft = draft_from_booking(native_live_booking)
+            base_draft = _native_booking_draft(native_live_booking, note_updates)
             native_patch_updates = {
                 **note_updates,
                 **({"customer_name": new_name} if new_name else {}),
@@ -1483,7 +1495,7 @@ class RestaurantService:
                 if isinstance(raw, dict):
                     session_state = dict(raw)
             if self._pool_provider is not None:
-                draft = draft_from_booking(
+                draft = _native_booking_draft(
                     {
                         "booking_id": booking_id,
                         "customer_name": row["customer_name"] or "",
@@ -1495,7 +1507,8 @@ class RestaurantService:
                         "require_approval_for_paid_items": row[
                             "require_approval_for_paid_items"
                         ],
-                    }
+                    },
+                    note_updates,
                 )
                 draft = patch_draft(draft, native_patch_updates)
                 locked_payload = update_booking_confirmation_payload(

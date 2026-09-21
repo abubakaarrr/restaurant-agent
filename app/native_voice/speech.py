@@ -148,6 +148,21 @@ class SpeechGate:
             == item.confirmation_hash
             for item in envelope_evidence
         )
+        # A failed mutation may carry an exact server-authored clarification.
+        # This grants permission to ask that question, never to claim success.
+        clarification_match = any(
+            item.action == "update_confirmed_booking"
+            and not item.success and not item.pending and not item.replayed
+            and item.state_version == current_state_version
+            and item.facts.get("safe_clarification") == item.confirmation_text
+            and " ".join((text or "").casefold().split())
+            == " ".join(item.confirmation_text.casefold().split())
+            and hashlib.sha256(item.confirmation_text.casefold().strip().encode()).hexdigest()
+            == item.confirmation_hash
+            for item in envelope_evidence
+        )
+        if clarification_match and not claims:
+            return SpeechDecision(allowed=True, text=text, audio=audio)
         if envelope_evidence:
             normalized_text = " ".join((text or "").casefold().split())
             if not any(
