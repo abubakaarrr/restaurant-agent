@@ -2117,3 +2117,19 @@ def test_closure_sentence_with_table_context_remains_scoped_to_date():
     assert SpeechGate().evaluate(text, b"closed", evidence=[evidence], current_state_version=1).allowed
     assert not SpeechGate().evaluate(text.replace("28th", "29th"), b"wrong",
                                     evidence=[evidence], current_state_version=1).allowed
+
+
+def test_negative_slot_uses_exact_authoritative_speech():
+    result = {"available": False, "restaurant_closed": True, "date": "2026-09-28", "time": "19:00"}
+    outcome = NativeVoiceAdapter._with_confirmation(ToolOutcome(
+        name="check_table_availability", call_id="closed", arguments={}, result=result,
+        success=True, readback_verified=True, state_version=2,
+        facts=ToolBridge._facts(result, None, {}),
+    ))
+    assert outcome.confirmation_text == "The restaurant is closed on September 28, 2026. Would you like a different date?"
+    evidence = [outcome.as_evidence(turn_id="turn")]
+    gate = SpeechGate()
+    assert gate.evaluate(outcome.confirmation_text, b"closed", evidence=evidence,
+                         current_state_version=2).allowed
+    assert not gate.evaluate(outcome.confirmation_text.replace("closed", "open"), b"wrong",
+                             evidence=evidence, current_state_version=2).allowed

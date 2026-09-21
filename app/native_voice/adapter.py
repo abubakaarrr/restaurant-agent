@@ -681,7 +681,7 @@ class NativeVoiceAdapter:
             if (
                 latest is not None and latest.confirmation_text
                 and latest.state_version == self.state.version
-                and (latest.pending or latest.name in {"confirm_order", "create_booking", "cancel_booking", "update_confirmed_booking"})
+                and (latest.pending or latest.name in {"confirm_order", "create_booking", "cancel_booking", "update_confirmed_booking", "check_table_availability"})
             ):
                 response_options.update(
                     # Render this authoritative utterance without competing
@@ -706,6 +706,21 @@ class NativeVoiceAdapter:
 
     @staticmethod
     def _confirmation_sentence(outcome: ToolOutcome) -> str:
+        if (
+            outcome.name == "check_table_availability"
+            and outcome.success and outcome.readback_verified
+            and isinstance(outcome.result, Mapping)
+            and outcome.result.get("available") is False
+        ):
+            if outcome.result.get("restaurant_closed") is True:
+                date_value = str(outcome.result.get("date") or "")
+                try:
+                    date_text = datetime.fromisoformat(date_value).strftime("%B %d, %Y")
+                except ValueError:
+                    date_text = ""
+                when = f" on {date_text}" if date_text else ""
+                return f"The restaurant is closed{when}. Would you like a different date?"
+            return "There is no availability for that requested time. Would you like a different date or time?"
         if (
             not outcome.success
             and isinstance(outcome.result, Mapping)
@@ -898,7 +913,13 @@ class NativeVoiceAdapter:
 
     @staticmethod
     def _with_confirmation(outcome: ToolOutcome) -> ToolOutcome:
-        if outcome.name not in MUTATING_TOOLS and not outcome.pending:
+        negative_slot = (
+            outcome.name == "check_table_availability"
+            and outcome.success and outcome.readback_verified
+            and isinstance(outcome.result, Mapping)
+            and outcome.result.get("available") is False
+        )
+        if outcome.name not in MUTATING_TOOLS and not outcome.pending and not negative_slot:
             return outcome
         # A failed write is not a confirmation. Do not let its generic failure
         # text suppress a later grounded lookup or clarification in the same turn.
