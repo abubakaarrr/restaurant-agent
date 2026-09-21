@@ -4,7 +4,7 @@ import base64
 import json
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -12,6 +12,18 @@ from app.native_voice.adapter import NativeVoiceAdapter
 from app.native_voice.database_guard import close_native_voice_pool, get_native_voice_pool
 from app.native_voice.protocol import MemoryRealtimeTransport
 from app.services.restaurant import _restaurant_now
+from app.restaurant_knowledge import get_restaurant_knowledge
+from zoneinfo import ZoneInfo
+
+
+@pytest.fixture(autouse=True)
+def native_open_restaurant_clock(monkeypatch):
+    if os.getenv("RUN_DB_INTEGRATION") == "1":
+        timezone_info = ZoneInfo(get_restaurant_knowledge().identity["timezone"])
+        monkeypatch.setattr(
+            "app.services.restaurant._restaurant_now",
+            lambda: datetime(2026, 9, 23, 18, 0, tzinfo=timezone_info),
+        )
 
 
 class ToolSpeechTransport(MemoryRealtimeTransport):
@@ -87,6 +99,9 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
         "date": date,
         "time": "19:00",
         "party_size": 2,
+        "occasion": "birthday",
+        "dietary": "vegan",
+        "require_approval_for_paid_items": True,
     }
     if with_alias_whitespace:
         draft_args["name"] = "  Synthetic   Booking Guest "
@@ -110,19 +125,26 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
         assert readback.audio and readback.speech and readback.speech.allowed
         _, created = await call(
             "create_booking",
-            {**draft_args, "caller_confirmed": True},
+            {
+                **draft_args,
+                "notes": "occasion: birthday; dietary: vegan",
+                "caller_confirmed": True,
+            },
             "Yes, those details are correct. Book it.",
             "create",
         )
         assert created.success and created.readback_verified, created.error
         booking_id = int(created.result["booking_id"])
         row = await pool.fetchrow(
-            "SELECT status, party_size, booked_at FROM bookings WHERE id = $1",
+            "SELECT status, party_size, booked_at, notes, require_approval_for_paid_items FROM bookings WHERE id = $1",
             booking_id,
         )
         assert row["status"] == "confirmed"
         assert row["party_size"] == 2
         assert row["booked_at"].date().isoformat() == date
+        assert "occasion: birthday" in row["notes"]
+        assert "dietary: vegan" in row["notes"]
+        assert row["require_approval_for_paid_items"] is True
 
         _, availability = await call(
             "check_table_availability",
@@ -140,6 +162,9 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
         )
         assert update_proposal.pending
         assert update_readback.audio and update_readback.speech and update_readback.speech.allowed
+        assert "occasion: birthday" in update_readback.transcript
+        assert "dietary: vegan" in update_readback.transcript
+        assert "paid-item approval on" in update_readback.transcript
         assert await pool.fetchval("SELECT party_size FROM bookings WHERE id = $1", booking_id) == 2
         _, updated = await call(
             "update_confirmed_booking",
@@ -149,11 +174,14 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
         )
         assert updated.success and updated.readback_verified, updated.error
         after = await pool.fetchrow(
-            "SELECT party_size, booked_at FROM bookings WHERE id = $1",
+            "SELECT party_size, booked_at, notes, require_approval_for_paid_items FROM bookings WHERE id = $1",
             booking_id,
         )
         assert after["party_size"] == 3
         assert after["booked_at"] == row["booked_at"]
+        assert "occasion: birthday" in after["notes"]
+        assert "dietary: vegan" in after["notes"]
+        assert after["require_approval_for_paid_items"] is True
 
         rename_args = {
             "booking_id": booking_id,
@@ -177,6 +205,34 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace):
         )
         assert renamed.success and renamed.readback_verified, renamed.error
         assert await pool.fetchval("SELECT customer_name FROM bookings WHERE id = $1", booking_id) == "Synthetic Updated Guest"
+
+        clear_args = {
+            "booking_id": booking_id,
+            "dietary": "",
+            "caller_confirmed": False,
+        }
+        cleared_readback, cleared_proposal = await call(
+            "update_confirmed_booking",
+            clear_args,
+            "Clear the dietary request from the reservation.",
+            "dietary-clear-proposal",
+        )
+        assert cleared_proposal.pending
+        assert "dietary request cleared" in cleared_readback.transcript
+        _, cleared = await call(
+            "update_confirmed_booking",
+            {**clear_args, "caller_confirmed": True},
+            "Yes, that is correct.",
+            "dietary-clear-approval",
+        )
+        assert cleared.success and cleared.readback_verified, cleared.error
+        cleared_row = await pool.fetchrow(
+            "SELECT notes, require_approval_for_paid_items FROM bookings WHERE id = $1",
+            booking_id,
+        )
+        assert "occasion: birthday" in cleared_row["notes"]
+        assert "dietary:" not in cleared_row["notes"]
+        assert cleared_row["require_approval_for_paid_items"] is True
     finally:
         await adapter.close()
         async with pool.acquire() as conn:

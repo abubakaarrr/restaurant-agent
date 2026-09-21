@@ -36,7 +36,19 @@ from app.native_voice.tools import OfflineToolExecutor, ToolBridge, ToolOutcome,
 from app.native_voice.tools import RestaurantToolExecutor
 from app.call_memory import clear_call_memory
 from app.services.restaurant import RestaurantService
+from app.restaurant_knowledge import get_restaurant_knowledge
 from app.native_voice.turns import CompletedCallerTurn, TurnAssembler
+from zoneinfo import ZoneInfo
+
+
+@pytest.fixture(autouse=True)
+def native_open_restaurant_clock(monkeypatch):
+    if os.getenv("RUN_DB_INTEGRATION") == "1":
+        timezone_info = ZoneInfo(get_restaurant_knowledge().identity["timezone"])
+        monkeypatch.setattr(
+            "app.services.restaurant._restaurant_now",
+            lambda: datetime(2026, 9, 23, 18, 0, tzinfo=timezone_info),
+        )
 
 
 class FakeExecutor:
@@ -1883,6 +1895,8 @@ async def test_unresolved_reservation_allows_only_scoped_correction(monkeypatch)
         result={"ok": True},
         readback={
             "readback_committed": True,
+            "booking_id": 0,
+            "status": "ready",
             "customer_name": "Ada Lovelace",
             "customer_phone": "+14155550123",
             "date": "2026-09-19",

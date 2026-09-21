@@ -28,6 +28,7 @@ from app.reservation_draft import (
     DRAFT_STATUS_CONFIRMED,
     compose_notes,
     coerce_draft,
+    draft_from_booking,
     flatten_draft,
     merge_note_text,
     normalize_preferred_location,
@@ -51,6 +52,7 @@ from app.pending_confirmation import (
     get_pending_confirmation,
     order_confirmation_payload,
     pending_state_patch,
+    payload_hash,
     register_pending_confirmation,
     require_pending_confirmation,
     update_booking_confirmation_payload,
@@ -1290,28 +1292,31 @@ class RestaurantService:
                 or draft_preferred_location(seating_preference or "")
                 or str(native_live_booking.get("location") or "")
             )
-            base_draft = patch_draft(
-                {},
-                {
-                    "customer_name": str(native_live_booking.get("customer_name") or ""),
-                    "customer_phone": str(native_live_booking.get("customer_phone") or ""),
-                    "date": effective_date,
-                    "time": effective_time,
-                    "party_size": current_party,
-                    "booking_id": booking_id,
-                    "status": DRAFT_STATUS_CONFIRMED,
-                    "extra_notes": str(native_live_booking.get("notes") or ""),
-                },
-            )
+            base_draft = draft_from_booking(native_live_booking)
+            native_patch_updates = {
+                **note_updates,
+                **({"customer_name": new_name} if new_name else {}),
+                **({"date": date} if date else {}),
+                **({"time": time} if time else {}),
+                **({"party_size": party_size} if party_size else {}),
+                **(
+                    {"require_approval_for_paid_items": require_approval_for_paid_items}
+                    if require_approval_for_paid_items is not None
+                    else {}
+                ),
+            }
             native_proposed_draft = patch_draft(
                 base_draft,
-                {
-                    "customer_name": effective_name,
-                    "date": effective_date,
-                    "time": effective_time,
-                    "party_size": effective_party,
-                    **note_updates,
-                },
+                native_patch_updates,
+            )
+            effective_date = str(native_proposed_draft.get("date") or "")
+            effective_time = str(native_proposed_draft.get("time") or "")
+            effective_party = int(native_proposed_draft.get("party_size") or 0)
+            effective_name = str(native_proposed_draft.get("customer_name") or "")
+            effective_location = (
+                preferred_location
+                or draft_preferred_location(native_proposed_draft)
+                or str(native_live_booking.get("location") or "")
             )
             effective_notes = compose_notes(native_proposed_draft)
             date = effective_date
@@ -1360,7 +1365,11 @@ class RestaurantService:
                 if native_live_booking is not None
                 else None
             ),
-            require_approval_for_paid_items=require_approval_for_paid_items,
+            require_approval_for_paid_items=(
+                native_proposed_draft.get("require_approval_for_paid_items")
+                if native_proposed_draft is not None
+                else require_approval_for_paid_items
+            ),
         )
         # Party-size edits must cite a fresh check_table_availability for that size.
         if party_size > 0:
@@ -1415,7 +1424,11 @@ class RestaurantService:
             "party_size": party_size,
             "preferred_location": effective_location,
             "customer_name": effective_name,
-            "require_approval_for_paid_items": require_approval_for_paid_items,
+            "require_approval_for_paid_items": (
+                native_proposed_draft.get("require_approval_for_paid_items")
+                if native_proposed_draft is not None
+                else require_approval_for_paid_items
+            ),
             "notes": effective_notes,
             **note_updates,
         }
@@ -1431,7 +1444,8 @@ class RestaurantService:
             row = await conn.fetchrow(
                 """
                 SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
-                       b.party_size, b.status, b.notes, b.table_id,
+                       b.party_size, b.status, b.notes,
+                       b.require_approval_for_paid_items, b.table_id,
                        t.table_number, t.location
                 FROM bookings b
                 LEFT JOIN tables t ON t.id = b.table_id
@@ -1469,25 +1483,56 @@ class RestaurantService:
                 if isinstance(raw, dict):
                     session_state = dict(raw)
             if self._pool_provider is not None:
-                draft = patch_draft(
-                    {},
+                draft = draft_from_booking(
                     {
+                        "booking_id": booking_id,
                         "customer_name": row["customer_name"] or "",
                         "customer_phone": row["customer_phone"] or "",
-                        "date": row["booked_at"].date().isoformat(),
-                        "time": row["booked_at"].strftime("%H:%M"),
+                        "booked_at": row["booked_at"],
                         "party_size": int(row["party_size"] or 0),
-                        "booking_id": booking_id,
-                        "status": DRAFT_STATUS_CONFIRMED,
-                        "extra_notes": row["notes"] or "",
-                    },
+                        "status": row["status"],
+                        "notes": row["notes"] or "",
+                        "require_approval_for_paid_items": row[
+                            "require_approval_for_paid_items"
+                        ],
+                    }
                 )
+                draft = patch_draft(draft, native_patch_updates)
+                locked_payload = update_booking_confirmation_payload(
+                    booking_id=booking_id,
+                    date=draft["date"],
+                    time=draft["time"],
+                    party_size=draft["party_size"],
+                    preferred_location=(
+                        preferred_location
+                        or draft_preferred_location(draft)
+                        or str(row["location"] or "")
+                    ),
+                    seating_preference=draft.get("seating_preference"),
+                    seating_backup=draft.get("seating_backup"),
+                    seating_avoid=draft.get("seating_avoid"),
+                    dietary=draft.get("dietary"),
+                    occasion=draft.get("occasion"),
+                    extra_notes=draft.get("extra_notes"),
+                    notes=compose_notes(draft),
+                    customer_name=draft.get("customer_name") or "",
+                    customer_phone=draft.get("customer_phone") or "",
+                    require_approval_for_paid_items=draft.get(
+                        "require_approval_for_paid_items"
+                    ),
+                )
+                if payload_hash(locked_payload) != payload_hash(confirmation_payload):
+                    raise RestaurantServiceError(
+                        "The booking changed after its readback. Read it back again before approving.",
+                        code="pending_confirmation_mismatch",
+                        status=409,
+                    )
             else:
                 draft = coerce_draft(session_state.get("reservation_draft") or session_state)
             booked_at = row["booked_at"]
-            new_date = date or booked_at.date().isoformat()
-            new_time = time or booked_at.strftime("%H:%M")
-            new_party = party_size or int(row["party_size"])
+            new_date = draft.get("date") or booked_at.date().isoformat()
+            new_time = draft.get("time") or booked_at.strftime("%H:%M")
+            new_party = int(draft.get("party_size") or row["party_size"])
             location_pref = preferred_location or draft_preferred_location(
                 seating_preference if seating_preference is not None else draft
             )
@@ -1578,19 +1623,20 @@ class RestaurantService:
                     booking_id,
                 )
 
-            draft = patch_draft(
-                draft,
-                {
-                    "customer_name": updated_name,
-                    "customer_phone": row["customer_phone"] or "",
-                    "date": new_date,
-                    "time": new_time,
-                    "party_size": new_party,
-                    "booking_id": booking_id,
-                    "status": DRAFT_STATUS_CONFIRMED,
-                    **note_updates,
-                },
-            )
+            if self._pool_provider is None:
+                draft = patch_draft(
+                    draft,
+                    {
+                        "customer_name": updated_name,
+                        "customer_phone": row["customer_phone"] or "",
+                        "date": new_date,
+                        "time": new_time,
+                        "party_size": new_party,
+                        "booking_id": booking_id,
+                        "status": DRAFT_STATUS_CONFIRMED,
+                        **note_updates,
+                    },
+                )
             rebuilt_notes = compose_notes(draft)
             if require_approval_for_paid_items is not None:
                 draft = patch_draft(
@@ -1810,7 +1856,8 @@ class RestaurantService:
                 row = await conn.fetchrow(
                     """
                     SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
-                           b.party_size, b.status, b.notes, t.table_number, t.location
+                           b.party_size, b.status, b.notes,
+                           b.require_approval_for_paid_items, t.table_number, t.location
                     FROM bookings b
                     LEFT JOIN tables t ON t.id = b.table_id
                     WHERE b.id = $1
@@ -1822,7 +1869,8 @@ class RestaurantService:
                 row = await conn.fetchrow(
                     """
                     SELECT b.id, b.customer_name, b.customer_phone, b.booked_at,
-                           b.party_size, b.status, b.notes, t.table_number, t.location
+                           b.party_size, b.status, b.notes,
+                           b.require_approval_for_paid_items, t.table_number, t.location
                     FROM bookings b
                     LEFT JOIN tables t ON t.id = b.table_id
                     WHERE LOWER(b.customer_name) = LOWER($1)
@@ -1856,6 +1904,9 @@ class RestaurantService:
             "table_number": row["table_number"],
             "location": row["location"] or "",
             "notes": row["notes"] or "",
+            "require_approval_for_paid_items": bool(
+                row["require_approval_for_paid_items"]
+            ),
         }
 
     async def sync_confirmed_draft_from_booking(
