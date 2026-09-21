@@ -1698,8 +1698,8 @@ async def test_native_booking_update_readback_resolves_live_omitted_fields(monke
             facts={},
         )
     )
-    assert "2026-10-01 at 19:00" in sentence
-    assert "4 guests" in sentence
+    assert "date 2026-10-01, time 19:00" in sentence
+    assert "party size 4" in sentence
     assert "Grace Hopper" in sentence
     assert "occasion: birthday" in sentence
     clear_call_memory(session_id)
@@ -1766,6 +1766,40 @@ def test_native_model_facts_preserve_unresolved_candidates():
             "source_turn_id": "turn-1",
         }
     ]
+
+
+def test_native_booking_update_speech_includes_every_effective_field():
+    sentence = NativeVoiceAdapter._confirmation_sentence(
+        ToolOutcome(
+            name="update_confirmed_booking",
+            call_id="complete-update-readback",
+            arguments={},
+            result={
+                "pending": True,
+                "proposed": {
+                    "booking_id": 17,
+                    "date": "2026-10-01",
+                    "time": "19:00",
+                    "party_size": 2,
+                    "preferred_location": "",
+                    "customer_name": "Ada Lovelace",
+                    "customer_phone": "+14155550123",
+                    "seating_preference": "",
+                    "extra_notes": "",
+                    "require_approval_for_paid_items": False,
+                },
+            },
+            success=True,
+            pending=True,
+            facts={},
+        )
+    )
+
+    assert "callback phone +14155550123" in sentence
+    assert "preferred location cleared" in sentence
+    assert "seating preference cleared" in sentence
+    assert "extra notes cleared" in sentence
+    assert "paid-item approval off" in sentence
 
 
 def test_consequential_speech_requires_exact_application_confirmation():

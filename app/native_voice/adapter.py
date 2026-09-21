@@ -666,20 +666,11 @@ class NativeVoiceAdapter:
                 return f"Would you like me to cancel booking reference {booking_id} for {customer_name}?"
             if outcome.name == "update_confirmed_booking":
                 booking_id = proposed.get("booking_id") or outcome.facts.get("booking_id") or ""
-                date_value = proposed.get("date") or outcome.facts.get("date") or ""
-                time_value = proposed.get("time") or outcome.facts.get("time") or ""
-                party_size = proposed.get("party_size") or outcome.facts.get("party_size") or ""
-                customer_name = proposed.get("customer_name") or outcome.facts.get("customer_name") or ""
-                details = [f"{date_value} at {time_value}", f"for {party_size} guests"]
-                if customer_name:
-                    details.append(f"under {customer_name}")
-                if proposed.get("preferred_location"):
-                    details.append(f"at {proposed['preferred_location']}")
-                if proposed.get("notes"):
-                    details.append(f"with notes {proposed['notes']}")
+                details = NativeVoiceAdapter._format_booking_update_fields(proposed)
                 return (
                     f"Booking reference {booking_id} would be updated to "
-                    f"{', '.join(details)}. Would you like me to apply these changes?"
+                    f"{', '.join(details) or 'the proposed values'}. "
+                    "Would you like me to apply these changes?"
                 )
             if outcome.name in {"create_booking", "get_reservation_draft"}:
                 date_value = proposed.get("date") or outcome.facts.get("date") or ""
@@ -802,6 +793,38 @@ class NativeVoiceAdapter:
         if item.get("notes"):
             effects.append(f"note {item['notes']}")
         return f"{text} ({'; '.join(effects)})" if effects else text
+
+    @staticmethod
+    def _format_booking_update_fields(proposed: Mapping[str, Any]) -> list[str]:
+        labels = {
+            "date": "date",
+            "time": "time",
+            "party_size": "party size",
+            "preferred_location": "preferred location",
+            "customer_name": "name",
+            "customer_phone": "callback phone",
+            "seating_preference": "seating preference",
+            "seating_backup": "backup seating",
+            "seating_avoid": "seating to avoid",
+            "dietary": "dietary request",
+            "occasion": "occasion",
+            "extra_notes": "extra notes",
+            "notes": "complete notes",
+            "require_approval_for_paid_items": "paid-item approval",
+        }
+        fields = []
+        for key, value in proposed.items():
+            if key == "booking_id":
+                continue
+            label = labels.get(key, key.replace("_", " "))
+            if isinstance(value, bool):
+                display = "on" if value else "off"
+            elif value in (None, ""):
+                display = "cleared"
+            else:
+                display = str(value)
+            fields.append(f"{label} {display}")
+        return fields
 
     @staticmethod
     def _with_confirmation(outcome: ToolOutcome) -> ToolOutcome:

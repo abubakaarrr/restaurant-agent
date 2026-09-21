@@ -1465,6 +1465,56 @@ class ToolBridge:
                         return False
                 except (TypeError, ValueError):
                     return False
+            if name == "update_reservation_draft":
+                required = (
+                    "booking_id",
+                    "customer_name",
+                    "customer_phone",
+                    "status",
+                    "date",
+                    "time",
+                    "party_size",
+                    "readback_committed",
+                )
+                if not all(field in readback for field in required) or not readback.get("readback_committed"):
+                    return False
+                text_fields = {
+                    "name": "customer_name",
+                    "customer_name": "customer_name",
+                    "phone": "customer_phone",
+                    "customer_phone": "customer_phone",
+                    "date": "date",
+                    "time": "time",
+                    "seating_preference": "seating_preference",
+                    "seating_backup": "seating_backup",
+                    "seating_avoid": "seating_avoid",
+                    "dietary": "dietary",
+                    "occasion": "occasion",
+                    "extra_notes": "extra_notes",
+                }
+                for argument_key, readback_key in text_fields.items():
+                    if argument_key not in arguments or arguments[argument_key] is None:
+                        continue
+                    expected = " ".join(str(arguments[argument_key]).split()).casefold()
+                    actual = " ".join(str(readback.get(readback_key) or "").split()).casefold()
+                    if readback_key == "customer_name":
+                        if _canonical_name(arguments[argument_key]) != _canonical_name(readback.get(readback_key)):
+                            return False
+                    elif readback_key == "customer_phone":
+                        if _canonical_phone(arguments[argument_key]) != _canonical_phone(readback.get(readback_key)):
+                            return False
+                    elif expected != actual:
+                        return False
+                if "party_size" in arguments and arguments["party_size"] is not None:
+                    try:
+                        if int(readback.get("party_size") or 0) != int(arguments["party_size"]):
+                            return False
+                    except (TypeError, ValueError):
+                        return False
+                if "require_approval_for_paid_items" in arguments and arguments["require_approval_for_paid_items"] is not None:
+                    if bool(readback.get("require_approval_for_paid_items")) != bool(arguments["require_approval_for_paid_items"]):
+                        return False
+                return True
             if "order_id" in readback:
                 if not readback.get("readback_committed"):
                     return False
@@ -1647,21 +1697,6 @@ class ToolBridge:
                     and readback.get("customer_name")
                     and readback.get("customer_phone")
                 )
-            if name == "update_reservation_draft":
-                if not readback.get("readback_committed"):
-                    return False
-                for argument_key, readback_key in (
-                    ("name", "customer_name"),
-                    ("customer_name", "customer_name"),
-                    ("phone", "customer_phone"),
-                    ("customer_phone", "customer_phone"),
-                    ("date", "date"),
-                    ("time", "time"),
-                    ("party_size", "party_size"),
-                ):
-                    if argument_key in arguments and arguments[argument_key] is not None and readback.get(readback_key) != arguments[argument_key]:
-                        return False
-                return all(field in readback for field in ("customer_name", "customer_phone", "date", "time", "party_size"))
             return False
         if isinstance(readback, str):
             return False
