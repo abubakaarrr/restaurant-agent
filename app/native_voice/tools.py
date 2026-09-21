@@ -558,14 +558,16 @@ class RestaurantToolExecutor:
             if self._native_service is not None:
                 try:
                     readback = dict(await self._service.get_order_summary(call_id=session_id))
-                    readback["guest_notes"] = str(result.get("guest_notes") or arguments.get("note") or "") if isinstance(result, Mapping) else str(arguments.get("note") or "")
+                    if not isinstance(result, Mapping) or "guest_notes" not in result:
+                        return {"readback_committed": False}
+                    readback["guest_notes"] = str(result.get("guest_notes") or "")
                     readback["readback_committed"] = True
                     readback.setdefault("unresolved_fields", [])
                     readback["state_version"] = int(readback.get("draft_version") or 0)
                     readback["readback_hash"] = _order_readback_hash(readback)
                     return readback
                 except Exception:
-                    return {**(dict(result) if isinstance(result, Mapping) else {}), "guest_notes": str(arguments.get("note") or ""), "readback_committed": True}
+                    return {"readback_committed": False}
             from app.call_memory import get_call_memory, hydrate_call_memory
             try:
                 readback = dict(
@@ -1066,7 +1068,9 @@ class ToolBridge:
                 if getattr(exc, "code", "") != "order_not_found":
                     return None, "booking_scope_unverified"
             else:
-                if current is not None:
+                if current is not None and (
+                    not isinstance(current, Mapping) or int(current.get("booking_id") or 0)
+                ):
                     return None, "booking_scope_unverified"
             scoped = dict(arguments)
             scoped["session_id"] = self.session_id

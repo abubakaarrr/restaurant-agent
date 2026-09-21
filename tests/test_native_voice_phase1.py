@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+from datetime import datetime
 import hashlib
 import importlib
 import json
@@ -87,6 +88,12 @@ class NativeServiceFake:
             ],
         )
         return {"ok": True, "order_id": 7, "order_item_id": len(self.calls), "status": "pending", "draft_version": len(self.calls)}
+
+    async def add_guest_note(self, **kwargs):
+        self.summary["order_notes"] = kwargs["note"]
+        self.summary["guest_notes"] = kwargs["note"]
+        self.summary["readback_hash"] = _order_readback_hash(self.summary)
+        return {"saved": True, "guest_notes": kwargs["note"], "note_owner": "order"}
 
     async def lookup_booking(self, **kwargs):
         return {
@@ -275,6 +282,73 @@ async def test_native_postgresql_executor_and_state_store_are_actual_boundaries(
         await close_native_voice_pool()
 
 
+@pytest.mark.skipif(os.getenv("RUN_DB_INTEGRATION") != "1", reason="disposable native PostgreSQL required")
+@pytest.mark.asyncio
+async def test_native_adapter_affirmation_advances_server_confirmation_turn():
+    session = f"native-confirm-test-{uuid.uuid4().hex}"
+    pool = await get_native_voice_pool()
+    booking_id = None
+    try:
+        async with pool.acquire() as conn:
+            table_id = await conn.fetchval("SELECT id FROM tables ORDER BY id LIMIT 1")
+            booking_id = await conn.fetchval(
+                """
+                INSERT INTO bookings
+                    (customer_name, customer_phone, table_id, booked_at, party_size, status)
+                VALUES ($1, $2, $3, $4, $5, 'confirmed')
+                RETURNING id
+                """,
+                "Ada Lovelace",
+                "+14155550123",
+                table_id,
+                datetime(2026, 9, 28, 19, 0),
+                2,
+            )
+            await conn.execute(
+                "INSERT INTO call_sessions (session_id, state) VALUES ($1, $2::jsonb)",
+                session,
+                json.dumps({
+                    "booking_id": booking_id,
+                    "customer_name": "Ada Lovelace",
+                    "customer_phone": "+14155550123",
+                }),
+            )
+        events = [
+            {"type": "response.created", "response": {"id": "r1"}},
+            {"type": "conversation.item.input_audio_transcription.completed", "item_id": "i1", "transcript": "Cancel my reservation"},
+            {"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "c1", "name": "cancel_booking", "arguments": json.dumps({"session_id": session, "booking_id": booking_id, "caller_confirmed": False})}},
+            {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+            {"type": "response.created", "response": {"id": "r1b"}},
+            {"type": "response.output_audio_transcript.done", "transcript": "Please confirm the cancellation."},
+            {"type": "response.done", "response": {"id": "r1b", "status": "completed"}},
+            {"type": "response.created", "response": {"id": "r2"}},
+            {"type": "conversation.item.input_audio_transcription.completed", "item_id": "i2", "transcript": "Yes, cancel my reservation"},
+            {"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "c2", "name": "cancel_booking", "arguments": json.dumps({"session_id": session, "booking_id": booking_id, "caller_confirmed": True})}},
+            {"type": "response.done", "response": {"id": "r2", "status": "completed"}},
+            {"type": "response.created", "response": {"id": "r2b"}},
+            {"type": "response.output_audio_transcript.done", "transcript": "Your reservation was cancelled."},
+            {"type": "response.done", "response": {"id": "r2b", "status": "completed"}},
+        ]
+        adapter = NativeVoiceAdapter(
+            session_id=session,
+            transport=MemoryRealtimeTransport(events),
+            state_store=CallSessionOrderStateStore(),
+        )
+        first = await adapter.submit_audio(b"synthetic", turn_id="turn-1")
+        second = await adapter.submit_audio(b"synthetic", turn_id="turn-2")
+        async with pool.acquire() as conn:
+            status = await conn.fetchval("SELECT status FROM bookings WHERE id = $1", booking_id)
+        assert status == "cancelled"
+        assert first.turn and second.turn
+    finally:
+        async with pool.acquire() as conn:
+            if booking_id:
+                await conn.execute("DELETE FROM voice_action_idempotency WHERE call_id = $1", session)
+                await conn.execute("DELETE FROM bookings WHERE id = $1", booking_id)
+            await conn.execute("DELETE FROM call_sessions WHERE session_id = $1", session)
+        await close_native_voice_pool()
+
+
 @pytest.mark.asyncio
 async def test_tool_bridge_requires_readback_and_replays_idempotently():
     executor = FakeExecutor(
@@ -408,6 +482,23 @@ async def test_native_booking_lookup_requires_supplied_phone_match():
     )
     assert not outcome.success
     assert outcome.error == "booking_scope_unverified"
+
+
+@pytest.mark.asyncio
+async def test_native_anonymous_order_guest_note_uses_authoritative_order_scope():
+    from app.native_voice.tools import RestaurantToolExecutor
+
+    service = NativeServiceFake()
+    bridge = ToolBridge(RestaurantToolExecutor(service=service), session_id="native-call")
+    outcome = await bridge.invoke(
+        call_id="note-1",
+        name="add_guest_note",
+        arguments={"session_id": "native-call", "note": "Please include utensils"},
+        turn_id="turn-note",
+        state_version=1,
+    )
+    assert outcome.success and outcome.readback_verified
+    assert service.summary["order_notes"] == "Please include utensils"
 
 
 @pytest.mark.asyncio
@@ -1150,7 +1241,6 @@ async def test_inmemory_adapter_uses_offline_executor(monkeypatch):
         transport=MemoryRealtimeTransport(),
         state_store=InMemoryOrderStateStore(),
     )
-    assert not adapter._uses_native_database
     await adapter.start()
 
 
@@ -1217,7 +1307,8 @@ async def test_committed_mutation_replays_after_adapter_restart():
         facts={"status": "cancelled", "booking_id": 7, "reference": "7"},
     )
     committed = first._with_confirmation(committed)
-    await first._persist_committed_outcome(committed)
+    committed = await first._persist_committed_outcome(committed)
+    assert committed.state_version == first.state.version
 
     restarted = NativeVoiceAdapter(
         session_id="call-1",
@@ -1231,6 +1322,16 @@ async def test_committed_mutation_replays_after_adapter_restart():
     assert replay is not None
     assert replay.replayed and replay.success and replay.readback_verified
     assert replay.result == committed.result
+    restarted._replayed_finalized_turns.add("turn-cancel")
+    same_operation = await restarted._run_tool("cancel-3", "cancel_booking", arguments, generation=0)
+    different_operation = await restarted._run_tool(
+        "cancel-4",
+        "cancel_booking",
+        {**arguments, "reason": "different"},
+        generation=0,
+    )
+    assert same_operation.replayed and same_operation.success
+    assert not different_operation.success and different_operation.error == "replayed_finalized_turn"
 
 
 @pytest.mark.asyncio

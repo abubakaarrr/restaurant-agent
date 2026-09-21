@@ -493,6 +493,19 @@ class RestaurantService:
             "state": self._coerce_state(row["state"]),
         }
 
+    async def hydrate_native_call_memory(self, call_id: str) -> dict[str, Any]:
+        state = await self.load_call_state(call_id)
+        from app.call_memory import update_call_memory
+
+        persisted = state.get("state") or {}
+        update_call_memory(
+            call_id,
+            pending_confirmations=persisted.get("pending_confirmations") or {},
+            confirmation_turn=persisted.get("confirmation_turn") or 0,
+            last_turn_affirmation=persisted.get("last_turn_affirmation") or "unclear",
+        )
+        return state
+
     async def get_reservation_draft(self, call_id: str) -> JsonDict:
         state = (await self.load_call_state(call_id)).get("state") or {}
         return coerce_draft(state.get("reservation_draft") or state)

@@ -187,9 +187,6 @@ class NativeVoiceAdapter:
         self._turn_lock = asyncio.Lock()
         self._commit_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
-        self._uses_native_database = isinstance(self.state_store, CallSessionOrderStateStore) or isinstance(
-            getattr(self.tool_bridge, "executor", None), RestaurantToolExecutor
-        )
         if hasattr(self.tool_bridge, "bind_session"):
             self.tool_bridge.bind_session(session_id)
 
@@ -197,6 +194,9 @@ class NativeVoiceAdapter:
         if self._started:
             return
         self.state = await self.state_store.load(self.session_id)
+        native_service = getattr(getattr(self.tool_bridge, "executor", None), "_native_service", None)
+        if native_service is not None and hasattr(native_service, "hydrate_native_call_memory"):
+            await native_service.hydrate_native_call_memory(self.session_id)
         event = self.config.session_update()
         await self._send(event)
         self.recorder.record(event)
@@ -208,6 +208,22 @@ class NativeVoiceAdapter:
     async def _send(self, event: Mapping[str, Any]) -> None:
         async with self._lifecycle_lock:
             await self.transport.send(event)
+
+    async def _persist_native_confirmation_state(self) -> None:
+        native_service = getattr(getattr(self.tool_bridge, "executor", None), "_native_service", None)
+        if native_service is None:
+            return
+        from app.call_memory import get_call_memory
+
+        memory = get_call_memory(self.session_id)
+        await native_service.persist_call_state(
+            self.session_id,
+            {
+                "pending_confirmations": dict(memory.get("pending_confirmations") or {}),
+                "confirmation_turn": int(memory.get("confirmation_turn") or 0),
+                "last_turn_affirmation": str(memory.get("last_turn_affirmation") or "unclear"),
+            },
+        )
 
     async def apply_order_patch(self, patch: OrderPatch) -> OrderState:
         """Apply facts only after a completed caller turn exists."""
@@ -573,7 +589,8 @@ class NativeVoiceAdapter:
                 outcome = await self._run_tool(call_id, name, args, generation=generation)
                 outcome = self._with_confirmation(outcome)
                 if outcome.success and outcome.readback_verified:
-                    await self._persist_committed_outcome(outcome)
+                    outcome = await self._persist_committed_outcome(outcome)
+                await self._persist_native_confirmation_state()
                 if generation != self.interruptions.generation:
                     if outcome.success and outcome.readback_verified:
                         self._outcomes.append(outcome)
@@ -781,16 +798,21 @@ class NativeVoiceAdapter:
                         resource[key] = subject[key]
         return resource
 
-    async def _persist_committed_outcome(self, outcome: ToolOutcome) -> None:
-        if self._completed_turn is None or not outcome.success or not outcome.readback_verified:
-            return
+    async def _persist_committed_outcome(self, outcome: ToolOutcome) -> ToolOutcome:
+        if (
+            self._completed_turn is None
+            or outcome.name not in MUTATING_TOOLS
+            or not outcome.success
+            or not outcome.readback_verified
+        ):
+            return outcome
         operation_id = outcome.operation_id or self._operation_id(
             outcome.name, outcome.arguments, self._completed_turn.turn_id
         )
         current = await self.state_store.load(self.session_id)
         if any(item.operation_id == operation_id and item.session_id == self.session_id for item in current.committed_operations):
             self.state = current
-            return
+            return replace(outcome, state_version=current.version)
         committed = CommittedOperation(
             session_id=self.session_id,
             operation_id=operation_id,
@@ -815,7 +837,7 @@ class NativeVoiceAdapter:
             latest = await self.state_store.load(self.session_id)
             if any(item.operation_id == operation_id and item.session_id == self.session_id for item in latest.committed_operations):
                 self.state = latest
-                return
+                return replace(outcome, state_version=latest.version)
             next_state = replace(
                 latest,
                 version=latest.version + 1,
@@ -824,6 +846,8 @@ class NativeVoiceAdapter:
             saved = await self._save_state(next_state, expected_version=latest.version, generation=None)
         if saved:
             self.state = next_state
+            return replace(outcome, state_version=next_state.version)
+        return replace(outcome, state_version=self.state.version)
 
     async def _durable_replay(self, call_id: str, name: str, arguments: Mapping[str, Any]) -> ToolOutcome | None:
         if self._completed_turn is None:
@@ -876,12 +900,17 @@ class NativeVoiceAdapter:
             return
         if completed.turn_id in self.state.finalized_turn_ids:
             if any(item.turn_id == completed.turn_id and item.session_id == self.session_id for item in self.state.committed_operations):
+                self._replayed_finalized_turns.add(completed.turn_id)
                 self.recorder.record({"type": "replayed_turn_available", "turn_id": completed.turn_id})
                 return
             else:
                 self._replayed_finalized_turns.add(completed.turn_id)
                 self.recorder.record({"type": "replayed_turn_rejected", "turn_id": completed.turn_id})
                 return
+        from app.pending_confirmation import begin_caller_turn
+
+        begin_caller_turn(self.session_id, transcript)
+        await self._persist_native_confirmation_state()
         patch = None
         if self.facts_extractor is not None:
             extracted = self.facts_extractor(completed, self.state)
@@ -1046,11 +1075,11 @@ class NativeVoiceAdapter:
     async def _run_tool(self, call_id: str, name: str, args: Mapping[str, Any], *, generation: int) -> ToolOutcome:
         if generation != self.interruptions.generation:
             return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="stale_interrupted_tool_call", state_version=self.state.version)
-        if self._completed_turn is not None and self._completed_turn.turn_id in self._replayed_finalized_turns:
-            return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="replayed_finalized_turn", state_version=self.state.version)
         durable = await self._durable_replay(call_id, name, args)
         if durable is not None:
             return replace(durable, call_id=call_id)
+        if self._completed_turn is not None and self._completed_turn.turn_id in self._replayed_finalized_turns:
+            return ToolOutcome(name=name, call_id=call_id, arguments=dict(args), result=None, success=False, error="replayed_finalized_turn", state_version=self.state.version)
         if self.state.unresolved_fields:
             if name in MUTATING_TOOLS and (
                 name != "update_reservation_draft" or not self._reservation_correction_is_scoped(args)
