@@ -2033,3 +2033,56 @@ def test_model_receives_closed_restaurant_and_negative_availability():
     assert output["facts"]["availability"] == "unavailable"
     assert output["facts"]["restaurant_closed"] is True
     assert output["facts"]["message"] == result["message"]
+
+
+def test_closed_restaurant_speech_matches_non_item_subject():
+    facts = ToolBridge._facts(
+        {"available": False, "restaurant_closed": True, "date": "2026-09-28", "time": "19:00"},
+        None, {"session_id": "native", "date": "2026-09-28", "time": "19:00"},
+    )
+    evidence = ToolEvidence(action="check_table_availability", call_id="closed", turn_id="turn",
+        state_version=1, success=True, readback_verified=True, facts=facts)
+    decision = SpeechGate().evaluate(
+        "The restaurant is closed on Monday, September 28. Would you like a different date?",
+        b"closed", evidence=[evidence], current_state_version=1,
+    )
+    assert decision.allowed, decision.reasons
+    wrong = SpeechGate().evaluate(
+        "The restaurant is open on Monday, September 28.", b"wrong",
+        evidence=[evidence], current_state_version=1,
+    )
+    assert not wrong.allowed
+    assert SpeechGate._subject_matches("The 7 pm slot", {"subject": {"time": "19:00"}})
+
+
+def test_ambiguous_menu_lookup_requests_clarification_not_availability():
+    output = NativeVoiceAdapter._model_tool_output(ToolOutcome(
+        name="check_menu_item_availability", call_id="unknown", arguments={},
+        result={"status": "ambiguous", "match": None}, success=True, readback_verified=True,
+        facts={"status": "ambiguous"},
+    ))
+    assert output["status"] == "needs_clarification"
+    assert output["clarification_state"] == "required"
+    assert SpeechGate().evaluate(output["speech"], b"clarify").allowed
+
+
+@pytest.mark.parametrize("spoken, matches", [
+    ("September 28", True), ("September 28 2026", True),
+    ("September 29", False), ("September 28 2025", False), ("09/28/25", False),
+])
+def test_spoken_date_distinguishes_day_from_explicit_year(spoken, matches):
+    assert SpeechGate._date_matches(spoken, "2026-09-28") is matches
+
+
+@pytest.mark.parametrize("stored_removals, verified", [(["onion jam"], True), ([], False), (["cheddar"], False)])
+def test_removal_option_verifies_its_canonical_stored_effect(stored_removals, verified):
+    arguments = {"item_name": "Hearth Burger", "quantity": 1,
+                 "modifier_ids": ["modifier.side-fries", "modifier.remove-onion"]}
+    readback = order_readback(items=[{
+        "order_item_id": 1, "item_id": "menu.sandwich.hearth-burger",
+        "item_name": "Hearth Burger", "quantity": 1,
+        "modifiers": [{"option_id": "modifier.side-fries", "name": "hearth fries"}],
+        "removals": stored_removals, "substitutions": [], "notes": "",
+    }])
+    assert ToolBridge._verify_readback("add_order_item", arguments, readback, 0,
+                                       {"order_item_id": 1}) is verified

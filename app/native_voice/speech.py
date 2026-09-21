@@ -403,8 +403,8 @@ class SpeechGate:
             for item in canonical_items
             if isinstance(item, Mapping) and item.get("name")
         )
-        if isinstance(subject := facts.get("subject"), Mapping):
-            item_names += (str(subject.get("item_name") or "").casefold(),)
+        if isinstance(subject := facts.get("subject"), Mapping) and subject.get("item_name"):
+            item_names += (str(subject["item_name"]).casefold(),)
         if item_names:
             for item_name in item_names:
                 if not item_name:
@@ -432,7 +432,7 @@ class SpeechGate:
             spoken_time = re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", normalized)
             expected_time = str(subject.get("time") or "").casefold()
             if spoken_time and expected_time:
-                if self._time_minutes(spoken_time.group(0)) == self._time_minutes(expected_time):
+                if SpeechGate._time_minutes(spoken_time.group(0)) == SpeechGate._time_minutes(expected_time):
                     expected_location = str(subject.get("preferred_location") or "").casefold()
                     mentioned_location = next(
                         (location for location in ("patio", "main", "private") if re.search(rf"\b{location}\b", normalized)),
@@ -531,13 +531,14 @@ class SpeechGate:
             return False
         value = spoken.strip().replace("/", "-").replace(",", "")
         parsed = None
-        includes_year = bool(re.search(r"\b\d{4}\b|\b\d{2}\b$", value))
+        includes_year = False
         for pattern in (
             "%Y-%m-%d", "%m-%d-%Y", "%m-%d-%y", "%B %d %Y", "%b %d %Y",
             "%d %B %Y", "%d %b %Y", "%B %d", "%b %d",
         ):
             try:
                 parsed = datetime.strptime(value, pattern).date()
+                includes_year = "%Y" in pattern or "%y" in pattern
                 break
             except ValueError:
                 continue

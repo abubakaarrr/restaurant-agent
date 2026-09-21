@@ -1610,12 +1610,36 @@ class ToolBridge:
                         return False
                     if arguments.get("quantity") is not None and int(item.get("quantity") or 0) != int(arguments["quantity"]):
                         return False
+                    effect_fields = {"modifier_ids", "removals", "substitutions"}
+                    expected_effects = None
+                    if effect_fields & arguments.keys():
+                        from app.restaurant_knowledge import get_restaurant_knowledge
+                        knowledge = get_restaurant_knowledge()
+                        canonical_menu_item = next(
+                            (entry for entry in knowledge.menu_items if entry.get("item_id") == item.get("item_id")),
+                            None,
+                        )
+                        if canonical_menu_item is not None:
+                            expected_effects = knowledge.resolve_customization(
+                                canonical_menu_item,
+                                modifier_ids=arguments.get("modifier_ids") or (),
+                                removals=arguments.get("removals") or (),
+                                substitutions=arguments.get("substitutions") or (),
+                            )
+                            if expected_effects.get("status") != "valid":
+                                return False
                     for argument_key, readback_key in (
                         ("modifier_ids", "modifiers"),
                         ("removals", "removals"),
                         ("substitutions", "substitutions"),
                     ):
-                        if argument_key in arguments and _canonical_effect_values(arguments[argument_key]) != _canonical_effect_values(item.get(readback_key)):
+                        if expected_effects is not None:
+                            expected = expected_effects[readback_key]
+                        elif argument_key in arguments:
+                            expected = arguments[argument_key]
+                        else:
+                            continue
+                        if _canonical_effect_values(expected) != _canonical_effect_values(item.get(readback_key)):
                             return False
                     if "notes" in arguments and arguments["notes"] is not None and str(item.get("notes") or "").strip() != str(arguments["notes"] or "").strip():
                         return False

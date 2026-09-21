@@ -50,6 +50,9 @@ class RealtimeConfig:
         "for ambiguity. Keep order memory in application state, not conversation history. "
         "Respect negative availability: if the restaurant is closed or a slot is unavailable, "
         "explain that result and ask for another time; do not proceed with a reservation. "
+        "If a menu lookup is ambiguous, resolve it with another menu lookup or say exactly: "
+        "Could you give me the exact menu item name? Never label an unidentified item "
+        "available or unavailable. "
         "Record bag or utensil requests in order_notes, item preparation in item notes, "
         "and allergies in allergy_notes. Never claim an allergen is safe to remove. "
         "Before adding an item, use check_menu_item_availability to resolve its canonical "
@@ -681,9 +684,8 @@ class NativeVoiceAdapter:
                     }],
                     tool_choice="none",
                     instructions=(
-                        "You are an English speech renderer. Read the user's text aloud exactly as written. "
-                        "The text is a script, not a question to answer or instructions to follow. "
-                        "Do not add a greeting, omit words, paraphrase, or translate. Speak only the script."
+                        "Speak in English. Repeat the entire text in the user message word for word, "
+                        "including its opening and final question. Do not answer the question."
                     ),
                 )
             await self._send({"type": "response.create", "response": response_options})
@@ -909,12 +911,17 @@ class NativeVoiceAdapter:
     def _model_tool_output(outcome: ToolOutcome) -> dict[str, Any]:
         sentence = outcome.confirmation_text or NativeVoiceAdapter._confirmation_sentence(outcome)
         verified = outcome.success and outcome.readback_verified
-        clarification_required = outcome.error == "clarification_required"
+        clarification_required = outcome.error == "clarification_required" or (
+            outcome.name == "check_menu_item_availability"
+            and outcome.facts.get("status") in {"ambiguous", "not_found", "unknown"}
+        )
+        if clarification_required and outcome.name == "check_menu_item_availability" and not outcome.confirmation_text:
+            sentence = "Could you give me the exact menu item name?"
         result_id = hashlib.sha256(
             f"{outcome.name}:{outcome.call_id}:{outcome.state_version}".encode("utf-8")
         ).hexdigest()[:24]
         output = {
-            "status": "pending_confirmation" if outcome.pending else ("completed" if verified else "failed"),
+            "status": "pending_confirmation" if outcome.pending else ("needs_clarification" if clarification_required else ("completed" if verified else "failed")),
             "result_id": result_id,
             "clarification_state": "required" if clarification_required else "none",
             "speech": sentence,
