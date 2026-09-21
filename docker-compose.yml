@@ -17,6 +17,7 @@ services:
       retries: 12
 
   web:
+    image: ${RESTAURANT_IMAGE_TAG:-restaurant-agent:local}
     build: .
     restart: unless-stopped
     depends_on:

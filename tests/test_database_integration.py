@@ -80,7 +80,9 @@ async def isolated_database(monkeypatch: pytest.MonkeyPatch):
 
 
 def _future_date() -> str:
-    candidate = (datetime.now() + timedelta(days=30)).date()
+    # Keep the fixture deterministic and inside the 30-day window relative to
+    # the frozen application clock used by ``isolated_database`` above.
+    candidate = (datetime(2026, 9, 8) + timedelta(days=14)).date()
     excluded = {"2026-10-18", "2026-11-26", "2026-12-24"}
     while candidate.weekday() == 0 or candidate.isoformat() in excluded:
         candidate += timedelta(days=1)
