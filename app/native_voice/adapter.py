@@ -64,7 +64,7 @@ class RealtimeConfig:
                         "turn_detection": None,
                     },
                     "output": {
-                        "format": {"type": self.output_format},
+                        "format": {"type": self.output_format, "rate": self.sample_rate_hz},
                         "voice": self.voice,
                     },
                 },

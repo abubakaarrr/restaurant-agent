@@ -1130,6 +1130,7 @@ async def test_booking_tools_fail_closed_without_verified_server_scope():
 
 def test_realtime_config_is_native_audio_and_strictly_development_scoped():
     session = RealtimeConfig().session_update()["session"]
+    assert session["audio"]["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
     assert session["type"] == "realtime"
     assert session["model"] == "gpt-realtime"
     assert session["output_modalities"] == ["audio"]
