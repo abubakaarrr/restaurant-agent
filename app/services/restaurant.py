@@ -1530,9 +1530,14 @@ class RestaurantService:
             else:
                 draft = coerce_draft(session_state.get("reservation_draft") or session_state)
             booked_at = row["booked_at"]
-            new_date = draft.get("date") or booked_at.date().isoformat()
-            new_time = draft.get("time") or booked_at.strftime("%H:%M")
-            new_party = int(draft.get("party_size") or row["party_size"])
+            if self._pool_provider is not None:
+                new_date = draft.get("date") or booked_at.date().isoformat()
+                new_time = draft.get("time") or booked_at.strftime("%H:%M")
+                new_party = int(draft.get("party_size") or row["party_size"])
+            else:
+                new_date = date or booked_at.date().isoformat()
+                new_time = time or booked_at.strftime("%H:%M")
+                new_party = party_size or int(row["party_size"])
             location_pref = preferred_location or draft_preferred_location(
                 seating_preference if seating_preference is not None else draft
             )
