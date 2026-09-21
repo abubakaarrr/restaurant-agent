@@ -1923,3 +1923,62 @@ async def test_unresolved_reservation_allows_only_scoped_correction(monkeypatch)
     assert outcome.success and outcome.readback_verified
     assert not (await store.load("call-1")).unresolved_fields
     assert executor.calls
+
+
+@pytest.mark.parametrize("lookup_kind", ["items", "match"])
+def test_model_receives_canonical_modifier_contract_without_private_fields(lookup_kind):
+    menu_item = {
+        "item_id": "menu.sandwich.hearth-burger", "name": "Hearth Burger",
+        "price": 18.0, "available": True,
+        "modifier_options": [{
+            "option_id": "modifier.side-fries", "name": "Hearth Fries",
+            "kind": "side_choice", "price_delta": 0, "availability": "available",
+            "removes": {"menu.sandwich.hearth-burger": "onion jam"},
+            "internal_secret": "never expose",
+        }],
+        "required_modifier_groups": [{
+            "group_id": "side", "min": 1, "max": 1,
+            "option_ids": ["modifier.side-fries"], "internal_secret": "never expose",
+        }],
+        "removable_ingredients": ["onion jam"], "internal_secret": "never expose",
+    }
+    result = {lookup_kind: [menu_item] if lookup_kind == "items" else menu_item}
+    outcome = ToolOutcome(
+        name="check_menu_item_availability", call_id="lookup", arguments={},
+        result=result, success=True, readback_verified=True,
+        facts=ToolBridge._facts(result, None, {}),
+    )
+    payload = NativeVoiceAdapter._model_tool_output(outcome)
+    canonical = payload["facts"]["canonical_items"][0]
+    assert canonical["modifier_options"][0]["option_id"] == "modifier.side-fries"
+    assert canonical["modifier_options"][0]["removes"] == {"menu.sandwich.hearth-burger": "onion jam"}
+    assert canonical["required_modifier_groups"] == [{
+        "group_id": "side", "min": 1, "max": 1, "option_ids": ["modifier.side-fries"],
+    }]
+    assert canonical["removable_ingredients"] == ["onion jam"]
+    assert payload["facts"]["prices"]["menu.sandwich.hearth-burger"] == 18.0
+    assert "internal_secret" not in json.dumps(payload)
+
+
+def test_failed_write_does_not_silence_grounded_recovery_or_authorize_success():
+    failed = NativeVoiceAdapter._with_confirmation(ToolOutcome(
+        name="add_order_item", call_id="failed-add", arguments={},
+        result={"added": False, "status": "ambiguous"}, success=False,
+        state_version=2,
+    ))
+    assert not failed.confirmation_text
+    assert NativeVoiceAdapter._model_tool_output(failed)["exact_speech_required"] is False
+    menu = ToolOutcome(
+        name="get_full_menu", call_id="menu", arguments={}, result={},
+        success=True, readback_verified=True, state_version=2,
+        facts={"canonical_items": [{"name": "Hearth Burger", "available": True}],
+               "items": ["Hearth Burger"], "availability": "available"},
+    )
+    evidence = [failed.as_evidence(turn_id="turn"), menu.as_evidence(turn_id="turn")]
+    gate = SpeechGate()
+    assert gate.evaluate("Would you like fries as your side?", b"question",
+                         evidence=evidence, current_state_version=2).allowed
+    rejected = gate.evaluate("Hearth Burger was added to your order.", b"unsafe",
+                             evidence=evidence, current_state_version=2)
+    assert not rejected.allowed
+    assert "success_claim_without_matching_readback" in rejected.reasons

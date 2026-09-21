@@ -46,7 +46,17 @@ class RealtimeConfig:
         "Use the provided restaurant tools for every menu, price, availability, "
         "booking, and order fact. Never claim an action succeeded without a "
         "matching tool result and database readback. Ask one bounded clarification "
-        "for ambiguity. Keep order memory in application state, not conversation history."
+        "for ambiguity. Keep order memory in application state, not conversation history. "
+        "Before adding an item, use check_menu_item_availability to resolve its canonical "
+        "name and modifier option IDs. Pass the canonical item name separately from "
+        "modifiers; never append sides or customizations to the item name. "
+        "Use choices and corrections already supplied by the caller; ask only for "
+        "missing or genuinely ambiguous information. Apply their fulfillment and "
+        "notes through tools, then get_order_summary for a complete readback. "
+        "Do not confirm an order until its readback has been spoken and the caller "
+        "agrees in a later turn. When a tool output has exact_speech_required=true, "
+        "speak its speech text verbatim, without a preface or extra claims. If several "
+        "tools run, use the latest authoritative readback and current application state."
     )
 
     def session_update(self) -> dict[str, Any]:
@@ -836,6 +846,17 @@ class NativeVoiceAdapter:
     def _with_confirmation(outcome: ToolOutcome) -> ToolOutcome:
         if outcome.name not in MUTATING_TOOLS and not outcome.pending:
             return outcome
+        # A failed write is not a confirmation. Do not let its generic failure
+        # text suppress a later grounded lookup or clarification in the same turn.
+        safe_clarification = (
+            outcome.name == "update_confirmed_booking"
+            and isinstance(outcome.result, Mapping)
+            and outcome.result.get("error") == "booking_notes_ambiguous"
+            and outcome.facts.get("safe_clarification") == outcome.result.get("message")
+            and bool(outcome.facts.get("safe_clarification"))
+        )
+        if not outcome.pending and not (outcome.success and outcome.readback_verified) and not safe_clarification:
+            return outcome
         sentence = NativeVoiceAdapter._confirmation_sentence(outcome)
         confirmation_hash = hashlib.sha256(sentence.casefold().strip().encode("utf-8")).hexdigest()
         return replace(outcome, confirmation_text=sentence, confirmation_hash=confirmation_hash)
@@ -853,6 +874,7 @@ class NativeVoiceAdapter:
             "result_id": result_id,
             "clarification_state": "required" if clarification_required else "none",
             "speech": sentence,
+            "exact_speech_required": bool(outcome.confirmation_text),
         }
         safe_facts = NativeVoiceAdapter._safe_model_facts(outcome.facts)
         safe_facts.setdefault("evidence_version", outcome.state_version)
@@ -887,22 +909,30 @@ class NativeVoiceAdapter:
             "id", "name", "price", "available", "modifier_options", "ingredients",
             "allergens", "dietary_tags", "customer_safe_answer", "item_name",
             "item_id", "quantity", "order_item_id", "modifiers", "removals", "substitutions",
-            "notes", "unit_price", "subtotal",
+            "notes", "unit_price", "subtotal", "required_modifier_groups",
+            "removable_ingredients",
         }
 
         nested_allowed = {
+            "modifier_options": {"option_id", "name", "kind", "price_delta", "availability", "removes", "warning"},
+            "required_modifier_groups": {"group_id", "min", "max", "option_ids"},
             "fulfillment_details": {"address", "instructions", "fulfillment_at", "delivery_fee", "zone_status", "pickup_location"},
             "unresolved_fields": {"field", "reason", "prompt", "candidates", "source", "source_turn_id"},
         }
 
         def clean(value: Any, *, item: bool = False, section: str = "") -> Any:
             if isinstance(value, Mapping):
+                if section in {"removes", "prices", "availability_by_item"}:
+                    return {
+                        str(key): entry for key, entry in value.items()
+                        if isinstance(entry, (str, int, float, bool)) or entry is None
+                    }
                 keys = item_allowed if item else nested_allowed.get(section, allowed)
                 return {
                     str(key): clean(
                         entry,
                         item=str(key) in {"canonical_items", "items", "proposed_items"},
-                        section=str(key) if not item else "",
+                        section=str(key),
                     )
                     for key, entry in value.items()
                     if str(key) in keys
@@ -912,7 +942,7 @@ class NativeVoiceAdapter:
             return value
 
         return {
-            key: clean(value, item=key in {"canonical_items", "proposed_items"}, section=key)
+            key: clean(value, item=key in {"canonical_items", "items", "proposed_items"}, section=key)
             for key, value in facts.items()
             if key in allowed
         }
