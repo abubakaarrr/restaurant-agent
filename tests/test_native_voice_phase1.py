@@ -63,7 +63,7 @@ class NativeServiceFake:
     async def load_call_state(self, session_id):
         return {"state": {}}
 
-    async def get_order_summary(self, *, call_id):
+    async def get_order_summary(self, *, call_id, arm_confirmation=True):
         return self.summary
 
     async def add_order_item(self, **kwargs):
@@ -313,13 +313,27 @@ async def test_native_adapter_affirmation_advances_server_confirmation_turn():
                     "customer_phone": "+14155550123",
                 }),
             )
+        class CanonicalReadbackTransport(MemoryRealtimeTransport):
+            async def receive(self):
+                event = dict(await super().receive())
+                if event.get("type") == "response.output_audio_transcript.done" and event.get("response_id") in (None, "r1b"):
+                    for sent in reversed(self.sent):
+                        item = sent.get("item") or {}
+                        if item.get("type") != "function_call_output":
+                            continue
+                        output = json.loads(item.get("output") or "{}")
+                        if output.get("speech"):
+                            event["transcript"] = output["speech"]
+                            break
+                return event
+
         events = [
             {"type": "response.created", "response": {"id": "r1"}},
             {"type": "conversation.item.input_audio_transcription.completed", "item_id": "i1", "transcript": "Cancel my reservation"},
             {"type": "response.output_item.done", "item": {"type": "function_call", "call_id": "c1", "name": "cancel_booking", "arguments": json.dumps({"session_id": session, "booking_id": booking_id, "caller_confirmed": False})}},
             {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
             {"type": "response.created", "response": {"id": "r1b"}},
-            {"type": "response.output_audio_transcript.done", "transcript": "Please confirm the cancellation."},
+            {"type": "response.output_audio_transcript.done", "response_id": "r1b", "transcript": "ignored"},
             {"type": "response.done", "response": {"id": "r1b", "status": "completed"}},
             {"type": "response.created", "response": {"id": "r2"}},
             {"type": "conversation.item.input_audio_transcription.completed", "item_id": "i2", "transcript": "Yes, cancel my reservation"},
@@ -331,7 +345,7 @@ async def test_native_adapter_affirmation_advances_server_confirmation_turn():
         ]
         adapter = NativeVoiceAdapter(
             session_id=session,
-            transport=MemoryRealtimeTransport(events),
+            transport=CanonicalReadbackTransport(events),
             state_store=CallSessionOrderStateStore(),
         )
         first = await adapter.submit_audio(b"synthetic", turn_id="turn-1")
@@ -340,6 +354,169 @@ async def test_native_adapter_affirmation_advances_server_confirmation_turn():
             status = await conn.fetchval("SELECT status FROM bookings WHERE id = $1", booking_id)
         assert status == "cancelled"
         assert first.turn and second.turn
+    finally:
+        async with pool.acquire() as conn:
+            if booking_id:
+                await conn.execute("DELETE FROM voice_action_idempotency WHERE call_id = $1", session)
+                await conn.execute("DELETE FROM bookings WHERE id = $1", booking_id)
+            await conn.execute("DELETE FROM call_sessions WHERE session_id = $1", session)
+        await close_native_voice_pool()
+
+
+@pytest.mark.skipif(os.getenv("RUN_DB_INTEGRATION") != "1", reason="disposable native PostgreSQL required")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_readback", [False, True])
+async def test_native_order_confirmation_requires_delivered_readback(invalid_readback):
+    session = f"native-order-confirm-test-{uuid.uuid4().hex}"
+    pool = await get_native_voice_pool()
+    order_id = None
+
+    class OrderReadbackTransport(MemoryRealtimeTransport):
+        def prepare(self, approved):
+            suffix = "yes" if approved else "request"
+            self.incoming = [
+                {"type": "response.created", "response": {"id": f"order-{suffix}"}},
+                {"type": "conversation.item.input_audio_transcription.completed", "transcript": "Yes, place my order." if approved else "Read back my order."},
+                {"type": "response.function_call_arguments.done", "response_id": f"order-{suffix}", "call_id": f"order-call-{suffix}", "name": "confirm_order" if approved else "get_order_summary", "arguments": json.dumps({"session_id": session, **({"expected_draft_version": self.draft_version, "caller_approved_full_readback": True} if approved else {})})},
+                {"type": "response.done", "response": {"id": f"order-{suffix}", "status": "completed"}},
+                {"type": "response.created", "response": {"id": f"order-final-{suffix}"}},
+                {"type": "response.output_audio.delta", "response_id": f"order-final-{suffix}", "delta": base64.b64encode(b"synthetic-audio").decode()},
+                {"type": "response.output_audio_transcript.done", "response_id": f"order-final-{suffix}", "canonical_speech": not approved},
+                {"type": "response.done", "response": {"id": f"order-final-{suffix}", "status": "completed"}},
+            ]
+
+        async def receive(self):
+            event = dict(await super().receive())
+            if event.pop("canonical_speech", False):
+                outputs = [
+                    json.loads(sent["item"]["output"])
+                    for sent in self.sent
+                    if sent.get("type") == "conversation.item.create"
+                    and sent.get("item", {}).get("type") == "function_call_output"
+                ]
+                speech = outputs[-1]["speech"]
+                event["transcript"] = (
+                    f"Would you like me to confirm order {self.order_id + 1}?"
+                    if invalid_readback
+                    else speech
+                )
+            return event
+
+    try:
+        service = RestaurantService(pool_provider=get_native_voice_pool)
+        await service.add_order_item(
+            call_id=session,
+            idempotency_key=f"{session}-seed",
+            item_name="Hearth Burger",
+            quantity=1,
+            modifier_ids=["modifier.side-fries"],
+            customer_name="Synthetic Order Guest",
+            customer_phone="+15035550109",
+        )
+        summary = await service.get_order_summary(call_id=session)
+        order_id = int(summary["order_id"])
+        transport = OrderReadbackTransport([])
+        transport.order_id = order_id
+        transport.draft_version = int(summary["draft_version"])
+        adapter = NativeVoiceAdapter(session_id=session, transport=transport)
+        try:
+            transport.prepare(False)
+            pending = await adapter.submit_audio(b"synthetic", turn_id="order-readback")
+            assert bool(pending.speech and pending.speech.allowed) is not invalid_readback
+            transport.prepare(True)
+            approved = await adapter.submit_audio(b"synthetic", turn_id="order-approval")
+            status = await pool.fetchval("SELECT status FROM orders WHERE id = $1", order_id)
+            if invalid_readback:
+                assert not approved.tool_outcomes[0].success
+                assert status == "pending"
+            else:
+                assert approved.tool_outcomes[0].success
+                assert status == "confirmed"
+        finally:
+            await adapter.close()
+    finally:
+        async with pool.acquire() as conn:
+            if order_id:
+                await conn.execute("DELETE FROM voice_action_idempotency WHERE call_id = $1", session)
+                await conn.execute("DELETE FROM orders WHERE id = $1", order_id)
+            await conn.execute("DELETE FROM call_sessions WHERE session_id = $1", session)
+        await close_native_voice_pool()
+
+
+@pytest.mark.skipif(os.getenv("RUN_DB_INTEGRATION") != "1", reason="disposable native PostgreSQL required")
+@pytest.mark.asyncio
+async def test_native_reservation_draft_readback_then_create_booking():
+    session = f"native-create-test-{uuid.uuid4().hex}"
+    pool = await get_native_voice_pool()
+    booking_id = None
+
+    class ReservationTransport(MemoryRealtimeTransport):
+        def prepare(self, create):
+            suffix = "create" if create else "draft"
+            arguments = (
+                {"session_id": session, "name": "Synthetic Reservation Guest", "phone": "+15035550110", "date": "2026-09-29", "time": "19:00", "party_size": 2, "caller_confirmed": True}
+                if create
+                else {"session_id": session}
+            )
+            self.incoming = [
+                {"type": "response.created", "response": {"id": f"reservation-{suffix}"}},
+                {"type": "conversation.item.input_audio_transcription.completed", "transcript": "Yes, book it." if create else "Read back the reservation."},
+                {"type": "response.function_call_arguments.done", "response_id": f"reservation-{suffix}", "call_id": f"reservation-call-{suffix}", "name": "create_booking" if create else "get_reservation_draft", "arguments": json.dumps(arguments)},
+                {"type": "response.done", "response": {"id": f"reservation-{suffix}", "status": "completed"}},
+                {"type": "response.created", "response": {"id": f"reservation-final-{suffix}"}},
+                {"type": "response.output_audio_transcript.done", "response_id": f"reservation-final-{suffix}", "canonical_speech": not create},
+                {"type": "response.done", "response": {"id": f"reservation-final-{suffix}", "status": "completed"}},
+            ]
+
+        async def receive(self):
+            event = dict(await super().receive())
+            if event.pop("canonical_speech", False):
+                outputs = [
+                    json.loads(sent["item"]["output"])
+                    for sent in self.sent
+                    if sent.get("type") == "conversation.item.create"
+                    and sent.get("item", {}).get("type") == "function_call_output"
+                ]
+                event["transcript"] = outputs[-1]["speech"]
+            return event
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO call_sessions (session_id, state) VALUES ($1, $2::jsonb)",
+                session,
+                json.dumps({
+                    "reservation_draft": {
+                        "customer_name": "Synthetic Reservation Guest",
+                        "customer_phone": "+15035550110",
+                        "date": "2026-09-29",
+                        "time": "19:00",
+                        "party_size": 2,
+                        "notes": "",
+                    }
+                }),
+            )
+        transport = ReservationTransport([])
+        adapter = NativeVoiceAdapter(session_id=session, transport=transport)
+        try:
+            transport.prepare(False)
+            pending = await adapter.submit_audio(b"synthetic", turn_id="reservation-draft")
+            assert pending.tool_outcomes[0].success
+            assert pending.speech and pending.speech.allowed
+            assert pending.speech.text == pending.tool_outcomes[0].confirmation_text, (
+                pending.speech.text,
+                pending.tool_outcomes[0].confirmation_text,
+            )
+            transport.prepare(True)
+            booked = await adapter.submit_audio(b"synthetic", turn_id="reservation-create")
+            outcome = booked.tool_outcomes[0]
+            assert outcome.success, f"{outcome.error}: {outcome.result}"
+            booking_id = int(outcome.result["booking_id"])
+            assert outcome.success and outcome.readback_verified
+            status = await pool.fetchval("SELECT status FROM bookings WHERE id = $1", booking_id)
+            assert status == "confirmed"
+        finally:
+            await adapter.close()
     finally:
         async with pool.acquire() as conn:
             if booking_id:

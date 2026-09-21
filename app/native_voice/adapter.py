@@ -667,7 +667,7 @@ class NativeVoiceAdapter:
             if outcome.name == "update_confirmed_booking":
                 booking_id = proposed.get("booking_id") or outcome.facts.get("booking_id") or ""
                 return f"Would you like me to apply these changes to booking reference {booking_id}?"
-            if outcome.name == "create_booking":
+            if outcome.name in {"create_booking", "get_reservation_draft"}:
                 date_value = proposed.get("date") or outcome.facts.get("date") or ""
                 time_value = proposed.get("time") or outcome.facts.get("time") or ""
                 party_size = proposed.get("party_size") or outcome.facts.get("party_size") or ""
@@ -688,7 +688,26 @@ class NativeVoiceAdapter:
                 if outcome.facts.get("guest_notes"):
                     details.append(f"guest note {outcome.facts['guest_notes']}")
                 if outcome.facts.get("fulfillment"):
-                    details.append(str(outcome.facts["fulfillment"]))
+                    fulfillment = str(outcome.facts["fulfillment"])
+                    fulfillment_details = outcome.facts.get("fulfillment_details") or {}
+                    if isinstance(fulfillment_details, Mapping) and fulfillment_details:
+                        detail_text = ", ".join(
+                            f"{key} {value}" for key, value in sorted(fulfillment_details.items())
+                            if value not in (None, "", [], {})
+                        )
+                        fulfillment = f"{fulfillment} ({detail_text})" if detail_text else fulfillment
+                    details.append(fulfillment)
+                for label, items_key in (("proposed", "proposed_items"),):
+                    item_text = ", ".join(
+                        NativeVoiceAdapter._format_order_item(item)
+                        for item in outcome.facts.get(items_key) or ()
+                        if isinstance(item, Mapping)
+                    )
+                    if item_text:
+                        details.append(f"{label} {item_text}")
+                unresolved = outcome.facts.get("unresolved_fields") or []
+                if unresolved:
+                    details.append(f"unresolved fields {unresolved}")
                 total = outcome.facts.get("total")
                 if total is not None:
                     details.append(f"total ${float(total):.2f}")
@@ -750,6 +769,18 @@ class NativeVoiceAdapter:
         return sentence
 
     @staticmethod
+    def _format_order_item(item: Mapping[str, Any]) -> str:
+        text = f"{int(item.get('quantity') or 1)} {item.get('name') or item.get('item_name') or 'item'}"
+        effects = []
+        for label, key in (("modifiers", "modifiers"), ("removals", "removals"), ("substitutions", "substitutions")):
+            values = item.get(key) or ()
+            if values:
+                effects.append(f"{label} {values}")
+        if item.get("notes"):
+            effects.append(f"note {item['notes']}")
+        return f"{text} ({'; '.join(effects)})" if effects else text
+
+    @staticmethod
     def _with_confirmation(outcome: ToolOutcome) -> ToolOutcome:
         if outcome.name not in MUTATING_TOOLS and not outcome.pending:
             return outcome
@@ -774,7 +805,10 @@ class NativeVoiceAdapter:
         safe_facts = NativeVoiceAdapter._safe_model_facts(outcome.facts)
         safe_facts.setdefault("evidence_version", outcome.state_version)
         if outcome.pending and isinstance(outcome.result, Mapping):
-            action = "confirm_order" if outcome.name == "get_order_summary" else outcome.name
+            action = {
+                "get_order_summary": "confirm_order",
+                "get_reservation_draft": "create_booking",
+            }.get(outcome.name, outcome.name)
             safe_facts["confirmation"] = {
                 "action": action,
                 "resource": NativeVoiceAdapter._operation_resource(outcome),
@@ -804,20 +838,29 @@ class NativeVoiceAdapter:
             "notes", "unit_price", "subtotal",
         }
 
-        def clean(value: Any, *, item: bool = False) -> Any:
+        nested_allowed = {
+            "fulfillment_details": {"address", "instructions", "fulfillment_at", "delivery_fee", "zone_status", "pickup_location"},
+            "unresolved_fields": {"field", "reason", "prompt", "source"},
+        }
+
+        def clean(value: Any, *, item: bool = False, section: str = "") -> Any:
             if isinstance(value, Mapping):
-                keys = item_allowed if item else allowed
+                keys = item_allowed if item else nested_allowed.get(section, allowed)
                 return {
-                    str(key): clean(entry, item=str(key) in {"canonical_items", "items", "proposed_items"})
+                    str(key): clean(
+                        entry,
+                        item=str(key) in {"canonical_items", "items", "proposed_items"},
+                        section=str(key) if not item else "",
+                    )
                     for key, entry in value.items()
                     if str(key) in keys
                 }
             if isinstance(value, (list, tuple)):
-                return [clean(entry, item=item) for entry in value]
+                return [clean(entry, item=item, section=section) for entry in value]
             return value
 
         return {
-            key: clean(value, item=key in {"canonical_items", "proposed_items"})
+            key: clean(value, item=key in {"canonical_items", "proposed_items"}, section=key)
             for key, value in facts.items()
             if key in allowed
         }
@@ -825,7 +868,7 @@ class NativeVoiceAdapter:
     def _native_confirmation_released(self, name: str, arguments: Mapping[str, Any]) -> bool:
         from app.pending_confirmation import current_confirmation_turn, get_pending_confirmation
 
-        action = "confirm_order" if name == "confirm_order" else name
+        action = {"confirm_order": "confirm_order", "get_reservation_draft": "create_booking"}.get(name, name)
         record = get_pending_confirmation(self.session_id, action)
         if not record or not record.get("readback_released"):
             return False
@@ -854,7 +897,10 @@ class NativeVoiceAdapter:
                 continue
             if outcome.state_version != state_version or not isinstance(outcome.result, Mapping):
                 continue
-            action = "confirm_order" if outcome.name == "get_order_summary" else outcome.name
+            action = {
+                "get_order_summary": "confirm_order",
+                "get_reservation_draft": "create_booking",
+            }.get(outcome.name, outcome.name)
             digest = str(outcome.result.get("pending_confirmation_hash") or "")
             if release_pending_confirmation(
                 self.session_id,
@@ -1005,9 +1051,12 @@ class NativeVoiceAdapter:
                 self._replayed_finalized_turns.add(completed.turn_id)
                 self.recorder.record({"type": "replayed_turn_rejected", "turn_id": completed.turn_id})
                 return
-        from app.pending_confirmation import begin_caller_turn
+        from app.pending_confirmation import begin_caller_turn, revoke_released_confirmations
 
-        begin_caller_turn(self.session_id, transcript)
+        affirmation = begin_caller_turn(self.session_id, transcript)
+        if self._native_service is not None and affirmation != "affirmative":
+            if revoke_released_confirmations(self.session_id):
+                await self._persist_native_confirmation_state()
         await self._persist_native_confirmation_state()
         patch = None
         if self.facts_extractor is not None:
@@ -1204,7 +1253,11 @@ class NativeVoiceAdapter:
         if (
             self._native_service is not None
             and name in {"create_booking", "update_confirmed_booking", "cancel_booking", "confirm_order"}
-            and bool(args.get("caller_confirmed"))
+            and bool(
+                args.get("caller_approved_full_readback")
+                if name == "confirm_order"
+                else args.get("caller_confirmed")
+            )
             and not self._native_confirmation_released(name, args)
         ):
             return ToolOutcome(

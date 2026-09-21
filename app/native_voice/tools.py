@@ -119,7 +119,11 @@ def _is_failure(
                 (value.get("pending") or value.get("readback_required"))
                 and not authoritative_read
             )
-            or bool((value.get("unavailable") and not allow_negative_availability) or value.get("no_op") or value.get("proposed"))
+            or bool(
+                (value.get("unavailable") and not allow_negative_availability)
+                or value.get("no_op")
+                or (value.get("proposed") and not authoritative_read)
+            )
             or any(key in value and value[key] is False for key in ("added", "updated", "removed", "cancelled", "saved"))
         )
     if isinstance(value, str):
@@ -471,7 +475,7 @@ class RestaurantToolExecutor:
                 approved=bool(args.get("caller_approved_full_readback")),
             )
         if name == "get_reservation_draft":
-            return await self._service.get_reservation_draft(session_id)
+            return await self._service.get_reservation_draft(session_id, arm_confirmation=True)
         if name == "update_reservation_draft":
             updates = {
                 key: args[key]
@@ -605,6 +609,8 @@ class RestaurantToolExecutor:
             return readback
         if name in {"create_booking", "update_confirmed_booking", "cancel_booking"}:
             booking_id = int(arguments.get("booking_id") or 0)
+            if not booking_id and isinstance(result, Mapping):
+                booking_id = int(result.get("booking_id") or 0)
             if not booking_id and isinstance(result, str):
                 match = re.search(r"(?:reference|booking)\s+#?\s*(\d+)", result, re.IGNORECASE)
                 if match:
@@ -1077,7 +1083,10 @@ class ToolBridge:
                         from app.services.restaurant import restaurant_service
 
                         service = restaurant_service
-                    current = await service.get_order_summary(call_id=self.session_id)
+                    current = await service.get_order_summary(
+                        call_id=self.session_id,
+                        arm_confirmation=False,
+                    )
             except Exception as exc:
                 if getattr(exc, "code", "") != "order_not_found":
                     return None, "booking_scope_unverified"
@@ -1155,7 +1164,7 @@ class ToolBridge:
                     from app.services.restaurant import restaurant_service
 
                     service = restaurant_service
-                current = await service.get_order_summary(call_id=self.session_id)
+                current = await service.get_order_summary(call_id=self.session_id, arm_confirmation=False)
         except Exception as exc:
             if getattr(exc, "code", "") != "order_not_found":
                 return None, "order_scope_unverified"

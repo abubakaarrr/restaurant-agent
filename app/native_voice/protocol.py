@@ -89,7 +89,10 @@ class EventRecorder:
                 else:
                     safe["arguments_present"] = bool(value)
                 continue
-            if key in {"customer_name", "customer_phone", "phone", "address", "email", "note", "notes"}:
+            if key in {
+                "customer_name", "customer_phone", "phone", "address", "email", "note", "notes",
+                "order_notes", "allergy_notes", "guest_notes", "item_notes", "prompt", "reason",
+            }:
                 raw = str(value)
                 safe[f"{key}_chars"] = len(raw)
                 safe[f"{key}_sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()

@@ -506,9 +506,29 @@ class RestaurantService:
         )
         return state
 
-    async def get_reservation_draft(self, call_id: str) -> JsonDict:
+    async def get_reservation_draft(
+        self, call_id: str, *, arm_confirmation: bool = False
+    ) -> JsonDict:
         state = (await self.load_call_state(call_id)).get("state") or {}
-        return coerce_draft(state.get("reservation_draft") or state)
+        draft = coerce_draft(state.get("reservation_draft") or state)
+        if arm_confirmation and not int(draft.get("booking_id") or 0):
+            required = {
+                "customer_name": str(draft.get("customer_name") or "").strip(),
+                "customer_phone": str(draft.get("customer_phone") or "").strip(),
+                "date": str(draft.get("date") or "").strip(),
+                "time": str(draft.get("time") or "").strip(),
+                "party_size": int(draft.get("party_size") or 0),
+            }
+            if all(required[key] for key in ("customer_name", "customer_phone", "date", "time")) and required["party_size"] > 0:
+                payload = booking_confirmation_payload(**required)
+                digest = register_pending_confirmation(call_id, ACTION_CREATE_BOOKING, payload)
+                draft = {
+                    **draft,
+                    "readback_required": True,
+                    "pending_confirmation_hash": digest,
+                    "proposed": payload,
+                }
+        return draft
 
     async def update_reservation_draft_native(
         self, call_id: str, updates: Mapping[str, Any]
@@ -1244,14 +1264,18 @@ class RestaurantService:
         effective_time = time
         current_party = 0
         if self._pool_provider is not None:
-            native_state = (await self.load_call_state(call_id)).get("state") or {}
-            native_draft = coerce_draft(native_state.get("reservation_draft") or native_state)
-            current_party = int(native_draft.get("party_size") or 0)
-            if not native_draft.get("date") or not native_draft.get("time") or not current_party:
-                live_booking = await self.lookup_booking(booking_id=booking_id)
-                effective_date = effective_date or str(live_booking.get("date") or "")
-                effective_time = effective_time or str(live_booking.get("time") or "")
-                current_party = current_party or int(live_booking.get("party_size") or 0)
+            live_booking = await self.lookup_booking(booking_id=booking_id)
+            if str(live_booking.get("status") or "") != DRAFT_STATUS_CONFIRMED:
+                raise RestaurantServiceError(
+                    "Only a confirmed booking can be updated.",
+                    code="booking_not_updatable",
+                    status=409,
+                )
+            effective_date = effective_date or str(live_booking.get("date") or "")
+            effective_time = effective_time or str(live_booking.get("time") or "")
+            current_party = int(live_booking.get("party_size") or 0)
+            date = effective_date
+            time = effective_time
         confirmation_payload = update_booking_confirmation_payload(
             booking_id=booking_id,
             date=effective_date,
@@ -2692,7 +2716,9 @@ class RestaurantService:
             "allergy_notes": order["allergy_notes"] or "",
         }
 
-    async def get_order_summary(self, *, call_id: str) -> JsonDict:
+    async def get_order_summary(
+        self, *, call_id: str, arm_confirmation: bool = True
+    ) -> JsonDict:
         call_id = self._require_call_id(call_id)
         pool = await self._get_pool()
         async with pool.acquire() as conn:
@@ -2712,7 +2738,7 @@ class RestaurantService:
                     status=404,
                 )
             result = await self._order_summary_with_conn(conn, order["id"])
-            if result.get("status") == "pending" and result.get("items"):
+            if arm_confirmation and result.get("status") == "pending" and result.get("items"):
                 if result.get("fulfillment") in {"pickup", "delivery"}:
                     _future_fulfillment_at(
                         str(result["fulfillment"]),

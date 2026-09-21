@@ -304,6 +304,26 @@ def release_pending_confirmation(
     return True
 
 
+def revoke_released_confirmations(session_id: str) -> bool:
+    sid = resolve_session_id(session_id)
+    if not sid:
+        return False
+    pending = _pending_map(sid)
+    changed = False
+    for action, value in list(pending.items()):
+        if not isinstance(value, dict) or not value.get("readback_released"):
+            continue
+        record = dict(value)
+        record.pop("readback_released", None)
+        record.pop("released_turn", None)
+        record.pop("released_response_id", None)
+        pending[action] = record
+        changed = True
+    if changed:
+        update_call_memory(sid, pending_confirmations=pending)
+    return changed
+
+
 def pending_state_patch(session_id: str) -> dict[str, Any]:
     """Fields to merge into call_sessions.state for cross-request durability."""
     mem = get_call_memory(session_id)
