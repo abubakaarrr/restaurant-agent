@@ -666,15 +666,38 @@ class NativeVoiceAdapter:
                 return f"Would you like me to cancel booking reference {booking_id} for {customer_name}?"
             if outcome.name == "update_confirmed_booking":
                 booking_id = proposed.get("booking_id") or outcome.facts.get("booking_id") or ""
-                return f"Would you like me to apply these changes to booking reference {booking_id}?"
+                date_value = proposed.get("date") or outcome.facts.get("date") or ""
+                time_value = proposed.get("time") or outcome.facts.get("time") or ""
+                party_size = proposed.get("party_size") or outcome.facts.get("party_size") or ""
+                customer_name = proposed.get("customer_name") or outcome.facts.get("customer_name") or ""
+                details = [f"{date_value} at {time_value}", f"for {party_size} guests"]
+                if customer_name:
+                    details.append(f"under {customer_name}")
+                if proposed.get("preferred_location"):
+                    details.append(f"at {proposed['preferred_location']}")
+                if proposed.get("notes"):
+                    details.append(f"with notes {proposed['notes']}")
+                return (
+                    f"Booking reference {booking_id} would be updated to "
+                    f"{', '.join(details)}. Would you like me to apply these changes?"
+                )
             if outcome.name in {"create_booking", "get_reservation_draft"}:
                 date_value = proposed.get("date") or outcome.facts.get("date") or ""
                 time_value = proposed.get("time") or outcome.facts.get("time") or ""
                 party_size = proposed.get("party_size") or outcome.facts.get("party_size") or ""
-                return f"Would you like me to confirm your reservation for {date_value} at {time_value} for {party_size} guests?"
+                customer_name = proposed.get("customer_name") or outcome.facts.get("customer_name") or ""
+                customer_phone = proposed.get("customer_phone") or outcome.facts.get("customer_phone") or ""
+                notes = proposed.get("notes") or outcome.facts.get("notes") or ""
+                details = [f"{date_value} at {time_value}", f"for {party_size} guests"]
+                if customer_name:
+                    details.append(f"under {customer_name}")
+                if customer_phone:
+                    details.append(f"using callback phone {customer_phone}")
+                details.append(f"with notes {notes or 'none'}")
+                return f"Would you like me to confirm your reservation for {', '.join(details)}?"
             if outcome.name == "get_order_summary":
                 item_text = ", ".join(
-                    f"{int(item.get('quantity') or 1)} {item.get('name') or item.get('item_name') or 'item'}"
+                    NativeVoiceAdapter._format_order_item(item)
                     for item in outcome.facts.get("canonical_items") or ()
                     if isinstance(item, Mapping)
                 )
@@ -840,7 +863,7 @@ class NativeVoiceAdapter:
 
         nested_allowed = {
             "fulfillment_details": {"address", "instructions", "fulfillment_at", "delivery_fee", "zone_status", "pickup_location"},
-            "unresolved_fields": {"field", "reason", "prompt", "source"},
+            "unresolved_fields": {"field", "reason", "prompt", "candidates", "source", "source_turn_id"},
         }
 
         def clean(value: Any, *, item: bool = False, section: str = "") -> Any:

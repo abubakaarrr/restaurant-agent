@@ -34,6 +34,7 @@ from app.native_voice.speech import SpeechGate, ToolEvidence
 from app.native_voice.state_store import CallSessionOrderStateStore, InMemoryOrderStateStore, StateVersionConflict
 from app.native_voice.tools import OfflineToolExecutor, ToolBridge, ToolOutcome, _order_readback_hash, realtime_tool_definitions
 from app.native_voice.tools import RestaurantToolExecutor
+from app.call_memory import clear_call_memory
 from app.services.restaurant import RestaurantService
 from app.native_voice.turns import CompletedCallerTurn, TurnAssembler
 
@@ -1588,6 +1589,183 @@ def test_item_confirmation_uses_the_committed_operation_item():
     payload = NativeVoiceAdapter._model_tool_output(outcome)
     assert "House Lemonade" in payload["speech"]
     assert "Hearth Burger" not in payload["speech"]
+
+
+@pytest.mark.asyncio
+async def test_public_native_draft_update_maps_name_and_phone_aliases():
+    class DraftService:
+        def __init__(self):
+            self.updates = None
+
+        async def update_reservation_draft_native(self, session_id, updates):
+            self.updates = (session_id, dict(updates))
+            return {"customer_name": updates["customer_name"], "customer_phone": updates["customer_phone"]}
+
+    service = DraftService()
+    executor = RestaurantToolExecutor(service=service)
+    result = await executor.invoke(
+        "update_reservation_draft",
+        {"session_id": "draft-alias", "name": "Ada Lovelace", "phone": "+14155550123"},
+    )
+
+    assert result == {"customer_name": "Ada Lovelace", "customer_phone": "+14155550123"}
+    assert service.updates == (
+        "draft-alias",
+        {"customer_name": "Ada Lovelace", "customer_phone": "+14155550123"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_reservation_draft_readback_includes_complete_notes(monkeypatch):
+    session_id = "draft-complete-readback"
+    clear_call_memory(session_id)
+    service = RestaurantService(pool_provider=lambda: None)
+
+    async def load_call_state(call_id):
+        return {
+            "state": {
+                "reservation_draft": {
+                    "customer_name": "Ada Lovelace",
+                    "customer_phone": "+14155550123",
+                    "date": "2026-10-01",
+                    "time": "19:00",
+                    "party_size": 2,
+                    "seating_preference": "patio",
+                    "occasion": "birthday",
+                    "dietary": "vegetarian",
+                    "extra_notes": "window table",
+                }
+            }
+        }
+
+    monkeypatch.setattr(service, "load_call_state", load_call_state)
+    draft = await service.get_reservation_draft(session_id, arm_confirmation=True)
+
+    assert draft["proposed"]["notes"] == (
+        "seating: patio; occasion: birthday; dietary: vegetarian; window table"
+    )
+    clear_call_memory(session_id)
+
+
+@pytest.mark.asyncio
+async def test_native_booking_update_readback_resolves_live_omitted_fields(monkeypatch):
+    session_id = "booking-update-readback"
+    clear_call_memory(session_id)
+    service = RestaurantService(pool_provider=lambda: None)
+
+    async def lookup_booking(**kwargs):
+        return {
+            "booking_id": 17,
+            "customer_name": "Ada Lovelace",
+            "customer_phone": "+14155550123",
+            "date": "2026-10-01",
+            "time": "19:00",
+            "party_size": 4,
+            "status": "confirmed",
+            "location": "patio",
+            "notes": "occasion: birthday",
+        }
+
+    async def persist_call_state(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(service, "lookup_booking", lookup_booking)
+    monkeypatch.setattr(service, "persist_call_state", persist_call_state)
+    pending = await service.update_confirmed_booking(
+        call_id=session_id,
+        idempotency_key="booking-update-readback",
+        booking_id=17,
+        confirmed=False,
+        customer_name="Grace Hopper",
+    )
+
+    proposed = pending["proposed"]
+    assert proposed["date"] == "2026-10-01"
+    assert proposed["time"] == "19:00"
+    assert proposed["party_size"] == 4
+    assert proposed["customer_name"] == "Grace Hopper"
+    assert proposed["customer_phone"] == "+14155550123"
+    assert proposed["preferred_location"] == "patio"
+    assert proposed["notes"] == "occasion: birthday"
+    sentence = NativeVoiceAdapter._confirmation_sentence(
+        ToolOutcome(
+            name="update_confirmed_booking",
+            call_id="update-readback",
+            arguments={},
+            result=pending,
+            success=True,
+            pending=True,
+            facts={},
+        )
+    )
+    assert "2026-10-01 at 19:00" in sentence
+    assert "4 guests" in sentence
+    assert "Grace Hopper" in sentence
+    assert "occasion: birthday" in sentence
+    clear_call_memory(session_id)
+
+
+def test_native_order_confirmation_reads_back_all_item_effects():
+    sentence = NativeVoiceAdapter._confirmation_sentence(
+        ToolOutcome(
+            name="get_order_summary",
+            call_id="order-readback",
+            arguments={},
+            result={"pending": True, "pending_confirmation_hash": "hash", "order_id": 7},
+            success=True,
+            pending=True,
+            facts={
+                "order_id": 7,
+                "canonical_items": [
+                    {
+                        "name": "Hearth Burger",
+                        "quantity": 1,
+                        "modifiers": ["fries"],
+                        "removals": ["onion jam"],
+                        "substitutions": ["gluten-free bun"],
+                        "notes": "cut in half",
+                    }
+                ],
+            },
+        )
+    )
+
+    assert "modifiers ['fries']" in sentence
+    assert "removals ['onion jam']" in sentence
+    assert "substitutions ['gluten-free bun']" in sentence
+    assert "note cut in half" in sentence
+
+
+def test_native_model_facts_preserve_unresolved_candidates():
+    output = NativeVoiceAdapter._model_tool_output(
+        ToolOutcome(
+            name="get_reservation_draft",
+            call_id="unresolved-readback",
+            arguments={},
+            result={"pending": True, "pending_confirmation_hash": "hash"},
+            success=True,
+            pending=True,
+            facts={
+                "unresolved_fields": [
+                    {
+                        "field": "date",
+                        "reason": "ambiguous",
+                        "candidates": ["Friday", "Saturday"],
+                        "source_turn_id": "turn-1",
+                    }
+                ]
+            },
+        )
+    )
+
+    assert output["facts"]["unresolved_fields"] == [
+        {
+            "field": "date",
+            "reason": "ambiguous",
+            "candidates": ["Friday", "Saturday"],
+            "source_turn_id": "turn-1",
+        }
+    ]
 
 
 def test_consequential_speech_requires_exact_application_confirmation():

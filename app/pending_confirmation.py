@@ -141,7 +141,9 @@ def update_booking_confirmation_payload(
     dietary: str | None = None,
     occasion: str | None = None,
     extra_notes: str | None = None,
+    notes: str | None = None,
     customer_name: str = "",
+    customer_phone: str | None = None,
     require_approval_for_paid_items: bool | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -159,6 +161,8 @@ def update_booking_confirmation_payload(
         "dietary": dietary,
         "occasion": occasion,
         "extra_notes": extra_notes,
+        "notes": notes,
+        "customer_phone": customer_phone,
         "require_approval_for_paid_items": require_approval_for_paid_items,
     }
     for key, value in optional.items():

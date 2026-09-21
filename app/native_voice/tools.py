@@ -478,13 +478,22 @@ class RestaurantToolExecutor:
             return await self._service.get_reservation_draft(session_id, arm_confirmation=True)
         if name == "update_reservation_draft":
             updates = {
-                key: args[key]
-                for key in (
-                    "name", "phone", "date", "time", "party_size", "seating_preference",
-                    "seating_backup", "seating_avoid", "dietary", "occasion", "extra_notes",
-                    "require_approval_for_paid_items",
+                canonical: args[source]
+                for source, canonical in (
+                    ("name", "customer_name"),
+                    ("phone", "customer_phone"),
+                    ("date", "date"),
+                    ("time", "time"),
+                    ("party_size", "party_size"),
+                    ("seating_preference", "seating_preference"),
+                    ("seating_backup", "seating_backup"),
+                    ("seating_avoid", "seating_avoid"),
+                    ("dietary", "dietary"),
+                    ("occasion", "occasion"),
+                    ("extra_notes", "extra_notes"),
+                    ("require_approval_for_paid_items", "require_approval_for_paid_items"),
                 )
-                if key in args and args[key] is not None
+                if source in args and args[source] is not None
             }
             return await self._service.update_reservation_draft_native(session_id, updates)
         raise ValueError(f"unsupported_native_tool:{name}")
@@ -1123,6 +1132,8 @@ class ToolBridge:
             except (TypeError, ValueError):
                 return None, "booking_scope_mismatch"
         for key in ("customer_name", "customer_phone"):
+            if name == "update_confirmed_booking" and key == "customer_name":
+                continue
             supplied = str(arguments.get(key) or "").strip()
             if not supplied:
                 continue
@@ -1133,15 +1144,19 @@ class ToolBridge:
             if not matches:
                 return None, "booking_scope_mismatch"
         scoped = dict(arguments)
-        scoped.update(trusted)
+        scoped["booking_id"] = booking_id
         scoped["session_id"] = self.session_id
         if name == "lookup_booking":
+            scoped.update(trusted)
             scoped.pop("session_id", None)
         elif name == "update_confirmed_booking":
             scoped.pop("customer_phone", None)
         elif name == "add_guest_note":
+            scoped.update(trusted)
             scoped.pop("customer_name", None)
             scoped.pop("customer_phone", None)
+        else:
+            scoped.update(trusted)
         return scoped, ""
 
     async def _scoped_order_arguments(
@@ -1569,6 +1584,8 @@ class ToolBridge:
                 if name in {"create_booking", "update_confirmed_booking"} and readback.get("status") != "confirmed":
                     return False
                 for argument_key, readback_key in (("name", "customer_name"), ("customer_name", "customer_name"), ("phone", "customer_phone"), ("customer_phone", "customer_phone"), ("date", "date"), ("time", "time"), ("party_size", "party_size")):
+                    if isinstance(result, Mapping) and result.get("pending"):
+                        continue
                     if argument_key not in arguments or arguments[argument_key] in (None, ""):
                         continue
                     expected = arguments[argument_key]
@@ -1586,7 +1603,7 @@ class ToolBridge:
                         matches = str(actual or "").strip().casefold() == str(expected).strip().casefold()
                     if not matches:
                         return False
-                if isinstance(result, Mapping):
+                if isinstance(result, Mapping) and not result.get("pending"):
                     for field in ("booking_id", "customer_name", "customer_phone", "date", "time", "party_size", "location", "notes", "table_number"):
                         if field not in result or field not in readback or result[field] in (None, ""):
                             continue
@@ -1633,7 +1650,15 @@ class ToolBridge:
             if name == "update_reservation_draft":
                 if not readback.get("readback_committed"):
                     return False
-                for argument_key, readback_key in (("name", "customer_name"), ("phone", "customer_phone"), ("date", "date"), ("time", "time"), ("party_size", "party_size")):
+                for argument_key, readback_key in (
+                    ("name", "customer_name"),
+                    ("customer_name", "customer_name"),
+                    ("phone", "customer_phone"),
+                    ("customer_phone", "customer_phone"),
+                    ("date", "date"),
+                    ("time", "time"),
+                    ("party_size", "party_size"),
+                ):
                     if argument_key in arguments and arguments[argument_key] is not None and readback.get(readback_key) != arguments[argument_key]:
                         return False
                 return all(field in readback for field in ("customer_name", "customer_phone", "date", "time", "party_size"))

@@ -520,7 +520,10 @@ class RestaurantService:
                 "party_size": int(draft.get("party_size") or 0),
             }
             if all(required[key] for key in ("customer_name", "customer_phone", "date", "time")) and required["party_size"] > 0:
-                payload = booking_confirmation_payload(**required)
+                payload = booking_confirmation_payload(
+                    **required,
+                    notes=compose_notes(draft),
+                )
                 digest = register_pending_confirmation(call_id, ACTION_CREATE_BOOKING, payload)
                 draft = {
                     **draft,
@@ -1262,33 +1265,101 @@ class RestaurantService:
             )
         effective_date = date
         effective_time = time
+        effective_party = party_size
+        effective_name = new_name
+        effective_location = preferred_location or ""
+        effective_notes = extra_notes if extra_notes is not None else notes
+        native_live_booking: JsonDict | None = None
+        native_proposed_draft: JsonDict | None = None
         current_party = 0
         if self._pool_provider is not None:
-            live_booking = await self.lookup_booking(booking_id=booking_id)
-            if str(live_booking.get("status") or "") != DRAFT_STATUS_CONFIRMED:
+            native_live_booking = await self.lookup_booking(booking_id=booking_id)
+            if str(native_live_booking.get("status") or "") != DRAFT_STATUS_CONFIRMED:
                 raise RestaurantServiceError(
                     "Only a confirmed booking can be updated.",
                     code="booking_not_updatable",
                     status=409,
                 )
-            effective_date = effective_date or str(live_booking.get("date") or "")
-            effective_time = effective_time or str(live_booking.get("time") or "")
-            current_party = int(live_booking.get("party_size") or 0)
+            effective_date = effective_date or str(native_live_booking.get("date") or "")
+            effective_time = effective_time or str(native_live_booking.get("time") or "")
+            current_party = int(native_live_booking.get("party_size") or 0)
+            effective_party = effective_party or current_party
+            effective_name = effective_name or str(native_live_booking.get("customer_name") or "")
+            effective_location = (
+                effective_location
+                or draft_preferred_location(seating_preference or "")
+                or str(native_live_booking.get("location") or "")
+            )
+            base_draft = patch_draft(
+                {},
+                {
+                    "customer_name": str(native_live_booking.get("customer_name") or ""),
+                    "customer_phone": str(native_live_booking.get("customer_phone") or ""),
+                    "date": effective_date,
+                    "time": effective_time,
+                    "party_size": current_party,
+                    "booking_id": booking_id,
+                    "status": DRAFT_STATUS_CONFIRMED,
+                    "extra_notes": str(native_live_booking.get("notes") or ""),
+                },
+            )
+            native_proposed_draft = patch_draft(
+                base_draft,
+                {
+                    "customer_name": effective_name,
+                    "date": effective_date,
+                    "time": effective_time,
+                    "party_size": effective_party,
+                    **note_updates,
+                },
+            )
+            effective_notes = compose_notes(native_proposed_draft)
             date = effective_date
             time = effective_time
+            party_size = effective_party
         confirmation_payload = update_booking_confirmation_payload(
             booking_id=booking_id,
             date=effective_date,
             time=effective_time,
-            party_size=party_size,
-            preferred_location=preferred_location or "",
-            seating_preference=seating_preference,
-            seating_backup=seating_backup,
-            seating_avoid=seating_avoid,
-            dietary=dietary,
-            occasion=occasion,
-            extra_notes=extra_notes if extra_notes is not None else notes,
-            customer_name=new_name,
+            party_size=effective_party,
+            preferred_location=effective_location,
+            seating_preference=(
+                native_proposed_draft.get("seating_preference")
+                if native_proposed_draft is not None
+                else seating_preference
+            ),
+            seating_backup=(
+                native_proposed_draft.get("seating_backup")
+                if native_proposed_draft is not None
+                else seating_backup
+            ),
+            seating_avoid=(
+                native_proposed_draft.get("seating_avoid")
+                if native_proposed_draft is not None
+                else seating_avoid
+            ),
+            dietary=(
+                native_proposed_draft.get("dietary")
+                if native_proposed_draft is not None
+                else dietary
+            ),
+            occasion=(
+                native_proposed_draft.get("occasion")
+                if native_proposed_draft is not None
+                else occasion
+            ),
+            extra_notes=(
+                native_proposed_draft.get("extra_notes")
+                if native_proposed_draft is not None
+                else extra_notes if extra_notes is not None else notes
+            ),
+            notes=effective_notes if native_proposed_draft is not None else None,
+            customer_name=effective_name,
+            customer_phone=(
+                native_live_booking.get("customer_phone")
+                if native_live_booking is not None
+                else None
+            ),
             require_approval_for_paid_items=require_approval_for_paid_items,
         )
         # Party-size edits must cite a fresh check_table_availability for that size.
@@ -1342,9 +1413,10 @@ class RestaurantService:
             "date": date,
             "time": time,
             "party_size": party_size,
-            "preferred_location": preferred_location or "",
-            "customer_name": new_name,
+            "preferred_location": effective_location,
+            "customer_name": effective_name,
             "require_approval_for_paid_items": require_approval_for_paid_items,
+            "notes": effective_notes,
             **note_updates,
         }
         # Fail closed before opening a DB transaction when the gate is not satisfied.
@@ -1396,7 +1468,22 @@ class RestaurantService:
                         raw = {}
                 if isinstance(raw, dict):
                     session_state = dict(raw)
-            draft = coerce_draft(session_state.get("reservation_draft") or session_state)
+            if self._pool_provider is not None:
+                draft = patch_draft(
+                    {},
+                    {
+                        "customer_name": row["customer_name"] or "",
+                        "customer_phone": row["customer_phone"] or "",
+                        "date": row["booked_at"].date().isoformat(),
+                        "time": row["booked_at"].strftime("%H:%M"),
+                        "party_size": int(row["party_size"] or 0),
+                        "booking_id": booking_id,
+                        "status": DRAFT_STATUS_CONFIRMED,
+                        "extra_notes": row["notes"] or "",
+                    },
+                )
+            else:
+                draft = coerce_draft(session_state.get("reservation_draft") or session_state)
             booked_at = row["booked_at"]
             new_date = date or booked_at.date().isoformat()
             new_time = time or booked_at.strftime("%H:%M")
