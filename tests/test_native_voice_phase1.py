@@ -887,7 +887,7 @@ async def test_tool_failure_or_readback_mismatch_cannot_unlock_success_speech():
     assert not decision.allowed
 
     exception = ToolBridge(FakeExecutor(error=TimeoutError()), session_id="call-1", scope_resolver=fake_order_scope)
-    timed_out = await exception.invoke(call_id="tool-3", name="confirm_order", arguments={"session_id": "call-1"}, turn_id="turn-1", state_version=1)
+    timed_out = await exception.invoke(call_id="tool-3", name="confirm_order", arguments={"session_id": "call-1", "expected_draft_version": 1}, turn_id="turn-1", state_version=1)
     assert not timed_out.success and "tool_exception" in timed_out.error
 
 
@@ -2086,3 +2086,34 @@ def test_removal_option_verifies_its_canonical_stored_effect(stored_removals, ve
     }])
     assert ToolBridge._verify_readback("add_order_item", arguments, readback, 0,
                                        {"order_item_id": 1}) is verified
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("released", [True, False])
+async def test_confirmation_version_is_bound_to_spoken_payload_not_current_database(monkeypatch, released):
+    async def current_scope(session_id):
+        return {"order_id": 7, "booking_id": 0, "draft_version": 9}
+    bridge = ToolBridge(FakeExecutor(), session_id="call-1", scope_resolver=current_scope)
+    monkeypatch.setattr("app.pending_confirmation.get_pending_confirmation",
+        lambda session, action: {"readback_released": released,
+                                 "payload": {"order_id": 7, "draft_version": 2}})
+    arguments, error = await bridge._scoped_order_arguments(
+        "confirm_order", {"caller_approved_full_readback": True})
+    if released:
+        assert not error
+        assert arguments["expected_draft_version"] == 2
+    else:
+        assert arguments is None and error == "order_confirmation_unverified"
+    schema = next(tool for tool in realtime_tool_definitions() if tool["name"] == "confirm_order")
+    assert "expected_draft_version" not in schema["parameters"]["properties"]
+
+
+def test_closure_sentence_with_table_context_remains_scoped_to_date():
+    facts = {"subject": {"date": "2026-09-28", "time": "19:00"},
+             "date": "2026-09-28", "availability": "unavailable", "restaurant_closed": True}
+    evidence = ToolEvidence(action="check_table_availability", call_id="closed", turn_id="turn",
+        state_version=1, success=True, readback_verified=True, facts=facts)
+    text = "The restaurant is closed on Monday, September 28th, so we cannot book a table for that day."
+    assert SpeechGate().evaluate(text, b"closed", evidence=[evidence], current_state_version=1).allowed
+    assert not SpeechGate().evaluate(text.replace("28th", "29th"), b"wrong",
+                                    evidence=[evidence], current_state_version=1).allowed

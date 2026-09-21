@@ -842,9 +842,13 @@ def realtime_tool_definitions() -> list[dict[str, Any]]:
     # Session identity belongs to the bound server connection, not model output.
     for definition in definitions:
         parameters = definition["parameters"]
-        parameters["properties"].pop("session_id", None)
+        server_fields = {"session_id"}
+        if definition["name"] == "confirm_order":
+            server_fields.add("expected_draft_version")
+        for key in server_fields:
+            parameters["properties"].pop(key, None)
         parameters["required"] = [
-            key for key in parameters.get("required", []) if key != "session_id"
+            key for key in parameters.get("required", []) if key not in server_fields
         ]
     return definitions
 
@@ -1201,6 +1205,21 @@ class ToolBridge:
             if getattr(exc, "code", "") != "order_not_found":
                 return None, "order_scope_unverified"
             current = None
+        if name == "confirm_order" and "expected_draft_version" not in scoped:
+            from app.pending_confirmation import get_pending_confirmation
+            pending = get_pending_confirmation(self.session_id, "confirm_order")
+            payload = pending.get("payload") if isinstance(pending, Mapping) else None
+            if (
+                not isinstance(payload, Mapping) or not pending.get("readback_released")
+                or not isinstance(current, Mapping)
+                or payload.get("order_id") != current.get("order_id")
+                or not isinstance(payload.get("draft_version"), int)
+                or payload["draft_version"] < 1
+            ):
+                return None, "order_confirmation_unverified"
+            # Bind to the version actually spoken, never silently refresh to
+            # the current database version after a correction.
+            scoped["expected_draft_version"] = payload["draft_version"]
         if name == "lookup_order":
             if not isinstance(current, Mapping):
                 return None, "order_scope_unverified"
@@ -1772,7 +1791,7 @@ class ToolBridge:
                 "items", "proposed_items", "prices", "availability", "booking", "order", "status", "date", "time",
                 "customer_name", "customer_phone", "party_size", "location", "notes", "total",
                 "fulfillment", "fulfillment_type", "fulfillment_details", "order_notes", "allergy_notes",
-                "guest_notes", "unresolved_fields", "state_version", "readback_required",
+                "guest_notes", "unresolved_fields", "state_version", "draft_version", "readback_required",
                 "pending_confirmation_hash", "booked_at", "timezone", "reference", "booking_reference", "table_number",
             ):
                 if key in value:

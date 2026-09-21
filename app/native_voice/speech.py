@@ -52,7 +52,7 @@ _DATE_TOKEN = re.compile(
     r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?|"
     r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
     r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
-    r"dec(?:ember)?)\s+\d{1,2}(?:,?\s+\d{4})?|"
+    r"dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|"
     r"\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
     r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
     r"nov(?:ember)?|dec(?:ember)?)\s+\d{4})\b",
@@ -423,6 +423,12 @@ class SpeechGate:
                         continue
                 return True
             return False
+        if (
+            facts.get("restaurant_closed") is True
+            and re.search(r"\bthe restaurant\b", normalized)
+            and SpeechGate._structured_details_supported(text, facts)
+        ):
+            return True
         subject = facts.get("subject") or {}
         if isinstance(subject, Mapping):
             numbered_subject = re.search(r"\b(?:booking|order)\s*#?\s*(\d+)\b", normalized)
@@ -529,7 +535,8 @@ class SpeechGate:
         expected_date = SpeechGate._parse_date(expected)
         if expected_date is None:
             return False
-        value = spoken.strip().replace("/", "-").replace(",", "")
+        value = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", spoken.strip(), flags=re.IGNORECASE)
+        value = value.replace("/", "-").replace(",", "")
         parsed = None
         includes_year = False
         for pattern in (

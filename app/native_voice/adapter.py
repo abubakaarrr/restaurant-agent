@@ -44,6 +44,7 @@ class RealtimeConfig:
     output_format: str = "audio/pcm"
     instructions: str = (
         "You are a restaurant host in a development-only synthetic test. "
+        "For a simple greeting, say: Hello. How can I help you today? "
         "Use the provided restaurant tools for every menu, price, availability, "
         "booking, and order fact. Never claim an action succeeded without a "
         "matching tool result and database readback. Ask one bounded clarification "
