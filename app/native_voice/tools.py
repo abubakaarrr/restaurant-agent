@@ -649,7 +649,7 @@ def realtime_tool_definitions() -> list[dict[str, Any]]:
     definitions = [
         _tool_definition(
             "check_menu_item_availability",
-            "Check one exact menu item; never infer a price or availability.",
+            "Check one base menu item name only, such as Hearth Burger. Exclude quantity, sides and preparation requests. Never infer price or availability.",
             {"item_name": {"type": "string"}},
             ["item_name"],
         ),
