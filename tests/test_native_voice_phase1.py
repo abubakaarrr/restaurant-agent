@@ -2133,3 +2133,29 @@ def test_negative_slot_uses_exact_authoritative_speech():
                          current_state_version=2).allowed
     assert not gate.evaluate(outcome.confirmation_text.replace("closed", "open"), b"wrong",
                              evidence=evidence, current_state_version=2).allowed
+
+
+@pytest.mark.asyncio
+async def test_matching_model_supplied_identity_cannot_bootstrap_booking_access():
+    class UnverifiedService:
+        def __init__(self):
+            self.lookups = 0
+            self.writes = 0
+        async def load_call_state(self, session_id):
+            return {"state": {}}
+        async def lookup_booking(self, **kwargs):
+            self.lookups += 1
+            return {"booking_id": 7, "customer_name": "Known Guest",
+                    "customer_phone": "+15035550108", "status": "confirmed"}
+        async def persist_call_state(self, *args, **kwargs):
+            self.writes += 1
+    service = UnverifiedService()
+    bridge = ToolBridge(RestaurantToolExecutor(service=service), session_id="unverified-session")
+    outcome = await bridge.invoke(
+        call_id="guess", name="lookup_booking",
+        arguments={"booking_id": 7, "customer_name": "Known Guest", "customer_phone": "+15035550108"},
+        turn_id="unverified", state_version=0,
+    )
+    assert not outcome.success and outcome.error == "booking_scope_unverified"
+    assert outcome.result is None
+    assert service.lookups == 0 and service.writes == 0

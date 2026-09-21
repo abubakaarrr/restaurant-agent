@@ -147,6 +147,22 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace, note_resol
         assert "dietary: vegan" in row["notes"]
         assert row["require_approval_for_paid_items"] is True
 
+        # Knowing the exact booking ID, name and phone is not session ownership.
+        from app.native_voice.tools import RestaurantToolExecutor, ToolBridge
+        from app.services.restaurant import RestaurantService
+        stranger = ToolBridge(
+            RestaurantToolExecutor(service=RestaurantService(pool_provider=get_native_voice_pool)),
+            session_id="unverified-" + uuid.uuid4().hex,
+        )
+        denied = await stranger.invoke(
+            call_id="foreign-lookup", name="lookup_booking",
+            arguments={"booking_id": booking_id, "customer_name": "Synthetic Booking Guest",
+                       "customer_phone": "+15035550108"},
+            turn_id="foreign", state_version=0,
+        )
+        assert not denied.success and denied.error == "booking_scope_unverified"
+        assert denied.result is None
+
         _, availability = await call(
             "check_table_availability",
             {"date": date, "time": "19:00", "party_size": 3},

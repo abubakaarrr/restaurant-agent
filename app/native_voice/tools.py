@@ -953,94 +953,6 @@ class ToolBridge:
             "customer_phone": trusted_phone,
         }, ""
 
-    async def _initial_booking_identity(
-        self, arguments: Mapping[str, Any]
-    ) -> tuple[dict[str, Any] | None, str]:
-        if not self.session_id:
-            return None, "booking_scope_unverified"
-        try:
-            booking_id = int(arguments.get("booking_id") or 0)
-        except (TypeError, ValueError):
-            booking_id = 0
-        customer_name = str(arguments.get("customer_name") or "").strip()
-        customer_phone = str(arguments.get("customer_phone") or "").strip()
-        if not customer_phone or (not booking_id and not customer_name):
-            return None, "booking_scope_unverified"
-        if isinstance(self.executor, OfflineToolExecutor):
-            identity = dict(self.executor.booking_identity)
-            if identity.get("session_id") not in (None, "", self.session_id):
-                return None, "booking_scope_unverified"
-            if not identity:
-                return None, "booking_scope_unverified"
-            if booking_id and int(identity.get("booking_id") or 0) != booking_id:
-                return None, "booking_scope_unverified"
-            if customer_name and _canonical_name(identity.get("customer_name")) != _canonical_name(customer_name):
-                return None, "booking_scope_unverified"
-            if _canonical_phone(identity.get("customer_phone")) != _canonical_phone(customer_phone):
-                return None, "booking_scope_unverified"
-            return {
-                "booking_id": int(identity["booking_id"]),
-                "customer_name": str(identity.get("customer_name") or ""),
-                "customer_phone": str(identity.get("customer_phone") or ""),
-            }, ""
-        try:
-            service = self.native_service
-            if service is None:
-                from app.services.restaurant import restaurant_service
-
-                service = restaurant_service
-            verified = await service.lookup_booking(
-                booking_id=booking_id,
-                customer_name="" if booking_id else customer_name,
-                customer_phone=customer_phone,
-            )
-            if customer_name and _canonical_name(verified.get("customer_name")) != _canonical_name(customer_name):
-                return None, "booking_scope_unverified"
-            if _canonical_phone(verified.get("customer_phone")) != _canonical_phone(customer_phone):
-                return None, "booking_scope_unverified"
-            await service.persist_call_state(
-                self.session_id,
-                {
-                    "booking_id": verified["booking_id"],
-                    "customer_name": verified["customer_name"],
-                    "customer_phone": verified["customer_phone"],
-                    "booking_date": verified.get("date") or "",
-                    "booking_time": verified.get("time") or "",
-                    "party_size": verified.get("party_size") or 0,
-                    "draft_status": str(verified.get("status") or "").casefold(),
-                },
-                caller_phone=str(verified.get("customer_phone") or ""),
-            )
-            if self.native_service is None:
-                from app.call_memory import hydrate_call_memory
-
-                await hydrate_call_memory(self.session_id)
-                booking_status = str(verified.get("status") or "").casefold()
-                if booking_status == "confirmed":
-                    from app.call_memory import apply_live_booking_to_memory
-
-                    apply_live_booking_to_memory(self.session_id, verified)
-                else:
-                    from app.call_memory import update_reservation_draft
-
-                    update_reservation_draft(
-                        self.session_id,
-                        booking_id=int(verified["booking_id"]),
-                        customer_name=str(verified.get("customer_name") or ""),
-                        customer_phone=str(verified.get("customer_phone") or ""),
-                        date=str(verified.get("date") or ""),
-                        time=str(verified.get("time") or ""),
-                        party_size=int(verified.get("party_size") or 0),
-                        status=booking_status,
-                    )
-        except Exception:
-            return None, "booking_scope_unverified"
-        return {
-            "booking_id": int(verified["booking_id"]),
-            "customer_name": str(verified.get("customer_name") or ""),
-            "customer_phone": str(verified.get("customer_phone") or ""),
-        }, ""
-
     async def _scoped_booking_arguments(
         self, name: str, arguments: Mapping[str, Any]
     ) -> tuple[dict[str, Any] | None, str]:
@@ -1061,8 +973,6 @@ class ToolBridge:
                     return scoped, ""
             elif name == "lookup_booking":
                 trusted, error = await self._verified_booking_identity()
-                if error:
-                    trusted, error = await self._initial_booking_identity(arguments)
                 if error:
                     return None, error
             else:
@@ -1133,8 +1043,6 @@ class ToolBridge:
             return scoped, ""
         if name == "lookup_booking":
             trusted, error = await self._verified_booking_identity()
-            if error:
-                trusted, error = await self._initial_booking_identity(arguments)
             if error:
                 return None, error
             scoped = dict(arguments)
