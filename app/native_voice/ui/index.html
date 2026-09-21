@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Restaurant · Voice call</title><link rel="stylesheet" href="/assets/style.css"><script type="module" src="/assets/app.js"></script></head>
+<body><main>
+<header><div class="brand"><span class="logo">R</span><div><strong id="restaurant">Restaurant</strong><small>Native voice · local test call</small></div></div><span class="badge">TEST DATABASE</span></header>
+<section class="intro"><p class="eyebrow">YOUR RESTAURANT, IN CONVERSATION</p><h1>Let’s talk.</h1><p>Have a complete conversation. Order, change your mind, ask questions, and interrupt naturally.</p></section>
+<div class="layout"><section class="call card">
+<div id="orb" class="orb"><span>◉</span></div><h2 id="status" aria-live="polite">Ready when you are</h2><p id="hint">Start a call and allow your microphone. Headphones work best.</p>
+<meter id="level" min="0" max="1" value="0" aria-label="Microphone level"></meter>
+<div class="buttons"><button id="start" class="primary">Start call</button><button id="mute" disabled>Mute</button><button id="stop" disabled>Stop response</button><button id="end" class="danger" disabled>End call</button></div>
+<div class="metrics"><div><small>LAST RESPONSE</small><strong id="latency">—</strong><span>End of speech → audio starts</span></div><div><small>CALL DURATION</small><strong id="duration">00:00</strong><span id="model">gpt-realtime</span></div></div>
+<details><summary>Call settings &amp; test information</summary><label for="silence">Pause before sending your turn</label><select id="silence"><option value="900">0.9 seconds</option><option value="1400" selected>1.4 seconds</option><option value="2200">2.2 seconds · longer pauses</option><option value="3000">3 seconds</option></select><p id="clock"></p><p>This call sends microphone audio to OpenAI. Orders and bookings affect only the test database. Use made-up contact details. Replies are checked before playback, which adds delay.</p><p>A new call starts a new session. Previous test orders remain in the database.</p></details>
+</section><section class="conversation card"><div class="section-title"><h2>Conversation</h2><span id="turns">0 turns</span></div><div id="messages" aria-live="polite"><p class="empty">Your conversation will appear here. Try speaking for 20–30 seconds with several details, then change one of them in your next turn.</p></div></section></div>
+<section class="card evidence"><details><summary>What the agent remembers &amp; tool results</summary><p>Application state and verified tool outcomes from this call.</p><pre id="state">No call yet.</pre></details></section>
+<p id="notice" role="status"></p><footer>Local voice preview · No phone number required · No production deployment</footer>
+</main></body></html>

@@ -1567,6 +1567,7 @@ async def connect_development_adapter(
     session_id: str,
     config: RealtimeConfig | None = None,
     state_store: OrderStateStore | None = None,
+    adapter_class: type[NativeVoiceAdapter] = NativeVoiceAdapter,
 ) -> NativeVoiceAdapter:
     """Explicit development entry point; production settings fail closed."""
     from app.config import get_settings
@@ -1585,7 +1586,7 @@ async def connect_development_adapter(
         api_key=settings.openai_api_key,
         model=resolved.model,
     )
-    return NativeVoiceAdapter(
+    return adapter_class(
         session_id=session_id,
         transport=transport,
         config=resolved,

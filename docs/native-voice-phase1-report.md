@@ -78,6 +78,28 @@ Grounding verdicts were reviewed against the actual authoritative tool outputs. 
 - This bounded synthetic campaign is not a human, accent, noisy-room, concurrency or statistical reliability benchmark.
 - One simple-order attempt at `6e421931` ended with a RuntimeError before any write. Its earlier harness omitted the terminal cause. An instrumented rerun passed; the original cause remains unclassified. The failed report and empty-operation state were preserved.
 - Existing-booking access from a new session requires trusted ownership provisioning. Merely stating a name, phone or booking ID is intentionally insufficient.
-- No production audio transport or user-facing voice UI was added in this phase, and no production readiness or deployment is claimed.
+- At the Phase 1 source freeze no user-facing voice UI existed. The subsequent local browser-call extension is documented below; no production readiness or deployment is claimed.
 
 All prior live attempts, local audio and validation logs remain under the local acceptance workspace. The committed summary contains selected accepted evidence and identifies the preserved attempts. No merge or deployment is authorized by this report.
+
+## Local browser call extension
+
+The later user-requested browser UI provides a continuous microphone/speaker call
+at localhost:8765: automatic silence-based turn ending, speech interruption,
+mute/end controls, transcripts, application state, and end-of-speech-to-playback
+timing. It uses the same native adapter and separate test database. Confirmation
+readbacks are deferred until matching browser playback completion after the audio
+duration; interrupted playback does not release confirmation eligibility.
+
+The native/database plus browser transport suite passed 101 tests; the JavaScript
+audio test passed a 30-second compound-turn boundary and PCM resampling check.
+A live two-turn endpoint check passed a greeting and authoritative unknown-menu
+clarification in one session. These use synthetic input; a human microphone,
+echo, noise and conversational acceptance pass remains the user's next step.
+Four additional browser input/early-acknowledgement boundary tests passed. A live
+order readback and separate confirmation also passed through the browser endpoint
+with verified database outcomes. The earlier independent review predates this UI extension.
+
+See [browser call instructions](native-voice-browser-call.md). Existing buffering
+latency and production limitations still apply. This is a local testing surface,
+not a deployment or replacement of production routing.
