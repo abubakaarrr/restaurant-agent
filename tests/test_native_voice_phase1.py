@@ -1273,7 +1273,8 @@ async def test_interruption_cancels_audio_and_rejects_stale_generation():
     generation = adapter.interruptions.generation
     await adapter.interrupt()
     assert adapter.interruptions.generation == generation + 1
-    assert {event["type"] for event in transport.sent} >= {"response.cancel", "output_audio_buffer.clear"}
+    assert "response.cancel" in {event["type"] for event in transport.sent}
+    assert "output_audio_buffer.clear" not in {event["type"] for event in transport.sent}
     assert not adapter.interruptions.accepts(generation=generation, response_id="old-response")
     assert any(event.event_type == "interruption" for event in adapter.recorder.events)
 
@@ -2019,3 +2020,16 @@ async def test_unchanged_readback_preserves_newer_summary_evidence_version():
     second = await adapter._sync_order_memory()
     assert first == second
     assert first.version == (await store.load("call-1")).version
+
+
+def test_model_receives_closed_restaurant_and_negative_availability():
+    result = {"available": False, "restaurant_closed": True,
+              "message": "Harbor & Hearth Kitchen is closed on Monday.",
+              "date": "2026-09-28", "time": "19:00"}
+    output = NativeVoiceAdapter._model_tool_output(ToolOutcome(
+        name="check_table_availability", call_id="closed", arguments={}, result=result,
+        success=True, readback_verified=True, facts=ToolBridge._facts(result, None, {}),
+    ))
+    assert output["facts"]["availability"] == "unavailable"
+    assert output["facts"]["restaurant_closed"] is True
+    assert output["facts"]["message"] == result["message"]

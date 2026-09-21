@@ -1753,6 +1753,11 @@ class ToolBridge:
             ):
                 if key in value:
                     facts[key] = deepcopy(value[key])
+            if isinstance(value.get("available"), bool):
+                facts["availability"] = "available" if value["available"] else "unavailable"
+            for key in ("restaurant_closed", "message"):
+                if key in value:
+                    facts[key] = value[key]
             for key in ("evidence_source", "evidence_version"):
                 if value.get(key) not in (None, ""):
                     facts[key] = value[key]
