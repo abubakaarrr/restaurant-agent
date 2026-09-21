@@ -70,7 +70,7 @@ class RealtimeConfig:
                 },
                 "tools": realtime_tool_definitions(),
                 "tool_choice": "auto",
-                "max_output_tokens": 256,
+                "max_output_tokens": 1024,
             },
         }
 
