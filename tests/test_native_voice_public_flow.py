@@ -89,7 +89,7 @@ async def test_public_native_booking_lifecycle(with_alias_whitespace, note_resol
     booking_id = 0
 
     async def call(name, arguments, transcript, turn_id):
-        transport.prepare(name, {"session_id": session_id, **arguments}, transcript, turn_id)
+        transport.prepare(name, arguments, transcript, turn_id)
         result = await adapter.submit_audio(b"\x00\x00" * 2400, turn_id=turn_id)
         assert result.tool_outcomes, "no tool outcome for " + name
         return result, result.tool_outcomes[0]
@@ -330,3 +330,11 @@ def test_booking_clarification_cannot_authorize_other_speech():
         text + " Your reservation is confirmed.", b"audio",
         evidence=[evidence], current_state_version=3
     ).allowed
+
+
+def test_model_tool_schemas_do_not_request_server_session_identity():
+    from app.native_voice.tools import realtime_tool_definitions
+
+    for tool in realtime_tool_definitions():
+        assert "session_id" not in tool["parameters"]["properties"]
+        assert "session_id" not in tool["parameters"]["required"]

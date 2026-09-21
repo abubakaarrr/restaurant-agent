@@ -644,7 +644,7 @@ class RestaurantToolExecutor:
 
 def realtime_tool_definitions() -> list[dict[str, Any]]:
     """Small, strict function surface sent in ``session.update``."""
-    return [
+    definitions = [
         _tool_definition(
             "check_menu_item_availability",
             "Check one exact menu item; never infer a price or availability.",
@@ -837,6 +837,14 @@ def realtime_tool_definitions() -> list[dict[str, Any]]:
             ["booking_id", "session_id", "caller_confirmed"],
         ),
     ]
+    # Session identity belongs to the bound server connection, not model output.
+    for definition in definitions:
+        parameters = definition["parameters"]
+        parameters["properties"].pop("session_id", None)
+        parameters["required"] = [
+            key for key in parameters.get("required", []) if key != "session_id"
+        ]
+    return definitions
 
 
 class ToolBridge:
@@ -1269,6 +1277,8 @@ class ToolBridge:
                 error="session_scope_mismatch",
                 state_version=state_version,
             )
+        if self.session_id:
+            args["session_id"] = self.session_id
         if name in MUTATING_TOOLS and not turn_id:
             return ToolOutcome(
                 name=name,
