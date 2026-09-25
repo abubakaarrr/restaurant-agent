@@ -1,0 +1,43 @@
+<div class="call-chat-layout native-voice-dashboard">
+  <div class="calls-column">
+    <div class="call-card native-controls">
+      <h2>Live Voice Call <span class="provider-tag">Gemini 3.8 Live</span></h2>
+      <p class="native-muted">English · local test database</p>
+      <div id="orb" class="native-orb">◉</div>
+      <h3 id="status" aria-live="polite">Ready when you are</h3>
+      <p id="hint">Start a call and speak naturally.</p>
+      <meter id="level" min="0" max="1" value="0" aria-label="Microphone level"></meter>
+      <label for="inputDevice">Microphone</label>
+      <select id="inputDevice"><option value="">Browser default microphone</option></select>
+      <small id="inputStatus">Select your headset microphone.</small>
+      <div class="native-buttons">
+        <button id="start" class="btn-small">Start call</button>
+        <button id="mute" class="btn-small" disabled>Mute</button>
+        <button id="stop" class="btn-small" disabled>Stop response</button>
+        <button id="end" class="btn-small" disabled>End call</button>
+      </div>
+      <div class="native-metrics">
+        <div><small>Response time</small><strong id="latency">—</strong><small>Speech end → first audio (estimate)</small></div>
+        <div><small>Call duration</small><strong id="duration">00:00</strong><small id="model">Gemini 3.8 Live</small></div>
+      </div>
+      <p class="native-muted">You can open Reservations, Orders or Menu while the call stays connected.</p>
+      <details><summary>Call settings</summary>
+        <label for="language">Language</label><select id="language"><option value="en">English</option></select>
+        <label for="pace">Conversation pace</label><select id="pace"><option value="natural">Natural</option><option value="patient">Patient · more time for pauses</option></select>
+        <button id="checkMicrophone" type="button" class="btn-small">Check microphone · 8 seconds</button>
+        <small id="microphoneCheckResult">Record and listen locally before calling.</small>
+        <audio id="microphonePlayback" controls hidden></audio>
+        <p id="clock"></p>
+        <p class="native-muted">Microphone audio is sent to Google Gemini. Browser echo cancellation and noise suppression are requested. Calls save only to the local test database.</p>
+      </details>
+      <p id="notice" role="status"></p>
+    </div>
+  </div>
+  <div class="chat-column">
+    <div class="chat-card">
+      <div class="chat-header"><div class="chat-avatar">🍽️</div><div><h2>Live conversation</h2><p><span id="turns">0 turns</span> · AI voice</p></div></div>
+      <div class="messages" id="messages" aria-live="polite"><p class="empty">Start a call to see your conversation here.</p></div>
+    </div>
+    <details class="native-evidence"><summary>Saved state &amp; tool results</summary><pre id="state">No call yet.</pre></details>
+  </div>
+</div>

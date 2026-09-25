@@ -1,0 +1,29 @@
+.native-controls { display:block; padding:24px; }
+.native-controls h2 { font-size:18px; }
+.native-controls h3 { margin:8px 0; }
+.native-controls p,.native-controls small { line-height:1.5; }
+.native-muted,.native-controls small { color:var(--text-dim); }
+.native-controls label { display:block; margin:16px 0 6px; font-size:13px; }
+.native-controls select { width:100%; padding:10px; color:var(--text); background:var(--bg); border:1px solid var(--border); border-radius:8px; }
+.native-controls meter { width:100%; height:9px; margin:12px 0; }
+.native-controls small { display:block; margin-top:6px; }
+.native-orb { color:var(--accent,#d4ae6a); font-size:32px; margin-top:16px; }
+.native-orb.speaking { color:var(--green,#80bd9e); }
+.native-buttons { display:flex; flex-wrap:wrap; gap:8px; margin:18px 0; }
+.native-buttons #start { background:var(--accent,#d4ae6a); color:#201b14; }
+.native-controls button:disabled { opacity:.45; cursor:default; }
+.native-metrics { display:grid; grid-template-columns:1fr 1fr; gap:16px; border-top:1px solid var(--border); padding-top:12px; }
+.native-metrics strong { display:block; font-size:22px; margin-top:5px; }
+.native-controls details,.native-evidence { margin-top:18px; }
+.native-controls summary,.native-evidence summary { cursor:pointer; color:var(--text-dim); }
+.native-controls audio { width:100%; margin-top:8px; }
+.native-controls #checkMicrophone { margin-top:14px; }
+.native-controls #notice { color:var(--red,#ea9b91); }
+.native-voice-dashboard .message { max-width:94%; padding:12px 14px; margin:8px 0; background:rgba(255,255,255,.055); border-radius:12px; }
+.native-voice-dashboard .message small { display:block; font-size:10px; letter-spacing:.08em; color:var(--text-dim); margin-bottom:6px; }
+.native-voice-dashboard .message span { white-space:pre-wrap; line-height:1.6; }
+.native-voice-dashboard .message.user { margin-left:auto; background:rgba(212,174,106,.13); }
+.native-voice-dashboard .message.note { color:var(--text-dim); }
+.native-voice-dashboard .messages { min-height:360px; }
+.native-evidence pre { white-space:pre-wrap; overflow-wrap:anywhere; max-height:250px; overflow:auto; font-size:12px; }
+.native-voice-dashboard .empty { color:var(--text-dim); }

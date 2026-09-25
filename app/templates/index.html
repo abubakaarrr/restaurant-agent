@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ restaurant }} — AI Receptionist</title>
   <link rel="stylesheet" href="/static/style.css">
+  {% if native_voice_dashboard %}<link rel="stylesheet" href="/static/native_voice.css">{% endif %}
 </head>
 <body>
 
@@ -62,7 +63,7 @@
           </button>
         </form>
       </div>
-      <small>Powered by LangGraph + GPT-4o</small>
+      <small>{% if native_voice_dashboard %}Gemini 3.8 Live · Local test{% else %}Powered by LangGraph + GPT-4o{% endif %}</small>
     </div>
   </nav>
 
@@ -82,9 +83,12 @@
 
       <div class="page-header">
         <h1>Call & Chat</h1>
-        <p>Voice calls and text conversations with {{ agent_name }}, your virtual restaurant host</p>
+        <p>{% if native_voice_dashboard %}Talk to your restaurant host, then check your saved reservations and orders.{% else %}Voice calls and text conversations with {{ agent_name }}, your virtual restaurant host{% endif %}</p>
       </div>
 
+      {% if native_voice_dashboard %}
+      {% include 'native_voice_card.html' %}
+      {% else %}
       <div class="call-chat-layout">
 
         <!-- Voice calls column -->
@@ -157,6 +161,7 @@
           </div>
         </div>
       </div>
+      {% endif %}
     </div>
 
     <!-- ═══════ PAGE: Dashboard ═══════ -->
@@ -417,6 +422,7 @@
   <!-- Config injected from server -->
   <script>
     window.APP_CONFIG = {
+      nativeVoice: {{ 'true' if native_voice_dashboard else 'false' }},
       vapiPubKey:      {{ vapi_pub | tojson }},
       vapiAssistantId: {{ vapi_asst | tojson }},
       restaurantName:  {{ restaurant | tojson }},
@@ -485,6 +491,7 @@
   </script>
   {% endif %}
 
+  {% if not native_voice_dashboard %}
   <!-- Retell Web SDK -->
   <script type="module">
     import { RetellWebClient } from 'https://esm.sh/retell-client-js-sdk@2.0.8';
@@ -538,6 +545,8 @@
     }
   </script>
 
-  <script src="/static/app.js"></script>
+  {% endif %}
+  <script src="/static/app.js?v=native-dashboard-1"></script>
+  {% if native_voice_dashboard %}<script type="module" src="/assets/gemini.js"></script>{% endif %}
 </body>
 </html>

@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     # LLM keys
     openai_api_key: str = ""
 
+    # Development-only native OpenAI Realtime adapter.  The production app
+    # never imports or starts this entry point and the flag defaults closed.
+    native_voice_realtime_enabled: bool = False
+    native_voice_realtime_model: str = "gpt-realtime"
+    native_voice_realtime_voice: str = "marin"
+
     # Vapi (voice calls via browser SDK)
     vapi_public_key: str = ""
     vapi_assistant_id: str = ""

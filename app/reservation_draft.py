@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import re
-from typing import Any
+from typing import Any, Mapping
 
 DRAFT_STATUS_COLLECTING = "collecting"
 DRAFT_STATUS_READY = "ready"
@@ -155,6 +155,83 @@ def compose_notes(draft: dict[str, Any], *, limit: int = 500) -> str:
     if draft.get("extra_notes"):
         parts.append(str(draft["extra_notes"]))
     return "; ".join(parts)[:limit]
+
+
+class AmbiguousBookingNotes(ValueError):
+    """Persisted note entries require an explicit caller resolution."""
+
+    def __init__(self, fields: list[str]) -> None:
+        self.fields = tuple(fields)
+        labels = ", ".join(field.replace("_", " ") for field in fields)
+        super().__init__(
+            f"The booking has multiple different {labels} entries. "
+            "Please specify the complete values to keep, or explicitly clear those fields. "
+            "No booking details have been changed."
+        )
+
+
+def draft_from_booking(
+    booking: Mapping[str, Any], *, note_updates: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Resolve stored fields without confusing ambiguity with an explicit clear."""
+    note_updates = note_updates or {}
+    notes = " ".join(str(booking.get("notes") or "").split())
+    parsed: dict[str, str] = {}
+    extra: list[str] = []
+    note_prefixes = {
+        "seating": "seating_preference",
+        "backup seating": "seating_backup",
+        "occasion": "occasion",
+        "dietary": "dietary",
+        "avoid": "seating_avoid",
+    }
+    entries: dict[str, list[str]] = {}
+    for part in (segment.strip() for segment in notes.split(";")):
+        matched = False
+        for prefix, field in note_prefixes.items():
+            marker = f"{prefix}:"
+            if part.casefold().startswith(marker):
+                matched = True
+                value = part[len(marker) :].strip()
+                values = entries.setdefault(field, [])
+                if value.casefold() not in {entry.casefold() for entry in values}:
+                    values.append(value)
+                break
+        if not matched:
+            extra.append(part)
+    ambiguous = []
+    for field, values in entries.items():
+        if note_updates.get(field) is not None:
+            # A provided empty string explicitly clears every old entry for this field.
+            parsed[field] = str(note_updates[field])
+        elif len(values) > 1:
+            ambiguous.append(field)
+        else:
+            parsed[field] = values[0]
+    if ambiguous:
+        raise AmbiguousBookingNotes(sorted(ambiguous))
+    booked_at = booking.get("booked_at")
+    booked_date = (
+        booked_at.date().isoformat() if hasattr(booked_at, "date") else ""
+    )
+    booked_time = booked_at.strftime("%H:%M") if hasattr(booked_at, "strftime") else ""
+    return patch_draft(
+        empty_draft(),
+        {
+            "customer_name": booking.get("customer_name") or "",
+            "customer_phone": booking.get("customer_phone") or "",
+            "date": booking.get("date") or booked_date,
+            "time": booking.get("time") or booked_time,
+            "party_size": booking.get("party_size") or 0,
+            "booking_id": booking.get("booking_id") or booking.get("id") or 0,
+            "status": booking.get("status") or DRAFT_STATUS_CONFIRMED,
+            **parsed,
+            "extra_notes": "; ".join(extra),
+            "require_approval_for_paid_items": bool(
+                booking.get("require_approval_for_paid_items")
+            ),
+        },
+    )
 
 
 def preferred_location(draft: dict[str, Any] | str) -> str:

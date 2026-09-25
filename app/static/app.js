@@ -25,19 +25,19 @@ function switchPage(pageName) {
 
   _currentPage = pageName;
 
-  if (pageName === 'dashboard' && !_pageLoaded.dashboard) {
+  if (pageName === 'dashboard' && (window.APP_CONFIG.nativeVoice || !_pageLoaded.dashboard)) {
     _pageLoaded.dashboard = true;
     loadDashboard();
   }
-  if (pageName === 'reservations' && !_pageLoaded.reservations) {
+  if (pageName === 'reservations' && (window.APP_CONFIG.nativeVoice || !_pageLoaded.reservations)) {
     _pageLoaded.reservations = true;
     loadReservations();
   }
-  if (pageName === 'orders' && !_pageLoaded.orders) {
+  if (pageName === 'orders' && (window.APP_CONFIG.nativeVoice || !_pageLoaded.orders)) {
     _pageLoaded.orders = true;
     loadOrders();
   }
-  if (pageName === 'menu' && !_pageLoaded.menu) {
+  if (pageName === 'menu' && (window.APP_CONFIG.nativeVoice || !_pageLoaded.menu)) {
     _pageLoaded.menu = true;
     loadMenu();
   }
@@ -220,7 +220,7 @@ async function sendMessage() {
   }
 
   document.getElementById('sendBtn').disabled = false;
-  document.getElementById('input').focus();
+  document.getElementById('input')?.focus();
 }
 
 function resetChat() {
@@ -727,4 +727,17 @@ async function saveSettings() {
 
 // ── Init ──────────────────────────────────────────────────────
 
-document.getElementById('input').focus();
+document.getElementById('input')?.focus();
+
+// Refresh saved data without interrupting the voice session or changing tabs.
+let nativeRefreshTimer;
+window.addEventListener('native-voice-state-changed', () => {
+  if (!window.APP_CONFIG.nativeVoice) return;
+  invalidateCache();
+  clearTimeout(nativeRefreshTimer);
+  nativeRefreshTimer = setTimeout(() => {
+    if (_currentPage === 'reservations') loadReservations();
+    if (_currentPage === 'orders') loadOrders();
+    if (_currentPage === 'dashboard') loadDashboard();
+  }, 300);
+});
