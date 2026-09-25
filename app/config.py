@@ -25,8 +25,9 @@ class Settings(BaseSettings):
     # LLM keys
     openai_api_key: str = ""
 
-    # Development-only native OpenAI Realtime adapter.  The production app
-    # never imports or starts this entry point and the flag defaults closed.
+    # Native browser voice is opt-in for local development or explicit QA staging.
+    # Production app.main never imports or starts the native entry point.
+    native_voice_staging_enabled: bool = False
     native_voice_realtime_enabled: bool = False
     native_voice_realtime_model: str = "gpt-realtime"
     native_voice_realtime_voice: str = "marin"
@@ -154,6 +155,40 @@ class Settings(BaseSettings):
             if code:
                 return code
         return "1"
+
+    def validate_native_voice_staging(self) -> None:
+        """Public QA opt-in; never silently enable the local demo on production."""
+        import os
+        failures = []
+        if self.app_env != "staging" or not self.native_voice_staging_enabled:
+            failures.append("APP_ENV=staging and NATIVE_VOICE_STAGING_ENABLED=true are required")
+        if not self.native_voice_realtime_enabled or not self.voice_live_writes_enabled:
+            failures.append("NATIVE_VOICE_REALTIME_ENABLED and VOICE_LIVE_WRITES_ENABLED must be true")
+        for name in ("NATIVE_VOICE_ALLOW_SHARED_DATABASE", "NATIVE_VOICE_DATABASE_WRITE_ENABLED"):
+            if os.getenv(name, "").lower() != "true":
+                failures.append(name + "=true is required")
+        if len(os.getenv("NATIVE_VOICE_DATABASE_MARKER", "").strip()) < 24:
+            failures.append("NATIVE_VOICE_DATABASE_MARKER must contain at least 24 characters")
+        if not (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")) or not self.openai_api_key:
+            failures.append("Gemini and OpenAI API keys are required")
+        if len(self.session_secret.strip()) < 32 or len(self.dashboard_api_key.strip()) < 24:
+            failures.append("Set SESSION_SECRET (32+ characters) and DASHBOARD_API_KEY (24+ characters)")
+        if not self.login_username.strip() or len(self.login_password) < 12 or self.login_password.lower() == "admin":
+            failures.append("Set LOGIN_USERNAME and a LOGIN_PASSWORD of at least 12 characters")
+        origins = self.cors_origins
+        if len(origins) != 1:
+            failures.append("Set exactly one HTTPS ALLOWED_ORIGINS value")
+        else:
+            parsed = urlparse(origins[0])
+            if (parsed.scheme != "https" or not parsed.hostname or "*" in origins[0]
+                    or parsed.username or parsed.password or parsed.path
+                    or parsed.params or parsed.query or parsed.fragment):
+                failures.append("ALLOWED_ORIGINS must be one exact HTTPS origin without a trailing slash")
+        if (self.enable_legacy_vapi or self.enable_legacy_retell_custom_llm
+                or self.enable_public_web_calls or self.widget_enabled):
+            failures.append("Disable legacy Vapi, Retell, public web calls, and the widget for QA voice")
+        if failures:
+            raise RuntimeError("Unsafe QA voice configuration: " + "; ".join(failures))
 
     def validate_runtime_security(self) -> None:
         """Reject unsafe production configuration before accepting traffic."""

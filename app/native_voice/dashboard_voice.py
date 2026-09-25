@@ -1,4 +1,4 @@
-"""Authenticated, loopback-only voice routes hosted by the restaurant dashboard."""
+"""Authenticated browser voice routes with explicit local or staging origins."""
 import asyncio
 from contextlib import suppress
 import json
@@ -19,10 +19,17 @@ def same_local_origin(socket):
             and not origin.path and not origin.query and not origin.fragment)
 
 
-def attach_local_voice(app, *, connector=None):
+def attach_local_voice(app, *, connector=None, allowed_origin=None):
     from app.config import settings
     if settings.is_production:
         raise RuntimeError("local_voice_dashboard_requires_development")
+    if allowed_origin is not None:
+        parsed = urlsplit(allowed_origin)
+        if (not settings.native_voice_staging_enabled or settings.app_env != "staging"
+                or parsed.scheme != "https" or not parsed.hostname
+                or parsed.username or parsed.password or parsed.path
+                or parsed.query or parsed.fragment):
+            raise RuntimeError("invalid_staging_voice_origin")
     if connector is None:
         from app.native_voice.gemini_live import connect_gemini_session
         connector = connect_gemini_session
@@ -42,13 +49,13 @@ def attach_local_voice(app, *, connector=None):
         from app.native_voice.gemini_live import MODEL
         return {"restaurant": get_restaurant_knowledge().identity["name"],
                 "clock": "Real restaurant time", "model": MODEL,
-                "database": "Separate test database"}
+                "database": "QA staging database" if allowed_origin else "Separate test database"}
 
     @app.websocket("/voice-gemini")
     async def voice(socket: WebSocket):
         pace = socket.query_params.get("pace", "natural")
         if (not socket.scope.get("session", {}).get("authenticated")
-                or not same_local_origin(socket) or pace not in {"natural", "patient"}
+                or not (socket.headers.get("origin") == allowed_origin if allowed_origin else same_local_origin(socket)) or pace not in {"natural", "patient"}
                 or app.state.dashboard_voice_sessions >= 2):
             await socket.close(code=1008)
             return

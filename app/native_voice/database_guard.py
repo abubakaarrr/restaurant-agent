@@ -1,4 +1,4 @@
-"""Database boundary for the development-only native voice adapter."""
+"""Database identity boundary for local demos and explicitly authorized QA staging."""
 
 from __future__ import annotations
 
@@ -44,8 +44,20 @@ def _database_identity(url: str) -> tuple[frozenset[str], int, str]:
     return frozenset(addresses), port, database
 
 
+def staging_database_enabled() -> bool:
+    return (settings.native_voice_staging_enabled
+            and settings.app_env == "staging"
+            and os.getenv("NATIVE_VOICE_ALLOW_SHARED_DATABASE", "").lower() == "true")
+
+
+def native_database_url() -> str:
+    if staging_database_enabled():
+        return str(settings.database_url).strip()
+    return os.getenv("NATIVE_VOICE_DATABASE_URL", "").strip()
+
+
 def validate_native_voice_database() -> str:
-    url = os.getenv("NATIVE_VOICE_DATABASE_URL", "").strip()
+    url = native_database_url()
     if not url:
         raise NativeVoiceDatabaseGuardError("native_voice_database_url_required")
     configured_databases = {
@@ -58,7 +70,7 @@ def validate_native_voice_database() -> str:
             configured_identity = _database_identity(configured_url)
             same_server = bool(native_identity[0] & configured_identity[0])
             same_database = native_identity[1:] == configured_identity[1:]
-            if same_server and same_database:
+            if same_server and same_database and not staging_database_enabled():
                 raise NativeVoiceDatabaseGuardError("native_voice_database_must_be_separate")
     if settings.is_production or os.getenv("APP_ENV", "development").casefold() == "production":
         raise NativeVoiceDatabaseGuardError("native_voice_database_production_forbidden")
@@ -74,10 +86,12 @@ async def verify_native_voice_database_connection(pool: object, *, expected_url:
     if not marker:
         raise NativeVoiceDatabaseGuardError("native_voice_database_marker_required")
     try:
+        marker_setting = ("app.native_voice_staging_marker" if staging_database_enabled()
+                          else "app.native_voice_disposable_marker")
         row = await pool.fetchrow(
             "SELECT host(inet_server_addr()) AS server_host, "
             "inet_server_port() AS server_port, current_database() AS database_name, "
-            "current_setting('app.native_voice_disposable_marker', true) AS marker"
+            f"current_setting('{marker_setting}', true) AS marker"
         )
     except Exception as exc:
         raise NativeVoiceDatabaseGuardError("native_voice_database_identity_unreadable") from exc
@@ -95,13 +109,13 @@ async def verify_native_voice_database_connection(pool: object, *, expected_url:
                 server_address = str(ipaddress.ip_interface(server_host).ip)
         except ValueError as exc:
             raise NativeVoiceDatabaseGuardError("native_voice_database_identity_invalid") from exc
-        configured_url = expected_url or os.getenv("NATIVE_VOICE_DATABASE_URL", "").strip()
+        configured_url = expected_url or native_database_url()
         expected_addresses, expected_port, expected_database = _database_identity(configured_url)
         normal_urls = {
             os.getenv("DATABASE_URL", "").strip(),
             str(settings.database_url or "").strip(),
         }
-        if any(
+        if not staging_database_enabled() and any(
             configured_url
             and (server_address, server_port, database_name)
             == (address, port, database)

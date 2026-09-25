@@ -199,7 +199,7 @@ async function startCall() {
     await context.resume(); await context.audioWorklet.addModule('/assets/capture.js');
     source = context.createMediaStreamSource(stream); node = new AudioWorkletNode(context, 'microphone-capture'); gain = context.createGain(); gain.gain.value = 0;
     source.connect(node); node.connect(gain); gain.connect(context.destination); node.port.onmessage = e => capture(e.data);
-    socket = new WebSocket('ws://' + location.host + '/voice-gemini?pace=' + $('pace').value);
+    socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/voice-gemini?pace=' + $('pace').value);
     live = true; connected = false; muted = false; epoch = 0; turns = 0; lastSpeechAt = 0; lastEndpointAt = 0;
     diagnostics = {microphone: stream.getAudioTracks()[0].getSettings(), microphone_name: stream.getAudioTracks()[0].label, audio_sample_rate: context.sampleRate};
     transcriptNodes.clear(); $('messages').replaceChildren(); $('latency').textContent = '—'; $('turns').textContent = '0 turns'; $('mute').textContent = 'Mute';

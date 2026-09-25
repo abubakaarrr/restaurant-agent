@@ -51,3 +51,6 @@ Unit tests do not establish acoustic reliability. Native generated conversation
 can still drift in wording or language; no zero-hallucination or production
 readiness claim is made. Complex food modifications require structured tool
 interpretation. No telephone integration is included.
+
+For HTTPS QA deployment using the existing seeded database and Docker web service,
+follow [the staging guide](native-voice-staging.md). Local defaults stay unchanged.

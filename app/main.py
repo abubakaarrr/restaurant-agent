@@ -154,7 +154,7 @@ app.add_middleware(
     session_cookie="restaurant_session",
     max_age=60 * 60 * 24 * 7,  # 7 days
     same_site="lax",
-    https_only=settings.app_env == "production",
+    https_only=settings.is_production or settings.native_voice_staging_enabled,
 )
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
