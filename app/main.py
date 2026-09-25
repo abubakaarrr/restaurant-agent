@@ -1033,6 +1033,7 @@ async def browser_demo(request: Request):
             "retell_ready": retell_ready,
             "csrf_token": request.session.get("csrf_token", ""),
             "username": request.session.get("username", ""),
+            "native_voice_dashboard": bool(getattr(request.app.state, "native_voice_dashboard", False)),
         },
     )
 

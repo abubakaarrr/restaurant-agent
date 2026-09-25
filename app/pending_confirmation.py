@@ -33,21 +33,39 @@ VALID_ACTIONS = frozenset(
 PENDING_TTL = timedelta(minutes=15)
 
 _AFFIRMATIVE_RE = re.compile(
-    r"(?:"
-    r"\byes\b|\byeah\b|\byep\b|\byup\b|"
-    r"\bcorrect\b|that'?s right|sounds good|go ahead|\bconfirmed\b|"
+    r"^\s*(?:eh[,. ]+)?(?:"
+    r"yes\b|yeah\b|yep\b|yup\b|yap\b|ya(?:[\s,]+ya)?\b|"
+    r"sure\b|okay\b|ok\b|correct\b|"
+    r"that'?s right|sounds good|go ahead|"
     r"all (?:of )?that(?:'s| is)? correct|that(?:'s| is) (?:all )?correct|"
-    r"\bplease do\b|\babsolutely\b"
+    r"please do\b|absolutely\b|book that\b|make that change\b"
     r")",
     re.IGNORECASE,
 )
 _NEGATIVE_RE = re.compile(
     r"(?:"
-    r"\bno\b|\bnope\b|not correct|\bwait\b|\bactually\b|\bchange\b|"
-    r"hold on|never ?mind|don'?t|do not|not\s+cancel|wrong|instead"
+    r"\bno\b|\bnope\b|not correct|\bwait\b|\bactually\b|"
+    r"hold on|never ?mind|don'?t|do not|\bnot\b|wrong|instead|"
+    r"\bbut\b.{0,40}\b(?:change|make|move|use)\b|"
+    r"\bchange\s+(?:the|my|our|it\s+to)\b|"
+    r"\bcorrect\s+(?:the|my|our)\b|"
+    r"\b(?:but|and|also|plus)\b.{0,40}\b(?:add|remove|swap|change|increase|decrease)\b"
     r")",
     re.IGNORECASE,
 )
+_ORDER_ABANDONMENT_RE = re.compile(
+    r"\b(?:leave|skip|cancel|forget|drop)\b.{0,50}"
+    r"\b(?:pre[ -]?order|food order|the order|that order)\b",
+    re.IGNORECASE,
+)
+
+
+def requests_order_abandonment(utterance: str) -> bool:
+    """Recognize an explicit request to leave an unconfirmed food order."""
+    text = " ".join((utterance or "").casefold().split())
+    if re.search(r"\b(?:you|you have|you've)\s+(?:forget|forgot|forgotten|dropped|skipped|cancelled)\b|\b(?:don't|do not|never)\s+(?:forget|drop|skip|cancel|leave)\b", text):
+        return False
+    return bool(re.fullmatch(r"(?:okay[,. ]+|ok[,. ]+|yes[,. ]+|please\s+|can you\s+|could you\s+|i (?:want|would like) (?:you )?to\s+)*(?:leave|skip|cancel|forget|drop)\s+(?:about\s+)?(?:the|my|our|that)?\s*(?:pre[ -]?order|food order|order)(?:\s+(?:please|for now|instead))?[.!\s]*", text))
 
 
 def payload_hash(payload: dict[str, Any]) -> str:
@@ -141,7 +159,9 @@ def update_booking_confirmation_payload(
     dietary: str | None = None,
     occasion: str | None = None,
     extra_notes: str | None = None,
+    notes: str | None = None,
     customer_name: str = "",
+    customer_phone: str | None = None,
     require_approval_for_paid_items: bool | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -159,6 +179,8 @@ def update_booking_confirmation_payload(
         "dietary": dietary,
         "occasion": occasion,
         "extra_notes": extra_notes,
+        "notes": notes,
+        "customer_phone": customer_phone,
         "require_approval_for_paid_items": require_approval_for_paid_items,
     }
     for key, value in optional.items():
@@ -197,8 +219,15 @@ def classify_affirmation(utterance: str) -> Affirmation:
     text = " ".join((utterance or "").split())
     if not text:
         return "unclear"
-    has_neg = bool(_NEGATIVE_RE.search(text))
-    has_aff = bool(_AFFIRMATIVE_RE.search(text))
+    has_neg = bool(_NEGATIVE_RE.search(text)) or requests_order_abandonment(text)
+    # Consume the whole single-intent answer; leading "yes" is insufficient.
+    clean = re.sub(r"[.,!]+", " ", text.casefold()).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    closed = r"(?:eh )?(?:yes|yeah|yep|yup|yap|ya(?: ya)?|sure|okay|ok|correct|that's right|that is right|sounds good|go ahead|absolutely|please do|book that|make that change|all (?:of )?that(?:'s| is)? correct|that(?:'s| is) (?:all )?correct)(?: (?:please|confirm(?: it| that)?|that's right|that is right|that is correct|that's correct|those details are correct|book it|book that|go ahead|you can make that change|make that change|thank you|thanks|motherfucker))*"
+    positive = r"(?:yes|yeah|yep|yup|yap|sure|okay|ok|absolutely|correct)"
+    repeated = rf"{positive}(?: {positive}){{1,4}}"
+    directed = rf"(?:{positive} )?(?:(?:please )?(?:you can |you may |go ahead and )?)(?:finalize|confirm|book|proceed with) (?:my |the |that )?(?:booking|reservation|table|order)(?: please)?"
+    has_aff = '?' not in text and bool(re.fullmatch(closed, clean) or re.fullmatch(repeated, clean) or re.fullmatch(directed, clean))
     if has_neg and not has_aff:
         return "negative"
     if has_neg and has_aff:
@@ -278,6 +307,85 @@ def get_pending_confirmation(
     pending = _pending_map(session_id)
     record = pending.get(action_type)
     return dict(record) if isinstance(record, dict) else None
+
+
+def release_pending_confirmation(
+    session_id: str,
+    action_type: str,
+    confirmation_hash: str,
+    *,
+    response_id: str = "",
+) -> bool:
+    sid = resolve_session_id(session_id)
+    if not sid or not confirmation_hash:
+        return False
+    pending = _pending_map(sid)
+    record = pending.get(action_type)
+    if not isinstance(record, dict) or str(record.get("payload_hash") or "") != confirmation_hash:
+        return False
+    record = dict(record)
+    # A caller's next approval must refer to one audible proposal, never to
+    # whichever of several old actions the model happens to choose.
+    for other_action, other in list(pending.items()):
+        if other_action == action_type or not isinstance(other, dict):
+            continue
+        other = dict(other)
+        other.pop("readback_released", None)
+        other.pop("released_turn", None)
+        other.pop("released_response_id", None)
+        pending[other_action] = other
+    record["readback_released"] = True
+    record["released_turn"] = current_confirmation_turn(sid)
+    if response_id:
+        record["released_response_id"] = response_id
+    pending[action_type] = record
+    update_call_memory(sid, pending_confirmations=pending)
+    return True
+
+
+def active_released_confirmation(session_id: str) -> tuple[str, dict[str, Any]] | None:
+    """Return the sole heard proposal eligible for a later caller turn.
+
+    This is the server-owned action pointer used by voice transports. The
+    service still verifies the payload hash, turn, scope, and write outcome.
+    """
+    current_turn = current_confirmation_turn(session_id)
+    eligible: list[tuple[str, dict[str, Any]]] = []
+    for action, record in _pending_map(session_id).items():
+        if action not in VALID_ACTIONS or not isinstance(record, dict):
+            continue
+        if not record.get("readback_released") or not isinstance(record.get("payload"), dict):
+            continue
+        try:
+            released_turn = int(record.get("released_turn") or 0)
+            expires_at = datetime.fromisoformat(str(record.get("expires_at") or ""))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        if current_turn > released_turn and datetime.now(timezone.utc) <= expires_at:
+            eligible.append((action, record))
+    return eligible[0] if len(eligible) == 1 else None
+
+
+def revoke_released_confirmations(session_id: str) -> bool:
+    sid = resolve_session_id(session_id)
+    if not sid:
+        return False
+    pending = _pending_map(sid)
+    changed = False
+    for action, value in list(pending.items()):
+        if not isinstance(value, dict) or not value.get("readback_released"):
+            continue
+        record = dict(value)
+        record.pop("readback_released", None)
+        record.pop("released_turn", None)
+        record.pop("released_response_id", None)
+        pending[action] = record
+        changed = True
+    if changed:
+        update_call_memory(sid, pending_confirmations=pending)
+    return changed
 
 
 def pending_state_patch(session_id: str) -> dict[str, Any]:

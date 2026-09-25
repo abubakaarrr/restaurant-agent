@@ -13,7 +13,6 @@ pgvector==0.2.5
 
 # OpenAI SDK (legacy rollback LLM/optional offline embedding jobs)
 openai>=1.25.0
-
 # Config + utilities
 python-dotenv==1.0.1
 pydantic-settings==2.2.1

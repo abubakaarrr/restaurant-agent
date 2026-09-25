@@ -12,13 +12,18 @@ from app.pending_confirmation import (
     ACTION_CANCEL_BOOKING,
     ACTION_CONFIRM_ORDER,
     ACTION_CREATE_BOOKING,
+    ACTION_UPDATE_CONFIRMED_BOOKING,
+    active_released_confirmation,
     begin_caller_turn,
     booking_confirmation_payload,
     classify_affirmation,
     clear_pending_confirmation,
     order_confirmation_payload,
     pending_state_patch,
+    get_pending_confirmation,
     register_pending_confirmation,
+    release_pending_confirmation,
+    revoke_released_confirmations,
     require_pending_confirmation,
 )
 
@@ -34,6 +39,34 @@ def test_classify_affirmation_keywords() -> None:
     assert classify_affirmation("move it to seven, not cancel it") == "negative"
     assert classify_affirmation("what time do you close?") == "unclear"
     assert classify_affirmation("yes, but change the name") == "negative"
+    # Spoken approvals from the failed local call must be accepted by the
+    # same server gate that authorizes the database write.
+    for spoken in ("Eh, yep.", "Ya ya.", "yap", "Yes, book that.",
+                   "Yes, you can make that change.",
+                   "Yes, make that change, motherfucker."):
+        assert classify_affirmation(spoken) == "affirmative", spoken
+    for spoken in ("Please add fries to my confirmed pre-order.",
+                   "Yes, but add one more salad.", "Yes, and add fries.",
+                   "Correct my phone number.",
+                   "Yeah, leave that pre-order. I will order on arrival. Just book my reservation."):
+        assert classify_affirmation(spoken) != "affirmative", spoken
+
+
+def test_only_latest_heard_action_can_be_approved() -> None:
+    session = "pc-one-active-proposal"
+    clear_call_memory(session)
+    begin_caller_turn(session, "Please read back my food order")
+    order_payload = {"order_id": 106, "draft_version": 3}
+    order_hash = register_pending_confirmation(session, ACTION_CONFIRM_ORDER, order_payload)
+    assert release_pending_confirmation(session, ACTION_CONFIRM_ORDER, order_hash)
+    begin_caller_turn(session, "What day is my booking?")
+    assert active_released_confirmation(session)[0] == ACTION_CONFIRM_ORDER
+    update_payload = {"booking_id": 247, "date": "2026-09-27"}
+    update_hash = register_pending_confirmation(session, ACTION_UPDATE_CONFIRMED_BOOKING, update_payload)
+    assert release_pending_confirmation(session, ACTION_UPDATE_CONFIRMED_BOOKING, update_hash)
+    begin_caller_turn(session, "Yes, make that change")
+    assert active_released_confirmation(session)[0] == ACTION_UPDATE_CONFIRMED_BOOKING
+    assert not get_pending_confirmation(session, ACTION_CONFIRM_ORDER).get("readback_released")
 
 
 def test_require_pending_rejects_without_record() -> None:
@@ -120,6 +153,26 @@ def test_require_pending_accepts_after_yes_on_later_turn() -> None:
     begin_caller_turn("pc-ok", "yes")
     require_pending_confirmation("pc-ok", ACTION_CREATE_BOOKING, payload)
     assert get_call_memory("pc-ok")["last_turn_affirmation"] == "affirmative"
+
+
+def test_negative_turn_revokes_released_confirmation() -> None:
+    session_id = "pc-revoke-released"
+    clear_call_memory(session_id)
+    payload = booking_confirmation_payload(
+        customer_name="Sam",
+        customer_phone="+14155550100",
+        date="2026-09-01",
+        time="19:00",
+        party_size=2,
+        notes="",
+    )
+    begin_caller_turn(session_id, "please read it back")
+    digest = register_pending_confirmation(session_id, ACTION_CREATE_BOOKING, payload)
+    assert release_pending_confirmation(session_id, ACTION_CREATE_BOOKING, digest)
+    begin_caller_turn(session_id, "no, change the time")
+    assert revoke_released_confirmations(session_id)
+    assert not get_pending_confirmation(session_id, ACTION_CREATE_BOOKING).get("readback_released")
+    clear_call_memory(session_id)
 
 
 def test_cancellation_confirmation_is_not_durable() -> None:
